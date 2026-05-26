@@ -536,18 +536,12 @@ PHP_MINIT_FUNCTION(zealphp)
 
 PHP_MSHUTDOWN_FUNCTION(zealphp)
 {
-    /* Skip handler restoration — the process is exiting and CG(function_table)
-     * may already be partially destroyed on PHP 8.5+ (changed shutdown order).
-     * Restoring handlers into freed memory causes SIGSEGV. */
-
-    zend_hash_destroy(&zealphp_orig_handlers);
-    zend_hash_destroy(&zealphp_callbacks);
-
-    /* Clean snapshot zvals first (while refcounted objects are still valid),
-     * then destroy the empty table structure. */
-    zend_hash_clean(&zealphp_coro_snapshots);
-    zend_hash_destroy(&zealphp_coro_snapshots);
-
+    /* Process is exiting — skip ALL cleanup. On PHP 8.5+ the shutdown order
+     * changed: CG(function_table) and refcounted objects (Closures stored in
+     * zealphp_callbacks) may already be freed by the time MSHUTDOWN runs.
+     * Calling zend_hash_destroy on tables whose zval dtors touch freed memory
+     * causes SIGSEGV. The OS reclaims all process memory on exit — this is
+     * the standard pattern used by opcache and other core extensions. */
     return SUCCESS;
 }
 
