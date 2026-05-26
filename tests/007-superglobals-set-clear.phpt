@@ -10,7 +10,8 @@ zealphp_superglobals_set(
     ['SID' => 'abc'],
     ['METHOD' => 'POST'],
     [],
-    ['name' => 'Alice']
+    ['name' => 'Alice'],
+    []
 );
 
 echo $_GET['name'] . "\n";

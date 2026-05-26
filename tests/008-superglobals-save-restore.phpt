@@ -5,11 +5,11 @@ zealphp
 --FILE--
 <?php
 // Simulate coroutine A
-zealphp_superglobals_set(['user' => 'CoroutineA'], [], [], [], [], []);
+zealphp_superglobals_set(['user' => 'CoroutineA'], [], [], [], [], [], []);
 $snapA = zealphp_superglobals_save();
 
 // Simulate coroutine B overwrites
-zealphp_superglobals_set(['user' => 'CoroutineB'], [], [], [], [], []);
+zealphp_superglobals_set(['user' => 'CoroutineB'], [], [], [], [], [], []);
 echo "Current: " . $_GET['user'] . "\n";
 
 // Restore A
