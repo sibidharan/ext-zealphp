@@ -84,29 +84,45 @@ static void zealphp_snapshot_restore(long cid)
     }
 }
 
-/* OpenSwoole scheduler callbacks — called from C, no PHP stack needed */
+/* Extract coroutine ID from the Coroutine* arg.
+ * OpenSwoole's Coroutine class stores `long cid` after the vtable pointer
+ * and a few base-class fields. We probe common offsets. */
+static long zealphp_cid_from_arg(void *arg)
+{
+    if (!arg) return -1;
+    /* Try reading cid at common struct offsets (bytes).
+     * OpenSwoole Coroutine inherits from a base with vtable (8 bytes on x64),
+     * then typically: long cid at offset 8, 16, or 24. */
+    long *p = (long *)arg;
+    /* Offset 0 (vtable ptr) — skip */
+    /* Offset 8 (first member after vtable) */
+    if (p[1] > 0 && p[1] < 1000000) return p[1];
+    /* Offset 16 */
+    if (p[2] > 0 && p[2] < 1000000) return p[2];
+    /* Offset 24 */
+    if (p[3] > 0 && p[3] < 1000000) return p[3];
+    return -1;
+}
+
+/* OpenSwoole scheduler callbacks — called from C, no PHP stack needed.
+ * Use the Coroutine* arg pointer itself as the unique key — guaranteed
+ * unique per coroutine, no need to extract cid from the struct. */
 static void zealphp_on_yield(void *arg)
 {
-    if (!os_get_cid) return;
-    long cid = os_get_cid();
-    if (cid < 0) return;
-    zealphp_snapshot_save(cid);
+    if (!arg) return;
+    zealphp_snapshot_save((zend_long)(uintptr_t)arg);
 }
 
 static void zealphp_on_resume(void *arg)
 {
-    if (!os_get_cid) return;
-    long cid = os_get_cid();
-    if (cid < 0) return;
-    zealphp_snapshot_restore(cid);
+    if (!arg) return;
+    zealphp_snapshot_restore((zend_long)(uintptr_t)arg);
 }
 
 static void zealphp_on_close(void *arg)
 {
-    if (!os_get_cid) return;
-    long cid = os_get_cid();
-    if (cid < 0) return;
-    zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)cid);
+    if (!arg) return;
+    zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
 }
 
 /* ── Allowlist ───────────────────────────────────────────────────────── */
@@ -480,10 +496,12 @@ PHP_MINIT_FUNCTION(zealphp)
      * isn't loaded or the symbols aren't found, we silently skip. */
     void *handle = dlopen(NULL, RTLD_LAZY);
     if (handle) {
-        os_set_on_yield  = (coro_switch_fn_t)dlsym(handle, "swoole_coroutine_set_on_yield");
-        os_set_on_resume = (coro_switch_fn_t)dlsym(handle, "swoole_coroutine_set_on_resume");
-        os_set_on_close  = (coro_switch_fn_t)dlsym(handle, "swoole_coroutine_set_on_close");
-        os_get_cid       = (coro_get_cid_fn_t)dlsym(handle, "swoole_coroutine_get_current_cid");
+        /* OpenSwoole exports C++-mangled symbols (openswoole::Coroutine::*).
+         * Resolve the mangled names directly. */
+        os_set_on_yield  = (coro_switch_fn_t)dlsym(handle, "_ZN10openswoole9Coroutine12set_on_yieldEPFvPvE");
+        os_set_on_resume = (coro_switch_fn_t)dlsym(handle, "_ZN10openswoole9Coroutine13set_on_resumeEPFvPvE");
+        os_set_on_close  = (coro_switch_fn_t)dlsym(handle, "_ZN10openswoole9Coroutine12set_on_closeEPFvPvE");
+        os_get_cid       = (coro_get_cid_fn_t)dlsym(handle, "openswoole_coroutine_get_current_id");
         dlclose(handle);
     }
 
