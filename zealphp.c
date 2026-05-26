@@ -496,12 +496,38 @@ PHP_MINIT_FUNCTION(zealphp)
      * isn't loaded or the symbols aren't found, we silently skip. */
     void *handle = dlopen(NULL, RTLD_LAZY);
     if (handle) {
-        /* OpenSwoole exports C++-mangled symbols (openswoole::Coroutine::*).
-         * Resolve the mangled names directly. */
-        os_set_on_yield  = (coro_switch_fn_t)dlsym(handle, "_ZN10openswoole9Coroutine12set_on_yieldEPFvPvE");
-        os_set_on_resume = (coro_switch_fn_t)dlsym(handle, "_ZN10openswoole9Coroutine13set_on_resumeEPFvPvE");
-        os_set_on_close  = (coro_switch_fn_t)dlsym(handle, "_ZN10openswoole9Coroutine12set_on_closeEPFvPvE");
-        os_get_cid       = (coro_get_cid_fn_t)dlsym(handle, "openswoole_coroutine_get_current_id");
+        /* Resolve coroutine scheduler hooks. Try multiple symbol patterns
+         * to support different OpenSwoole/Swoole versions:
+         * 1. Clean C exports (future/proposed)
+         * 2. OpenSwoole C++ mangled (current 22.x/26.x)
+         * 3. Swoole C++ mangled (for Swoole compat) */
+        static const char *yield_names[] = {
+            "openswoole_coroutine_set_on_yield",
+            "_ZN10openswoole9Coroutine12set_on_yieldEPFvPvE",
+            "_ZN6swoole9Coroutine12set_on_yieldEPFvPvE",
+            NULL
+        };
+        static const char *resume_names[] = {
+            "openswoole_coroutine_set_on_resume",
+            "_ZN10openswoole9Coroutine13set_on_resumeEPFvPvE",
+            "_ZN6swoole9Coroutine13set_on_resumeEPFvPvE",
+            NULL
+        };
+        static const char *close_names[] = {
+            "openswoole_coroutine_set_on_close",
+            "_ZN10openswoole9Coroutine12set_on_closeEPFvPvE",
+            "_ZN6swoole9Coroutine12set_on_closeEPFvPvE",
+            NULL
+        };
+        for (const char **n = yield_names; *n && !os_set_on_yield; n++)
+            os_set_on_yield = (coro_switch_fn_t)dlsym(handle, *n);
+        for (const char **n = resume_names; *n && !os_set_on_resume; n++)
+            os_set_on_resume = (coro_switch_fn_t)dlsym(handle, *n);
+        for (const char **n = close_names; *n && !os_set_on_close; n++)
+            os_set_on_close = (coro_switch_fn_t)dlsym(handle, *n);
+        os_get_cid = (coro_get_cid_fn_t)dlsym(handle, "openswoole_coroutine_get_current_id");
+        if (!os_get_cid)
+            os_get_cid = (coro_get_cid_fn_t)dlsym(handle, "swoole_coroutine_get_current_id");
         dlclose(handle);
     }
 
