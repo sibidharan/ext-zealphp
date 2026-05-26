@@ -13,9 +13,9 @@ zealphp_superglobals_set(
     ['auth_token' => 'bearer_xyz'],
     ['HTTP_AUTHORIZATION' => 'Bearer sk_live_secret123'],
     ['upload' => ['name' => 'secret.pdf']],
-    ['api_key' => 'sk_live_secret123']
+    ['api_key' => 'sk_live_secret123'],
+    ['user_id' => 42, 'is_admin' => true]
 );
-$_SESSION = ['user_id' => 42, 'is_admin' => true];
 
 // A ends — clear everything
 zealphp_superglobals_clear();

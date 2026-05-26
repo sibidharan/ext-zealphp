@@ -11,6 +11,7 @@ zealphp_superglobals_set(
     [],
     [],
     ['avatar' => ['name' => 'photo.jpg', 'size' => 12345, 'tmp_name' => '/tmp/php123']],
+    [],
     []
 );
 echo "Has file: " . (isset($_FILES['avatar']) ? "yes" : "no") . "\n";
