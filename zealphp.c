@@ -536,20 +536,18 @@ PHP_MINIT_FUNCTION(zealphp)
 
 PHP_MSHUTDOWN_FUNCTION(zealphp)
 {
-    /* restore any still-overridden functions */
-    zend_string *key;
-    void *orig;
-
-    ZEND_HASH_FOREACH_STR_KEY_PTR(&zealphp_orig_handlers, key, orig) {
-        zend_function *func = zend_hash_find_ptr(CG(function_table), key);
-        if (func) {
-            func->internal_function.handler = (zif_handler)orig;
-        }
-    } ZEND_HASH_FOREACH_END();
+    /* Skip handler restoration — the process is exiting and CG(function_table)
+     * may already be partially destroyed on PHP 8.5+ (changed shutdown order).
+     * Restoring handlers into freed memory causes SIGSEGV. */
 
     zend_hash_destroy(&zealphp_orig_handlers);
     zend_hash_destroy(&zealphp_callbacks);
+
+    /* Clean snapshot zvals first (while refcounted objects are still valid),
+     * then destroy the empty table structure. */
+    zend_hash_clean(&zealphp_coro_snapshots);
     zend_hash_destroy(&zealphp_coro_snapshots);
+
     return SUCCESS;
 }
 
