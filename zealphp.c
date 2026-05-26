@@ -21,6 +21,7 @@
 #include "ext/standard/info.h"
 #include "zend_exceptions.h"
 #include "php_zealphp.h"
+#include <dlfcn.h>
 
 /* ── Storage ─────────────────────────────────────────────────────────── */
 
@@ -29,6 +30,84 @@ static HashTable zealphp_orig_handlers;
 
 /* PHP callable callbacks, keyed by lowercase function name */
 static HashTable zealphp_callbacks;
+
+/* ── Per-coroutine superglobal isolation ─────────────────────────────── */
+
+/* Per-coroutine snapshots: coro_id → zval (array of 6 superglobal arrays) */
+static HashTable zealphp_coro_snapshots;
+static bool zealphp_coro_hooks_active = false;
+
+/* OpenSwoole C-level hook typedefs (resolved via dlsym at runtime) */
+typedef void (*coro_switch_fn_t)(void (*)(void *));
+typedef long (*coro_get_cid_fn_t)(void);
+
+static coro_switch_fn_t os_set_on_yield  = NULL;
+static coro_switch_fn_t os_set_on_resume = NULL;
+static coro_switch_fn_t os_set_on_close  = NULL;
+static coro_get_cid_fn_t os_get_cid      = NULL;
+
+static const char *sg_names[] = {"_GET","_POST","_COOKIE","_SERVER","_FILES","_REQUEST", NULL};
+
+static void zealphp_snapshot_save(long cid)
+{
+    zval snapshot;
+    array_init(&snapshot);
+    for (const char **n = sg_names; *n; n++) {
+        zval *sg = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
+        if (sg) {
+            zval copy;
+            ZVAL_COPY(&copy, sg);
+            add_assoc_zval(&snapshot, *n, &copy);
+        }
+    }
+    zend_hash_index_update(&zealphp_coro_snapshots, (zend_ulong)cid, &snapshot);
+}
+
+static void zealphp_snapshot_restore(long cid)
+{
+    zval *snapshot = zend_hash_index_find(&zealphp_coro_snapshots, (zend_ulong)cid);
+    if (!snapshot || Z_TYPE_P(snapshot) != IS_ARRAY) return;
+
+    for (const char **n = sg_names; *n; n++) {
+        zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
+        if (val) {
+            zval *existing = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
+            if (existing) {
+                zval_ptr_dtor(existing);
+                ZVAL_COPY(existing, val);
+            } else {
+                zval copy;
+                ZVAL_COPY(&copy, val);
+                zend_hash_str_add_new(&EG(symbol_table), *n, strlen(*n), &copy);
+            }
+        }
+    }
+}
+
+/* OpenSwoole scheduler callbacks — called from C, no PHP stack needed */
+static void zealphp_on_yield(void *arg)
+{
+    if (!os_get_cid) return;
+    long cid = os_get_cid();
+    if (cid < 0) return;
+    zealphp_snapshot_save(cid);
+}
+
+static void zealphp_on_resume(void *arg)
+{
+    if (!os_get_cid) return;
+    long cid = os_get_cid();
+    if (cid < 0) return;
+    zealphp_snapshot_restore(cid);
+}
+
+static void zealphp_on_close(void *arg)
+{
+    if (!os_get_cid) return;
+    long cid = os_get_cid();
+    if (cid < 0) return;
+    zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)cid);
+}
 
 /* ── Allowlist ───────────────────────────────────────────────────────── */
 
@@ -354,12 +433,61 @@ PHP_FUNCTION(zealphp_superglobals_restore)
     }
 }
 
+/* ── zealphp_coroutine_superglobals(bool $enable): bool ──────────── */
+/* Activates per-coroutine superglobal save/restore via OpenSwoole's
+ * yield/resume/close hooks. Returns true if hooks were registered,
+ * false if OpenSwoole scheduler hooks aren't available. */
+PHP_FUNCTION(zealphp_coroutine_superglobals)
+{
+    bool enable;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_BOOL(enable)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!enable) {
+        zealphp_coro_hooks_active = false;
+        zend_hash_clean(&zealphp_coro_snapshots);
+        RETURN_TRUE;
+    }
+
+    if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+        php_error_docref(NULL, E_WARNING,
+            "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+            "Per-coroutine superglobal isolation requires OpenSwoole.");
+        RETURN_FALSE;
+    }
+
+    if (!zealphp_coro_hooks_active) {
+        os_set_on_yield(zealphp_on_yield);
+        os_set_on_resume(zealphp_on_resume);
+        os_set_on_close(zealphp_on_close);
+        zealphp_coro_hooks_active = true;
+    }
+
+    RETURN_TRUE;
+}
+
 /* ── Module lifecycle ────────────────────────────────────────────── */
 
 PHP_MINIT_FUNCTION(zealphp)
 {
     zend_hash_init(&zealphp_orig_handlers, 32, NULL, NULL, 1);
     zend_hash_init(&zealphp_callbacks, 32, NULL, ZVAL_PTR_DTOR, 1);
+    zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 1);
+
+    /* Try to hook into OpenSwoole's coroutine scheduler for per-coroutine
+     * superglobal isolation. Resolved at runtime via dlsym — if OpenSwoole
+     * isn't loaded or the symbols aren't found, we silently skip. */
+    void *handle = dlopen(NULL, RTLD_LAZY);
+    if (handle) {
+        os_set_on_yield  = (coro_switch_fn_t)dlsym(handle, "swoole_coroutine_set_on_yield");
+        os_set_on_resume = (coro_switch_fn_t)dlsym(handle, "swoole_coroutine_set_on_resume");
+        os_set_on_close  = (coro_switch_fn_t)dlsym(handle, "swoole_coroutine_set_on_close");
+        os_get_cid       = (coro_get_cid_fn_t)dlsym(handle, "swoole_coroutine_get_current_cid");
+        dlclose(handle);
+    }
+
     return SUCCESS;
 }
 
@@ -378,6 +506,7 @@ PHP_MSHUTDOWN_FUNCTION(zealphp)
 
     zend_hash_destroy(&zealphp_orig_handlers);
     zend_hash_destroy(&zealphp_callbacks);
+    zend_hash_destroy(&zealphp_coro_snapshots);
     return SUCCESS;
 }
 
@@ -424,6 +553,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_superglobals_restore, 0,
     ZEND_ARG_TYPE_INFO(0, snapshot, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_coroutine_superglobals, 0, 1, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
 static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_override,               arginfo_zealphp_override)
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
@@ -432,6 +565,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_superglobals_clear,     arginfo_zealphp_superglobals_clear)
     PHP_FE(zealphp_superglobals_save,      arginfo_zealphp_superglobals_save)
     PHP_FE(zealphp_superglobals_restore,   arginfo_zealphp_superglobals_restore)
+    PHP_FE(zealphp_coroutine_superglobals, arginfo_zealphp_coroutine_superglobals)
     PHP_FE_END
 };
 
