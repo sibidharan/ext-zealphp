@@ -46,6 +46,15 @@ static coro_switch_fn_t os_set_on_resume = NULL;
 static coro_switch_fn_t os_set_on_close  = NULL;
 static coro_get_cid_fn_t os_get_cid      = NULL;
 
+/* Original OpenSwoole callbacks — must be chained, not replaced.
+ * set_on_yield REPLACES the callback; PHPCoroutine::on_yield handles
+ * PHP executor context switching (EG/CG swap). Without chaining,
+ * PHP state is corrupted on coroutine resume → SIGSEGV. */
+typedef void (*coro_callback_fn_t)(void *);
+static coro_callback_fn_t orig_on_yield  = NULL;
+static coro_callback_fn_t orig_on_resume = NULL;
+static coro_callback_fn_t orig_on_close  = NULL;
+
 static const char *sg_names[] = {"_GET","_POST","_COOKIE","_SERVER","_FILES","_REQUEST","_SESSION", NULL};
 
 /* ── Per-request define() isolation ─────────────────────────────────── */
@@ -65,13 +74,20 @@ static bool zealphp_globals_snapshotted = false;
 
 static void zealphp_snapshot_save(long cid)
 {
+    /* Guard: EG(symbol_table) may be invalid during coroutine teardown.
+     * Check that the table has a valid nTableMask (non-zero when initialized). */
+    if (!EG(symbol_table).nTableMask) return;
+
     zval snapshot;
     array_init(&snapshot);
     for (const char **n = sg_names; *n; n++) {
         zval *sg = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
-        if (sg) {
+        if (sg && Z_TYPE_P(sg) == IS_ARRAY) {
+            /* Deep copy the array to avoid sharing zvals with the live
+             * symbol table — the original may be modified or freed between
+             * yield and resume/close. */
             zval copy;
-            ZVAL_COPY(&copy, sg);
+            ZVAL_DUP(&copy, sg);
             add_assoc_zval(&snapshot, *n, &copy);
         }
     }
@@ -86,15 +102,12 @@ static void zealphp_snapshot_restore(long cid)
     for (const char **n = sg_names; *n; n++) {
         zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
         if (val) {
-            zval *existing = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
-            if (existing) {
-                zval_ptr_dtor(existing);
-                ZVAL_COPY(existing, val);
-            } else {
-                zval copy;
-                ZVAL_COPY(&copy, val);
-                zend_hash_str_add_new(&EG(symbol_table), *n, strlen(*n), &copy);
-            }
+            /* Use zend_hash_str_update instead of in-place modification.
+             * zval_ptr_dtor on the old value can trigger GC which rehashes
+             * EG(symbol_table), invalidating any pointer from _find(). */
+            zval copy;
+            ZVAL_COPY(&copy, val);
+            zend_hash_str_update(&EG(symbol_table), *n, strlen(*n), &copy);
         }
     }
 }
@@ -126,16 +139,23 @@ static void zealphp_on_yield(void *arg)
 {
     if (!arg) return;
     zealphp_snapshot_save((zend_long)(uintptr_t)arg);
+    /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap */
+    if (orig_on_yield) orig_on_yield(arg);
 }
 
 static void zealphp_on_resume(void *arg)
 {
+    /* Chain to OpenSwoole's PHPCoroutine::on_resume FIRST — restores EG/CG
+     * so EG(symbol_table) is valid when we read/write superglobals */
+    if (orig_on_resume) orig_on_resume(arg);
     if (!arg) return;
     zealphp_snapshot_restore((zend_long)(uintptr_t)arg);
 }
 
 static void zealphp_on_close(void *arg)
 {
+    /* Chain to OpenSwoole's PHPCoroutine::on_close FIRST */
+    if (orig_on_close) orig_on_close(arg);
     if (!arg) return;
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
 }
@@ -489,6 +509,38 @@ PHP_FUNCTION(zealphp_coroutine_superglobals)
     }
 
     if (!zealphp_coro_hooks_active) {
+        /* Save existing OpenSwoole callbacks (PHPCoroutine::on_yield/resume/close)
+         * via the Coroutine::on_yield/on_resume global variables. These handle
+         * PHP executor context switching — we MUST chain to them, not replace. */
+        void *handle = dlopen(NULL, RTLD_LAZY);
+        if (handle) {
+            static const char *yield_var_names[] = {
+                "_ZN10openswoole9Coroutine8on_yieldE",
+                "_ZN6swoole9Coroutine8on_yieldE", NULL
+            };
+            static const char *resume_var_names[] = {
+                "_ZN10openswoole9Coroutine9on_resumeE",
+                "_ZN6swoole9Coroutine9on_resumeE", NULL
+            };
+            static const char *close_var_names[] = {
+                "_ZN10openswoole9Coroutine8on_closeE",
+                "_ZN6swoole9Coroutine8on_closeE", NULL
+            };
+            for (const char **n = yield_var_names; *n && !orig_on_yield; n++) {
+                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+                if (p) orig_on_yield = *p;
+            }
+            for (const char **n = resume_var_names; *n && !orig_on_resume; n++) {
+                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+                if (p) orig_on_resume = *p;
+            }
+            for (const char **n = close_var_names; *n && !orig_on_close; n++) {
+                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+                if (p) orig_on_close = *p;
+            }
+            dlclose(handle);
+        }
+
         os_set_on_yield(zealphp_on_yield);
         os_set_on_resume(zealphp_on_resume);
         os_set_on_close(zealphp_on_close);
@@ -750,7 +802,7 @@ PHP_MINIT_FUNCTION(zealphp)
 {
     zend_hash_init(&zealphp_orig_handlers, 32, NULL, NULL, 1);
     zend_hash_init(&zealphp_callbacks, 32, NULL, ZVAL_PTR_DTOR, 1);
-    zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 1);
+    zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_request_constants, 64, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_globals_snapshot, 128, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_files, 256, NULL, ZVAL_PTR_DTOR, 1);
