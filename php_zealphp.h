@@ -4,7 +4,7 @@
 extern zend_module_entry zealphp_module_entry;
 #define phpext_zealphp_ptr &zealphp_module_entry
 
-#define PHP_ZEALPHP_VERSION "0.1.9"
+#define PHP_ZEALPHP_VERSION "0.2.1"
 
 PHP_MINIT_FUNCTION(zealphp);
 PHP_MSHUTDOWN_FUNCTION(zealphp);
@@ -18,5 +18,7 @@ PHP_FUNCTION(zealphp_superglobals_clear);
 PHP_FUNCTION(zealphp_superglobals_save);
 PHP_FUNCTION(zealphp_superglobals_restore);
 PHP_FUNCTION(zealphp_coroutine_superglobals);
+PHP_FUNCTION(zealphp_constants_clear);
+PHP_FUNCTION(zealphp_define_hook);
 
 #endif

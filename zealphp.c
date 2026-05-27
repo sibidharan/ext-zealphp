@@ -48,6 +48,14 @@ static coro_get_cid_fn_t os_get_cid      = NULL;
 
 static const char *sg_names[] = {"_GET","_POST","_COOKIE","_SERVER","_FILES","_REQUEST","_SESSION", NULL};
 
+/* ── Per-request define() isolation ─────────────────────────────────── */
+
+/* Track constants defined during the current request so they can be
+ * removed on request end. Keys = constant name (case-sensitive zend_string). */
+static HashTable zealphp_request_constants;
+static bool zealphp_define_hooked = false;
+static zif_handler zealphp_orig_define_handler = NULL;
+
 static void zealphp_snapshot_save(long cid)
 {
     zval snapshot;
@@ -483,6 +491,74 @@ PHP_FUNCTION(zealphp_coroutine_superglobals)
     RETURN_TRUE;
 }
 
+/* ── define() interception ───────────────────────────────────────── */
+
+/* Intercept define() to track per-request constants. The real define()
+ * runs first; if it succeeds, we record the name so zealphp_constants_clear()
+ * can remove it at request end. */
+static ZEND_NAMED_FUNCTION(zealphp_define_intercept)
+{
+    /* Forward to the real define() first */
+    zealphp_orig_define_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+
+    /* If define() succeeded (returned true), track the constant name */
+    if (Z_TYPE_P(return_value) == IS_TRUE) {
+        zval *arg1 = ZEND_CALL_ARG(execute_data, 1);
+        if (arg1 && Z_TYPE_P(arg1) == IS_STRING) {
+            zval one;
+            ZVAL_LONG(&one, 1);
+            zend_hash_update(&zealphp_request_constants, Z_STR_P(arg1), &one);
+        }
+    }
+}
+
+/* ── zealphp_constants_clear(): void ─────────────────────────────── */
+
+PHP_FUNCTION(zealphp_constants_clear)
+{
+    zend_string *name;
+    ZEND_HASH_FOREACH_STR_KEY(&zealphp_request_constants, name) {
+        if (name) {
+            /* zend_hash_del on EG(zend_constants) removes the constant.
+             * Case-sensitive constants use the exact name as key. */
+            zend_hash_del(EG(zend_constants), name);
+        }
+    } ZEND_HASH_FOREACH_END();
+    zend_hash_clean(&zealphp_request_constants);
+}
+
+/* ── zealphp_define_hook(bool $enable): bool ─────────────────────── */
+
+PHP_FUNCTION(zealphp_define_hook)
+{
+    bool enable;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_BOOL(enable)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (enable && !zealphp_define_hooked) {
+        zend_string *name = zend_string_init("define", sizeof("define") - 1, 0);
+        zend_function *func = zend_hash_find_ptr(CG(function_table), name);
+        if (func && func->type == ZEND_INTERNAL_FUNCTION) {
+            zealphp_orig_define_handler = func->internal_function.handler;
+            func->internal_function.handler = zealphp_define_intercept;
+            zealphp_define_hooked = true;
+        }
+        zend_string_release(name);
+    } else if (!enable && zealphp_define_hooked) {
+        zend_string *name = zend_string_init("define", sizeof("define") - 1, 0);
+        zend_function *func = zend_hash_find_ptr(CG(function_table), name);
+        if (func && zealphp_orig_define_handler) {
+            func->internal_function.handler = zealphp_orig_define_handler;
+            zealphp_orig_define_handler = NULL;
+            zealphp_define_hooked = false;
+        }
+        zend_string_release(name);
+    }
+
+    RETURN_BOOL(zealphp_define_hooked);
+}
+
 /* ── Module lifecycle ────────────────────────────────────────────── */
 
 PHP_MINIT_FUNCTION(zealphp)
@@ -490,6 +566,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_orig_handlers, 32, NULL, NULL, 1);
     zend_hash_init(&zealphp_callbacks, 32, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 1);
+    zend_hash_init(&zealphp_request_constants, 64, NULL, ZVAL_PTR_DTOR, 1);
 
     /* Try to hook into OpenSwoole's coroutine scheduler for per-coroutine
      * superglobal isolation. Resolved at runtime via dlsym — if OpenSwoole
@@ -593,6 +670,13 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_coroutine_superglobals, 
     ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_constants_clear, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_define_hook, 0, 1, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
 static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_override,               arginfo_zealphp_override)
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
@@ -602,6 +686,8 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_superglobals_save,      arginfo_zealphp_superglobals_save)
     PHP_FE(zealphp_superglobals_restore,   arginfo_zealphp_superglobals_restore)
     PHP_FE(zealphp_coroutine_superglobals, arginfo_zealphp_coroutine_superglobals)
+    PHP_FE(zealphp_constants_clear,        arginfo_zealphp_constants_clear)
+    PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
     PHP_FE_END
 };
 
