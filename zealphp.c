@@ -102,19 +102,19 @@ static void zealphp_snapshot_restore(long cid)
     for (const char **n = sg_names; *n; n++) {
         zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
         if (val) {
-            /* In-place zval swap: same pattern as zealphp_set_superglobal.
-             * Preserves the zval memory address so CV caches in included
-             * files (which store a pointer to this zval) stay valid.
-             * Safe ordering: copy new → dtor old (survives GC rehash). */
+            /* In-place zval swap with ZVAL_DUP: same pattern as
+             * zealphp_set_superglobal. Preserves the zval memory address
+             * (CV cache compatible) AND creates a full copy with refcount=1
+             * (no COW separation on write). */
             zval *existing = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
             if (existing) {
                 zval old;
                 ZVAL_COPY_VALUE(&old, existing);
-                ZVAL_COPY(existing, val);
+                ZVAL_DUP(existing, val);
                 zval_ptr_dtor(&old);
             } else {
                 zval copy;
-                ZVAL_COPY(&copy, val);
+                ZVAL_DUP(&copy, val);
                 zend_hash_str_add_new(&EG(symbol_table), *n, strlen(*n), &copy);
             }
         }
@@ -417,11 +417,17 @@ static void zealphp_set_superglobal(const char *name, size_t name_len, zval *val
     if (existing) {
         zval old;
         ZVAL_COPY_VALUE(&old, existing);
-        ZVAL_COPY(existing, value);
+        /* ZVAL_DUP creates a full copy with refcount=1. ZVAL_COPY would share
+         * the zend_array via refcount — PHP's COW then separates on the first
+         * write ($_SESSION['x']++), sending the mutation to a COPY while the
+         * EG(symbol_table) zval keeps the old shared array. With DUP, the
+         * zval in EG(symbol_table) owns its array exclusively and the file's
+         * writes go directly into it. */
+        ZVAL_DUP(existing, value);
         zval_ptr_dtor(&old);
     } else {
         zval copy;
-        ZVAL_COPY(&copy, value);
+        ZVAL_DUP(&copy, value);
         zend_hash_str_add_new(&EG(symbol_table), name, name_len, &copy);
     }
 }
