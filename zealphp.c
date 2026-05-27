@@ -94,37 +94,6 @@ static void zealphp_snapshot_save(long cid)
     zend_hash_index_update(&zealphp_coro_snapshots, (zend_ulong)cid, &snapshot);
 }
 
-/* Update a superglobal array IN-PLACE: clear the existing HashTable and
- * copy entries from the source. Preserves the zend_array* pointer so any
- * compiled-variable (CV) cache in included files still references the same
- * array — just with updated contents. Without this, ZVAL_COPY/zend_hash_update
- * replaces the zend_array*, and CVs cached from a prior coroutine's execution
- * still point at the OLD array (PHP auto-global caching in long-running processes).
- * Falls back to zend_hash_str_update for non-array or missing entries. */
-static void zealphp_update_superglobal_inplace(const char *name, size_t name_len, zval *val)
-{
-    zval *existing = zend_hash_str_find(&EG(symbol_table), name, name_len);
-    if (existing && Z_TYPE_P(existing) == IS_ARRAY && Z_TYPE_P(val) == IS_ARRAY) {
-        zend_hash_clean(Z_ARRVAL_P(existing));
-        zval *entry;
-        zend_string *key;
-        zend_ulong idx;
-        ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(val), idx, key, entry) {
-            zval copy;
-            ZVAL_COPY(&copy, entry);
-            if (key) {
-                zend_hash_add_new(Z_ARRVAL_P(existing), key, &copy);
-            } else {
-                zend_hash_index_add_new(Z_ARRVAL_P(existing), idx, &copy);
-            }
-        } ZEND_HASH_FOREACH_END();
-    } else {
-        zval copy;
-        ZVAL_COPY(&copy, val);
-        zend_hash_str_update(&EG(symbol_table), name, name_len, &copy);
-    }
-}
-
 static void zealphp_snapshot_restore(long cid)
 {
     zval *snapshot = zend_hash_index_find(&zealphp_coro_snapshots, (zend_ulong)cid);
@@ -133,7 +102,12 @@ static void zealphp_snapshot_restore(long cid)
     for (const char **n = sg_names; *n; n++) {
         zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
         if (val) {
-            zealphp_update_superglobal_inplace(*n, strlen(*n), val);
+            /* Use zend_hash_str_update instead of in-place modification.
+             * zval_ptr_dtor on the old value can trigger GC which rehashes
+             * EG(symbol_table), invalidating any pointer from _find(). */
+            zval copy;
+            ZVAL_COPY(&copy, val);
+            zend_hash_str_update(&EG(symbol_table), *n, strlen(*n), &copy);
         }
     }
 }
@@ -419,12 +393,18 @@ PHP_FUNCTION(zealphp_restore_all)
 
 /* ── Superglobals management ─────────────────────────────────────── */
 
-/* Helper: overwrite a superglobal in the executor symbol table.
- * Uses in-place update to preserve the zend_array* pointer for CV cache
- * compatibility in coroutine mode. */
+/* Helper: overwrite a superglobal in the executor symbol table. */
 static void zealphp_set_superglobal(const char *name, size_t name_len, zval *value)
 {
-    zealphp_update_superglobal_inplace(name, name_len, value);
+    zval *existing = zend_hash_str_find(&EG(symbol_table), name, name_len);
+    if (existing) {
+        zval_ptr_dtor(existing);
+        ZVAL_COPY(existing, value);
+    } else {
+        zval copy;
+        ZVAL_COPY(&copy, value);
+        zend_hash_str_add_new(&EG(symbol_table), name, name_len, &copy);
+    }
 }
 
 /* zealphp_superglobals_set(array $g, $p, $c, $s, $f, $r, $sess): void
