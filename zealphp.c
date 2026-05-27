@@ -576,6 +576,11 @@ PHP_FUNCTION(zealphp_process_state_clean)
     efree(del_files);
 
     /* --- User classes: remove entries not in snapshot --- */
+    /* SAFETY: skip classes that have initialized static members (runtime
+     * copy of default_static_members_table). Removing such classes via
+     * zend_hash_del leaves a zombie entry (class_exists returns true but
+     * statics are inaccessible → segfault). See ext-zealphp#1.
+     * Classes without statics or with never-accessed statics are safe. */
     zend_string **del_cls = NULL;
     uint32_t dc_count = 0, dc_cap = 64;
     del_cls = emalloc(sizeof(zend_string *) * dc_cap);
@@ -584,6 +589,12 @@ PHP_FUNCTION(zealphp_process_state_clean)
         if (key && !zend_hash_exists(&zealphp_snapshot_classes, key)) {
             zend_class_entry *ce = Z_PTR_P(val);
             if (ce && ce->type == ZEND_USER_CLASS) {
+                /* Skip if statics have been initialized at runtime */
+                if (ce->default_static_members_count > 0
+                    && CE_STATIC_MEMBERS(ce) != NULL
+                    && CE_STATIC_MEMBERS(ce) != ce->default_static_members_table) {
+                    continue;  /* unsafe to remove — zombie class risk */
+                }
                 if (dc_count >= dc_cap) { dc_cap *= 2; del_cls = erealloc(del_cls, sizeof(zend_string *) * dc_cap); }
                 del_cls[dc_count++] = key;
             }
