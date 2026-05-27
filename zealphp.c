@@ -102,9 +102,21 @@ static void zealphp_snapshot_restore(long cid)
     for (const char **n = sg_names; *n; n++) {
         zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
         if (val) {
-            /* Delegate to zealphp_set_superglobal which handles both
-             * EG(symbol_table) in-place swap AND PG(http_globals) update. */
-            zealphp_set_superglobal(*n, strlen(*n), val);
+            /* In-place zval swap with ZVAL_DUP: same pattern as
+             * zealphp_set_superglobal. Preserves the zval memory address
+             * (CV cache compatible) AND creates a full copy with refcount=1
+             * (no COW separation on write). */
+            zval *existing = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
+            if (existing) {
+                zval old;
+                ZVAL_COPY_VALUE(&old, existing);
+                ZVAL_DUP(existing, val);
+                zval_ptr_dtor(&old);
+            } else {
+                zval copy;
+                ZVAL_DUP(&copy, val);
+                zend_hash_str_add_new(&EG(symbol_table), *n, strlen(*n), &copy);
+            }
         }
     }
 }
@@ -390,51 +402,33 @@ PHP_FUNCTION(zealphp_restore_all)
 
 /* ── Superglobals management ─────────────────────────────────────── */
 
-/* Map superglobal name to PG(http_globals) index.
- * Returns -1 for _SESSION/_ENV (no TRACK_VARS slot). */
-static int zealphp_track_vars_index(const char *name)
-{
-    if (name[0] != '_') return -1;
-    if (strcmp(name, "_GET") == 0)     return TRACK_VARS_GET;
-    if (strcmp(name, "_POST") == 0)    return TRACK_VARS_POST;
-    if (strcmp(name, "_COOKIE") == 0)  return TRACK_VARS_COOKIE;
-    if (strcmp(name, "_SERVER") == 0)  return TRACK_VARS_SERVER;
-    if (strcmp(name, "_FILES") == 0)   return TRACK_VARS_FILES;
-    if (strcmp(name, "_REQUEST") == 0) return TRACK_VARS_REQUEST;
-    return -1;
-}
-
-/* Helper: overwrite a superglobal in the executor symbol table AND
- * update PG(http_globals) so PHP's auto-global JIT resolves correctly.
+/* Helper: overwrite a superglobal in the executor symbol table.
+ * Uses in-place zval swap so the zval memory ADDRESS stays the same —
+ * critical for coroutine mode where compiled-variable (CV) caches in
+ * included files store a pointer to this zval. zend_hash_str_update
+ * would allocate a new bucket (different address), staling the CV cache.
  *
- * PG(http_globals)[TRACK_VARS_*] is what PHP reads when the auto-global
- * JIT fires. In OpenSwoole coroutine mode, PG() is process-wide (not
- * per-coroutine). Without this update, the JIT returns stale data from
- * a prior coroutine. Updating PG(http_globals) on every set ensures
- * the next auto-global resolution sees the current request's data.
- *
- * ZVAL_DUP creates a full copy with refcount=1 (no COW on write).
- * Safe ordering: copy new → dtor old (survives GC rehash). */
+ * Safe ordering: copy new value IN first, THEN dtor old. If dtor triggers
+ * GC which rehashes EG(symbol_table), the `existing` pointer was already
+ * used in the ZVAL_COPY step, so the rehash doesn't cause a use-after-free. */
 static void zealphp_set_superglobal(const char *name, size_t name_len, zval *value)
 {
     zval *existing = zend_hash_str_find(&EG(symbol_table), name, name_len);
     if (existing) {
         zval old;
         ZVAL_COPY_VALUE(&old, existing);
+        /* ZVAL_DUP creates a full copy with refcount=1. ZVAL_COPY would share
+         * the zend_array via refcount — PHP's COW then separates on the first
+         * write ($_SESSION['x']++), sending the mutation to a COPY while the
+         * EG(symbol_table) zval keeps the old shared array. With DUP, the
+         * zval in EG(symbol_table) owns its array exclusively and the file's
+         * writes go directly into it. */
         ZVAL_DUP(existing, value);
         zval_ptr_dtor(&old);
     } else {
         zval copy;
         ZVAL_DUP(&copy, value);
         zend_hash_str_add_new(&EG(symbol_table), name, name_len, &copy);
-        existing = zend_hash_str_find(&EG(symbol_table), name, name_len);
-    }
-
-    /* Update PG(http_globals) so auto-global JIT resolves to current data */
-    int idx = zealphp_track_vars_index(name);
-    if (idx >= 0 && existing) {
-        zval_ptr_dtor(&PG(http_globals)[idx]);
-        ZVAL_COPY(&PG(http_globals)[idx], existing);
     }
 }
 
