@@ -56,6 +56,13 @@ static HashTable zealphp_request_constants;
 static bool zealphp_define_hooked = false;
 static zif_handler zealphp_orig_define_handler = NULL;
 
+/* ── Per-request $GLOBALS isolation ─────────────────────────────────── */
+
+/* Snapshot of EG(symbol_table) keys at boot. Keys added after the snapshot
+ * are considered request-scoped and removed by zealphp_globals_clean(). */
+static HashTable zealphp_globals_snapshot;
+static bool zealphp_globals_snapshotted = false;
+
 static void zealphp_snapshot_save(long cid)
 {
     zval snapshot;
@@ -491,6 +498,61 @@ PHP_FUNCTION(zealphp_coroutine_superglobals)
     RETURN_TRUE;
 }
 
+/* ── $GLOBALS snapshot/clean ─────────────────────────────────────── */
+
+/* zealphp_globals_snapshot(): void — save current EG(symbol_table) keys */
+PHP_FUNCTION(zealphp_globals_snapshot)
+{
+    zend_string *key;
+
+    if (zealphp_globals_snapshotted) {
+        zend_hash_clean(&zealphp_globals_snapshot);
+    }
+
+    ZEND_HASH_FOREACH_STR_KEY(&EG(symbol_table), key) {
+        if (key) {
+            zval one;
+            ZVAL_LONG(&one, 1);
+            zend_hash_update(&zealphp_globals_snapshot, key, &one);
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    zealphp_globals_snapshotted = true;
+}
+
+/* zealphp_globals_clean(): void — remove keys not in the snapshot */
+PHP_FUNCTION(zealphp_globals_clean)
+{
+    zend_string *key;
+    zval *val;
+
+    if (!zealphp_globals_snapshotted) {
+        return;
+    }
+
+    /* Collect keys to delete (can't delete while iterating) */
+    zend_string **to_delete = NULL;
+    uint32_t delete_count = 0;
+    uint32_t delete_cap = 64;
+    to_delete = emalloc(sizeof(zend_string *) * delete_cap);
+
+    ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, val) {
+        if (key && !zend_hash_exists(&zealphp_globals_snapshot, key)) {
+            if (delete_count >= delete_cap) {
+                delete_cap *= 2;
+                to_delete = erealloc(to_delete, sizeof(zend_string *) * delete_cap);
+            }
+            to_delete[delete_count++] = key;
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    for (uint32_t i = 0; i < delete_count; i++) {
+        zend_hash_del(&EG(symbol_table), to_delete[i]);
+    }
+
+    efree(to_delete);
+}
+
 /* ── define() interception ───────────────────────────────────────── */
 
 /* Intercept define() to track per-request constants. The real define()
@@ -567,6 +629,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_callbacks, 32, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_request_constants, 64, NULL, ZVAL_PTR_DTOR, 1);
+    zend_hash_init(&zealphp_globals_snapshot, 128, NULL, ZVAL_PTR_DTOR, 1);
 
     /* Try to hook into OpenSwoole's coroutine scheduler for per-coroutine
      * superglobal isolation. Resolved at runtime via dlsym — if OpenSwoole
@@ -673,6 +736,12 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_constants_clear, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_globals_snapshot, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_globals_clean, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_define_hook, 0, 1, _IS_BOOL, 0)
     ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
@@ -688,6 +757,8 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_coroutine_superglobals, arginfo_zealphp_coroutine_superglobals)
     PHP_FE(zealphp_constants_clear,        arginfo_zealphp_constants_clear)
     PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
+    PHP_FE(zealphp_globals_snapshot,       arginfo_zealphp_globals_snapshot)
+    PHP_FE(zealphp_globals_clean,          arginfo_zealphp_globals_clean)
     PHP_FE_END
 };
 
