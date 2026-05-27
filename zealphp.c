@@ -1049,6 +1049,28 @@ PHP_FUNCTION(zealphp_constants_clear)
     zend_hash_clean(&zealphp_request_constants);
 }
 
+/* ── zealphp_ini_restore(): void ──────────────────────────────────── */
+/* Restore all ini entries modified by ini_set() during this request.
+ * Called at request end from SessionManager/CoSessionManager. For
+ * sequential requests (no yield), the coroutine hooks don't fire, so
+ * this is the cleanup path. */
+PHP_FUNCTION(zealphp_ini_restore)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    if (!EG(modified_ini_directives)) return;
+
+    zend_ini_entry *entry;
+    ZEND_HASH_FOREACH_PTR(EG(modified_ini_directives), entry) {
+        if (entry && entry->orig_value && entry->value != entry->orig_value) {
+            zend_string *orig = zend_string_copy(entry->orig_value);
+            zend_alter_ini_entry_ex(entry, orig,
+                entry->modifiable, ZEND_INI_STAGE_RUNTIME, 1);
+            zend_string_release(orig);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
 /* ── zealphp_define_hook(bool $enable): bool ─────────────────────── */
 
 PHP_FUNCTION(zealphp_define_hook)
@@ -1228,6 +1250,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_superglobals_restore,   arginfo_zealphp_superglobals_restore)
     PHP_FE(zealphp_coroutine_superglobals, arginfo_zealphp_coroutine_superglobals)
     PHP_FE(zealphp_constants_clear,        arginfo_zealphp_constants_clear)
+    PHP_FE(zealphp_ini_restore,           arginfo_zealphp_constants_clear)
     PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
     PHP_FE(zealphp_globals_snapshot,       arginfo_zealphp_globals_snapshot)
     PHP_FE(zealphp_globals_clean,          arginfo_zealphp_globals_clean)
