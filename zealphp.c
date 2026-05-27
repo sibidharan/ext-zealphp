@@ -402,33 +402,53 @@ PHP_FUNCTION(zealphp_restore_all)
 
 /* ── Superglobals management ─────────────────────────────────────── */
 
-/* Helper: overwrite a superglobal in the executor symbol table.
- * Uses in-place zval swap so the zval memory ADDRESS stays the same —
- * critical for coroutine mode where compiled-variable (CV) caches in
- * included files store a pointer to this zval. zend_hash_str_update
- * would allocate a new bucket (different address), staling the CV cache.
+/* Map superglobal name to PG(http_globals) TRACK_VARS index.
+ * Returns -1 for _SESSION/_ENV (no TRACK_VARS slot). */
+static int zealphp_track_vars_index(const char *name)
+{
+    if (name[0] != '_') return -1;
+    if (strcmp(name, "_GET") == 0)     return TRACK_VARS_GET;
+    if (strcmp(name, "_POST") == 0)    return TRACK_VARS_POST;
+    if (strcmp(name, "_COOKIE") == 0)  return TRACK_VARS_COOKIE;
+    if (strcmp(name, "_SERVER") == 0)  return TRACK_VARS_SERVER;
+    if (strcmp(name, "_FILES") == 0)   return TRACK_VARS_FILES;
+    if (strcmp(name, "_REQUEST") == 0) return TRACK_VARS_REQUEST;
+    return -1;
+}
+
+/* Helper: overwrite a superglobal in the executor symbol table AND
+ * update PG(http_globals) so PHP's auto-global JIT resolves correctly.
  *
- * Safe ordering: copy new value IN first, THEN dtor old. If dtor triggers
- * GC which rehashes EG(symbol_table), the `existing` pointer was already
- * used in the ZVAL_COPY step, so the rehash doesn't cause a use-after-free. */
+ * EG(symbol_table): in-place zval swap via ZVAL_DUP preserves the zval
+ * memory ADDRESS (CV cache compatible) with refcount=1 (no COW on write).
+ *
+ * PG(http_globals): PHP's auto-global JIT callback reads from this
+ * process-wide array. In CLI SAPI these slots start as IS_UNDEF —
+ * must check type before zval_ptr_dtor to avoid segfault. */
 static void zealphp_set_superglobal(const char *name, size_t name_len, zval *value)
 {
     zval *existing = zend_hash_str_find(&EG(symbol_table), name, name_len);
     if (existing) {
         zval old;
         ZVAL_COPY_VALUE(&old, existing);
-        /* ZVAL_DUP creates a full copy with refcount=1. ZVAL_COPY would share
-         * the zend_array via refcount — PHP's COW then separates on the first
-         * write ($_SESSION['x']++), sending the mutation to a COPY while the
-         * EG(symbol_table) zval keeps the old shared array. With DUP, the
-         * zval in EG(symbol_table) owns its array exclusively and the file's
-         * writes go directly into it. */
         ZVAL_DUP(existing, value);
         zval_ptr_dtor(&old);
     } else {
         zval copy;
         ZVAL_DUP(&copy, value);
         zend_hash_str_add_new(&EG(symbol_table), name, name_len, &copy);
+        existing = zend_hash_str_find(&EG(symbol_table), name, name_len);
+    }
+
+    /* Sync PG(http_globals) — the source auto-global JIT reads from.
+     * CLI SAPI never initializes these slots (they're IS_UNDEF), so
+     * guard the dtor. After this, the JIT callback returns our data. */
+    int idx = zealphp_track_vars_index(name);
+    if (idx >= 0 && existing) {
+        if (Z_TYPE(PG(http_globals)[idx]) != IS_UNDEF) {
+            zval_ptr_dtor(&PG(http_globals)[idx]);
+        }
+        ZVAL_COPY(&PG(http_globals)[idx], existing);
     }
 }
 
