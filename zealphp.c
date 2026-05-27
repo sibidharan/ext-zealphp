@@ -57,6 +57,9 @@ static coro_callback_fn_t orig_on_close  = NULL;
 
 static const char *sg_names[] = {"_GET","_POST","_COOKIE","_SERVER","_FILES","_REQUEST","_SESSION", NULL};
 
+/* Per-coroutine constant snapshots: coro_id → HashTable(name → zval value) */
+static HashTable zealphp_coro_constant_snapshots;
+
 /* ── Per-request define() isolation ─────────────────────────────────── */
 
 /* Track constants defined during the current request so they can be
@@ -71,6 +74,96 @@ static zif_handler zealphp_orig_define_handler = NULL;
  * are considered request-scoped and removed by zealphp_globals_clean(). */
 static HashTable zealphp_globals_snapshot;
 static bool zealphp_globals_snapshotted = false;
+
+/* Save request-scoped constants for this coroutine. Copies the constant
+ * values from EG(zend_constants) and removes them so the next coroutine
+ * starts with a clean constant table (only boot-time constants remain). */
+static void zealphp_constants_snapshot_save(long cid)
+{
+    if (!zealphp_define_hooked || zend_hash_num_elements(&zealphp_request_constants) == 0) {
+        return;
+    }
+
+    zval snapshot;
+    array_init(&snapshot);
+
+    zend_string *name;
+    ZEND_HASH_FOREACH_STR_KEY(&zealphp_request_constants, name) {
+        if (name) {
+            zend_constant *c = zend_hash_find_ptr(EG(zend_constants), name);
+            if (c) {
+                zval val_copy;
+                ZVAL_DUP(&val_copy, &c->value);
+                zend_hash_update(Z_ARRVAL(snapshot), name, &val_copy);
+                /* Remove from EG so next coroutine doesn't see it */
+                zend_hash_del(EG(zend_constants), name);
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    /* Also save the tracked names set so we know which to restore */
+    zval names_snapshot;
+    array_init(&names_snapshot);
+    ZEND_HASH_FOREACH_STR_KEY(&zealphp_request_constants, name) {
+        if (name) {
+            zval one;
+            ZVAL_LONG(&one, 1);
+            zend_hash_update(Z_ARRVAL(names_snapshot), name, &one);
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    /* Store both under this coroutine's ID */
+    zval pair;
+    array_init(&pair);
+    zend_hash_str_update(Z_ARRVAL(pair), "values", sizeof("values") - 1, &snapshot);
+    zend_hash_str_update(Z_ARRVAL(pair), "names", sizeof("names") - 1, &names_snapshot);
+    zend_hash_index_update(&zealphp_coro_constant_snapshots, (zend_ulong)cid, &pair);
+
+    /* Clear the process-wide tracker */
+    zend_hash_clean(&zealphp_request_constants);
+}
+
+/* Restore this coroutine's request-scoped constants into EG(zend_constants). */
+static void zealphp_constants_snapshot_restore(long cid)
+{
+    zval *pair = zend_hash_index_find(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
+    if (!pair || Z_TYPE_P(pair) != IS_ARRAY) return;
+
+    zval *values = zend_hash_str_find(Z_ARRVAL_P(pair), "values", sizeof("values") - 1);
+    zval *names = zend_hash_str_find(Z_ARRVAL_P(pair), "names", sizeof("names") - 1);
+    if (!values || Z_TYPE_P(values) != IS_ARRAY) return;
+
+    /* Re-register each constant in EG(zend_constants) */
+    zend_string *name;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(values), name, val) {
+        if (name && !zend_hash_exists(EG(zend_constants), name)) {
+            zend_constant c;
+            ZVAL_DUP(&c.value, val);
+            c.name = zend_string_copy(name);
+            ZEND_CONSTANT_SET_FLAGS(&c, 0, PHP_USER_CONSTANT);
+            zend_register_constant(&c);
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    /* Restore the tracked names into the process-wide tracker */
+    if (names && Z_TYPE_P(names) == IS_ARRAY) {
+        zend_hash_clean(&zealphp_request_constants);
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(names), name, val) {
+            if (name) {
+                zval one;
+                ZVAL_LONG(&one, 1);
+                zend_hash_update(&zealphp_request_constants, name, &one);
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+}
+
+/* Clean up this coroutine's constant snapshot (on close). */
+static void zealphp_constants_snapshot_delete(long cid)
+{
+    zend_hash_index_del(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
+}
 
 static void zealphp_snapshot_save(long cid)
 {
@@ -148,6 +241,7 @@ static void zealphp_on_yield(void *arg)
 {
     if (!arg) return;
     zealphp_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
     /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap */
     if (orig_on_yield) orig_on_yield(arg);
 }
@@ -159,6 +253,7 @@ static void zealphp_on_resume(void *arg)
     if (orig_on_resume) orig_on_resume(arg);
     if (!arg) return;
     zealphp_snapshot_restore((zend_long)(uintptr_t)arg);
+    zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
 }
 
 static void zealphp_on_close(void *arg)
@@ -167,6 +262,7 @@ static void zealphp_on_close(void *arg)
     if (orig_on_close) orig_on_close(arg);
     if (!arg) return;
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
+    zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
 }
 
 /* ── Allowlist ───────────────────────────────────────────────────────── */
@@ -848,6 +944,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_orig_handlers, 32, NULL, NULL, 1);
     zend_hash_init(&zealphp_callbacks, 32, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_request_constants, 64, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_globals_snapshot, 128, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_files, 256, NULL, ZVAL_PTR_DTOR, 1);
