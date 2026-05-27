@@ -60,6 +60,12 @@ static const char *sg_names[] = {"_GET","_POST","_COOKIE","_SERVER","_FILES","_R
 /* Per-coroutine constant snapshots: coro_id → HashTable(name → zval value) */
 static HashTable zealphp_coro_constant_snapshots;
 
+/* Per-coroutine ini_set snapshots: coro_id → HashTable(name → string value) */
+static HashTable zealphp_coro_ini_snapshots;
+
+/* Per-coroutine static property snapshots: coro_id → HashTable(class_name → zval[]) */
+static HashTable zealphp_coro_static_snapshots;
+
 /* ── Per-request define() isolation ─────────────────────────────────── */
 
 /* Track constants defined during the current request so they can be
@@ -165,6 +171,138 @@ static void zealphp_constants_snapshot_delete(long cid)
     zend_hash_index_del(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
 }
 
+/* ── Level 3: Per-coroutine ini_set isolation ──────────────────────── */
+
+/* Save modified ini entries for this coroutine and restore originals.
+ * EG(modified_ini_directives) tracks entries changed via ini_set().
+ * We save the current values and restore orig_value so the next
+ * coroutine sees unmodified ini state. On resume, re-apply. */
+static void zealphp_ini_snapshot_save(long cid)
+{
+    if (!EG(modified_ini_directives) ||
+        zend_hash_num_elements(EG(modified_ini_directives)) == 0) {
+        return;
+    }
+
+    zval snapshot;
+    array_init(&snapshot);
+
+    zend_ini_entry *ini_entry;
+    zend_string *name;
+    ZEND_HASH_FOREACH_STR_KEY_PTR(EG(modified_ini_directives), name, ini_entry) {
+        if (name && ini_entry && ini_entry->value) {
+            zval val;
+            ZVAL_STR_COPY(&val, ini_entry->value);
+            zend_hash_update(Z_ARRVAL(snapshot), name, &val);
+            /* Restore original value */
+            if (ini_entry->orig_value) {
+                zend_string *orig = zend_string_copy(ini_entry->orig_value);
+                zend_alter_ini_entry_ex(ini_entry, orig,
+                    ini_entry->modifiable, ZEND_INI_STAGE_RUNTIME, 1);
+                zend_string_release(orig);
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    zend_hash_index_update(&zealphp_coro_ini_snapshots, (zend_ulong)cid, &snapshot);
+}
+
+static void zealphp_ini_snapshot_restore(long cid)
+{
+    zval *snapshot = zend_hash_index_find(&zealphp_coro_ini_snapshots, (zend_ulong)cid);
+    if (!snapshot || Z_TYPE_P(snapshot) != IS_ARRAY) return;
+
+    zend_string *name;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(snapshot), name, val) {
+        if (name && Z_TYPE_P(val) == IS_STRING) {
+            zend_string *value = Z_STR_P(val);
+            zend_alter_ini_entry(name, value,
+                ZEND_INI_USER, ZEND_INI_STAGE_RUNTIME);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
+static void zealphp_ini_snapshot_delete(long cid)
+{
+    zend_hash_index_del(&zealphp_coro_ini_snapshots, (zend_ulong)cid);
+}
+
+/* ── Level 2: Per-coroutine static property isolation ─────────────── */
+
+/* Save static properties of user classes that have been accessed.
+ * Only snapshots classes where CE_STATIC_MEMBERS(ce) is non-NULL
+ * (lazy — unaccessed classes are skipped). */
+static void zealphp_statics_snapshot_save(long cid)
+{
+    zval snapshot;
+    array_init(&snapshot);
+    bool has_statics = false;
+
+    zend_string *class_name;
+    zval *cls_zv;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(CG(class_table), class_name, cls_zv) {
+        if (!class_name) continue;
+        zend_class_entry *ce = Z_PTR_P(cls_zv);
+        if (!ce || ce->type != ZEND_USER_CLASS) continue;
+        if (ce->default_static_members_count == 0) continue;
+
+        zval *statics = CE_STATIC_MEMBERS(ce);
+        if (!statics) continue;
+
+        /* Snapshot each static property value */
+        zval class_snapshot;
+        array_init_size(&class_snapshot, ce->default_static_members_count);
+        for (int i = 0; i < ce->default_static_members_count; i++) {
+            zval copy;
+            ZVAL_DUP(&copy, &statics[i]);
+            zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
+        }
+        zend_hash_update(Z_ARRVAL(snapshot), class_name, &class_snapshot);
+        has_statics = true;
+    } ZEND_HASH_FOREACH_END();
+
+    if (has_statics) {
+        zend_hash_index_update(&zealphp_coro_static_snapshots, (zend_ulong)cid, &snapshot);
+    } else {
+        zval_ptr_dtor(&snapshot);
+    }
+}
+
+static void zealphp_statics_snapshot_restore(long cid)
+{
+    zval *snapshot = zend_hash_index_find(&zealphp_coro_static_snapshots, (zend_ulong)cid);
+    if (!snapshot || Z_TYPE_P(snapshot) != IS_ARRAY) return;
+
+    zend_string *class_name;
+    zval *class_snapshot;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(snapshot), class_name, class_snapshot) {
+        if (!class_name || Z_TYPE_P(class_snapshot) != IS_ARRAY) continue;
+
+        zval *cls_zv = zend_hash_find(CG(class_table), class_name);
+        if (!cls_zv) continue;
+        zend_class_entry *ce = Z_PTR_P(cls_zv);
+        if (!ce || ce->type != ZEND_USER_CLASS) continue;
+
+        zval *statics = CE_STATIC_MEMBERS(ce);
+        if (!statics) continue;
+
+        zval *val;
+        zend_ulong idx;
+        ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(class_snapshot), idx, val) {
+            if ((int)idx < ce->default_static_members_count) {
+                zval_ptr_dtor(&statics[idx]);
+                ZVAL_DUP(&statics[idx], val);
+            }
+        } ZEND_HASH_FOREACH_END();
+    } ZEND_HASH_FOREACH_END();
+}
+
+static void zealphp_statics_snapshot_delete(long cid)
+{
+    zend_hash_index_del(&zealphp_coro_static_snapshots, (zend_ulong)cid);
+}
+
 static void zealphp_snapshot_save(long cid)
 {
     /* Guard: EG(symbol_table) may be invalid during coroutine teardown.
@@ -242,6 +380,8 @@ static void zealphp_on_yield(void *arg)
     if (!arg) return;
     zealphp_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
     /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap */
     if (orig_on_yield) orig_on_yield(arg);
 }
@@ -254,6 +394,8 @@ static void zealphp_on_resume(void *arg)
     if (!arg) return;
     zealphp_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
+    zealphp_ini_snapshot_restore((zend_long)(uintptr_t)arg);
+    zealphp_statics_snapshot_restore((zend_long)(uintptr_t)arg);
 }
 
 static void zealphp_on_close(void *arg)
@@ -263,6 +405,8 @@ static void zealphp_on_close(void *arg)
     if (!arg) return;
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_statics_snapshot_delete((zend_long)(uintptr_t)arg);
 }
 
 /* ── Allowlist ───────────────────────────────────────────────────────── */
@@ -945,6 +1089,8 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_callbacks, 32, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_request_constants, 64, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_globals_snapshot, 128, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_files, 256, NULL, ZVAL_PTR_DTOR, 1);
