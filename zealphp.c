@@ -102,12 +102,21 @@ static void zealphp_snapshot_restore(long cid)
     for (const char **n = sg_names; *n; n++) {
         zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
         if (val) {
-            /* Use zend_hash_str_update instead of in-place modification.
-             * zval_ptr_dtor on the old value can trigger GC which rehashes
-             * EG(symbol_table), invalidating any pointer from _find(). */
-            zval copy;
-            ZVAL_COPY(&copy, val);
-            zend_hash_str_update(&EG(symbol_table), *n, strlen(*n), &copy);
+            /* In-place zval swap: same pattern as zealphp_set_superglobal.
+             * Preserves the zval memory address so CV caches in included
+             * files (which store a pointer to this zval) stay valid.
+             * Safe ordering: copy new → dtor old (survives GC rehash). */
+            zval *existing = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
+            if (existing) {
+                zval old;
+                ZVAL_COPY_VALUE(&old, existing);
+                ZVAL_COPY(existing, val);
+                zval_ptr_dtor(&old);
+            } else {
+                zval copy;
+                ZVAL_COPY(&copy, val);
+                zend_hash_str_add_new(&EG(symbol_table), *n, strlen(*n), &copy);
+            }
         }
     }
 }
@@ -393,13 +402,23 @@ PHP_FUNCTION(zealphp_restore_all)
 
 /* ── Superglobals management ─────────────────────────────────────── */
 
-/* Helper: overwrite a superglobal in the executor symbol table. */
+/* Helper: overwrite a superglobal in the executor symbol table.
+ * Uses in-place zval swap so the zval memory ADDRESS stays the same —
+ * critical for coroutine mode where compiled-variable (CV) caches in
+ * included files store a pointer to this zval. zend_hash_str_update
+ * would allocate a new bucket (different address), staling the CV cache.
+ *
+ * Safe ordering: copy new value IN first, THEN dtor old. If dtor triggers
+ * GC which rehashes EG(symbol_table), the `existing` pointer was already
+ * used in the ZVAL_COPY step, so the rehash doesn't cause a use-after-free. */
 static void zealphp_set_superglobal(const char *name, size_t name_len, zval *value)
 {
     zval *existing = zend_hash_str_find(&EG(symbol_table), name, name_len);
     if (existing) {
-        zval_ptr_dtor(existing);
+        zval old;
+        ZVAL_COPY_VALUE(&old, existing);
         ZVAL_COPY(existing, value);
+        zval_ptr_dtor(&old);
     } else {
         zval copy;
         ZVAL_COPY(&copy, value);
