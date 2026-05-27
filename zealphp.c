@@ -498,6 +498,118 @@ PHP_FUNCTION(zealphp_coroutine_superglobals)
     RETURN_TRUE;
 }
 
+/* ── Process-state snapshot/clean (included_files + classes + functions) ── */
+
+/* Full process-state snapshot for pool workers. Captures:
+ * - EG(included_files) keys — require_once cache
+ * - CG(class_table) user-class keys
+ * - CG(function_table) user-function keys
+ * Cleaning removes entries added after the snapshot, giving the pool worker
+ * fresh-process semantics without the proc_open cost. */
+static HashTable zealphp_snapshot_files;
+static HashTable zealphp_snapshot_classes;
+static HashTable zealphp_snapshot_functions;
+static bool zealphp_state_snapshotted = false;
+
+PHP_FUNCTION(zealphp_process_state_snapshot)
+{
+    zend_string *key;
+
+    if (zealphp_state_snapshotted) {
+        zend_hash_clean(&zealphp_snapshot_files);
+        zend_hash_clean(&zealphp_snapshot_classes);
+        zend_hash_clean(&zealphp_snapshot_functions);
+    }
+
+    zval one;
+    ZVAL_LONG(&one, 1);
+
+    /* Included files */
+    ZEND_HASH_FOREACH_STR_KEY(&EG(included_files), key) {
+        if (key) zend_hash_update(&zealphp_snapshot_files, key, &one);
+    } ZEND_HASH_FOREACH_END();
+
+    /* User classes only */
+    zval *cls_zv;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(CG(class_table), key, cls_zv) {
+        if (key) {
+            zend_class_entry *ce = Z_PTR_P(cls_zv);
+            if (ce && ce->type == ZEND_USER_CLASS) {
+                zend_hash_update(&zealphp_snapshot_classes, key, &one);
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    /* User functions only */
+    zval *fn_zv;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(CG(function_table), key, fn_zv) {
+        if (key) {
+            zend_function *func = Z_PTR_P(fn_zv);
+            if (func && func->type == ZEND_USER_FUNCTION) {
+                zend_hash_update(&zealphp_snapshot_functions, key, &one);
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    zealphp_state_snapshotted = true;
+}
+
+PHP_FUNCTION(zealphp_process_state_clean)
+{
+    zend_string *key;
+    zval *val;
+
+    if (!zealphp_state_snapshotted) return;
+
+    /* --- Included files: remove entries not in snapshot --- */
+    zend_string **del_files = NULL;
+    uint32_t df_count = 0, df_cap = 64;
+    del_files = emalloc(sizeof(zend_string *) * df_cap);
+
+    ZEND_HASH_FOREACH_STR_KEY(&EG(included_files), key) {
+        if (key && !zend_hash_exists(&zealphp_snapshot_files, key)) {
+            if (df_count >= df_cap) { df_cap *= 2; del_files = erealloc(del_files, sizeof(zend_string *) * df_cap); }
+            del_files[df_count++] = key;
+        }
+    } ZEND_HASH_FOREACH_END();
+    for (uint32_t i = 0; i < df_count; i++) zend_hash_del(&EG(included_files), del_files[i]);
+    efree(del_files);
+
+    /* --- User classes: remove entries not in snapshot --- */
+    zend_string **del_cls = NULL;
+    uint32_t dc_count = 0, dc_cap = 64;
+    del_cls = emalloc(sizeof(zend_string *) * dc_cap);
+
+    ZEND_HASH_FOREACH_STR_KEY_VAL(CG(class_table), key, val) {
+        if (key && !zend_hash_exists(&zealphp_snapshot_classes, key)) {
+            zend_class_entry *ce = Z_PTR_P(val);
+            if (ce && ce->type == ZEND_USER_CLASS) {
+                if (dc_count >= dc_cap) { dc_cap *= 2; del_cls = erealloc(del_cls, sizeof(zend_string *) * dc_cap); }
+                del_cls[dc_count++] = key;
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+    for (uint32_t i = 0; i < dc_count; i++) zend_hash_del(CG(class_table), del_cls[i]);
+    efree(del_cls);
+
+    /* --- User functions: remove entries not in snapshot --- */
+    zend_string **del_fn = NULL;
+    uint32_t dfn_count = 0, dfn_cap = 64;
+    del_fn = emalloc(sizeof(zend_string *) * dfn_cap);
+
+    ZEND_HASH_FOREACH_STR_KEY_VAL(CG(function_table), key, val) {
+        if (key && !zend_hash_exists(&zealphp_snapshot_functions, key)) {
+            zend_function *func = Z_PTR_P(val);
+            if (func && func->type == ZEND_USER_FUNCTION) {
+                if (dfn_count >= dfn_cap) { dfn_cap *= 2; del_fn = erealloc(del_fn, sizeof(zend_string *) * dfn_cap); }
+                del_fn[dfn_count++] = key;
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+    for (uint32_t i = 0; i < dfn_count; i++) zend_hash_del(CG(function_table), del_fn[i]);
+    efree(del_fn);
+}
+
 /* ── $GLOBALS snapshot/clean ─────────────────────────────────────── */
 
 /* zealphp_globals_snapshot(): void — save current EG(symbol_table) keys */
@@ -630,6 +742,9 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_request_constants, 64, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_globals_snapshot, 128, NULL, ZVAL_PTR_DTOR, 1);
+    zend_hash_init(&zealphp_snapshot_files, 256, NULL, ZVAL_PTR_DTOR, 1);
+    zend_hash_init(&zealphp_snapshot_classes, 256, NULL, ZVAL_PTR_DTOR, 1);
+    zend_hash_init(&zealphp_snapshot_functions, 256, NULL, ZVAL_PTR_DTOR, 1);
 
     /* Try to hook into OpenSwoole's coroutine scheduler for per-coroutine
      * superglobal isolation. Resolved at runtime via dlsym — if OpenSwoole
@@ -742,6 +857,12 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_globals_clean, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_process_state_snapshot, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_process_state_clean, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_define_hook, 0, 1, _IS_BOOL, 0)
     ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
@@ -759,6 +880,8 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
     PHP_FE(zealphp_globals_snapshot,       arginfo_zealphp_globals_snapshot)
     PHP_FE(zealphp_globals_clean,          arginfo_zealphp_globals_clean)
+    PHP_FE(zealphp_process_state_snapshot, arginfo_zealphp_process_state_snapshot)
+    PHP_FE(zealphp_process_state_clean,    arginfo_zealphp_process_state_clean)
     PHP_FE_END
 };
 
