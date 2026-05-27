@@ -1058,17 +1058,28 @@ PHP_FUNCTION(zealphp_ini_restore)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
-    if (!EG(modified_ini_directives)) return;
+    if (!EG(modified_ini_directives) ||
+        zend_hash_num_elements(EG(modified_ini_directives)) == 0) {
+        return;
+    }
 
-    zend_ini_entry *entry;
-    ZEND_HASH_FOREACH_PTR(EG(modified_ini_directives), entry) {
-        if (entry && entry->orig_value && entry->value != entry->orig_value) {
-            zend_string *orig = zend_string_copy(entry->orig_value);
-            zend_alter_ini_entry_ex(entry, orig,
-                entry->modifiable, ZEND_INI_STAGE_RUNTIME, 1);
-            zend_string_release(orig);
+    /* Collect names first — zend_restore_ini_entry may modify the hash */
+    uint32_t count = 0, cap = 32;
+    zend_string **names = emalloc(sizeof(zend_string *) * cap);
+
+    zend_string *name;
+    ZEND_HASH_FOREACH_STR_KEY(EG(modified_ini_directives), name) {
+        if (name) {
+            if (count >= cap) { cap *= 2; names = erealloc(names, sizeof(zend_string *) * cap); }
+            names[count++] = name;
         }
     } ZEND_HASH_FOREACH_END();
+
+    for (uint32_t i = 0; i < count; i++) {
+        zend_restore_ini_entry(names[i], ZEND_INI_STAGE_RUNTIME);
+    }
+
+    efree(names);
 }
 
 /* ── zealphp_define_hook(bool $enable): bool ─────────────────────── */
