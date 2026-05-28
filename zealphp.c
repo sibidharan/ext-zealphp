@@ -109,6 +109,11 @@ static bool zealphp_coro_globals_hooks_active = false;
 static HashTable zealphp_coro_globals_parent;
 static bool zealphp_coro_globals_parent_set = false;
 
+/* Stage 3/4 silent-redeclare master flag. Hoisted to file-scope here
+ * (vs co-located with the Stage 3 storage block farther down) so the
+ * zealphp_define_intercept hook below can read it. */
+static bool zealphp_silent_redeclare_enabled = false;
+
 /* ── Per-request define() isolation ─────────────────────────────────── */
 
 /* Track constants defined during the current request so they can be
@@ -1494,10 +1499,27 @@ PHP_FUNCTION(zealphp_globals_clean)
  * can remove it at request end. */
 static ZEND_NAMED_FUNCTION(zealphp_define_intercept)
 {
-    /* Forward to the real define() first */
+    /* Stage 3.5 — silent-define-redeclare. When silent_redeclare is on
+     * and define(NAME, VAL) targets a name that's already defined, we
+     * return true WITHOUT calling the real define(). Suppresses PHP's
+     * "Constant X already defined" E_WARNING — exactly the legacy-app
+     * boot pattern (`define('ROOT_DIR', __DIR__)` at top of every
+     * include) that crashes coroutine-mode workers on request 2.
+     *
+     * First-declaration wins (matches FPM's fresh-proc semantics). */
+    if (zealphp_silent_redeclare_enabled) {
+        zval *arg1 = ZEND_CALL_ARG(execute_data, 1);
+        if (arg1 && Z_TYPE_P(arg1) == IS_STRING
+            && zend_hash_exists(EG(zend_constants), Z_STR_P(arg1))) {
+            RETURN_TRUE;
+        }
+    }
+
+    /* Forward to the real define() */
     zealphp_orig_define_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
 
-    /* If define() succeeded (returned true), track the constant name */
+    /* If define() succeeded (returned true), track the constant name so
+     * zealphp_constants_clear() can remove it at request end. */
     if (Z_TYPE_P(return_value) == IS_TRUE) {
         zval *arg1 = ZEND_CALL_ARG(execute_data, 1);
         if (arg1 && Z_TYPE_P(arg1) == IS_STRING) {
@@ -1618,7 +1640,8 @@ PHP_FUNCTION(zealphp_define_hook)
  * symbol must use uopz / closures / autoloaders instead.
  */
 
-static bool zealphp_silent_redeclare_enabled = false;
+/* zealphp_silent_redeclare_enabled is hoisted to the top of this file
+ * so the zealphp_define_intercept hook can read it. */
 
 /* Extract the lowercased target name from a DECLARE_FUNCTION / DECLARE_CLASS
  * opline. Both opcodes use op1 as the "destination key" string constant. */
@@ -1823,6 +1846,23 @@ PHP_FUNCTION(zealphp_silent_redeclare)
     bool prev = zealphp_silent_redeclare_enabled;
     if (!on_is_null) {
         zealphp_silent_redeclare_enabled = (bool)on;
+
+        /* Auto-engage the define() intercept so the silent-define-redeclare
+         * path inside zealphp_define_intercept activates. Without this hook
+         * being installed, legacy apps' top-of-file `define('FOO', __DIR__)`
+         * fires PHP's native "already defined" E_WARNING on request 2 in
+         * coroutine mode — exactly the redeclare crash Stage 3/4 close for
+         * functions and classes. The intercept stays installed until
+         * explicit zealphp_define_hook(false) or RSHUTDOWN. */
+        if ((bool)on && !zealphp_define_hooked) {
+            zend_function *df = zend_hash_str_find_ptr(
+                CG(function_table), "define", sizeof("define") - 1);
+            if (df && df->type == ZEND_INTERNAL_FUNCTION) {
+                zealphp_orig_define_handler = df->internal_function.handler;
+                df->internal_function.handler = zealphp_define_intercept;
+                zealphp_define_hooked = true;
+            }
+        }
     }
     RETURN_BOOL(prev);
 }
