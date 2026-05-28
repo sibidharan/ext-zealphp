@@ -8,6 +8,8 @@ extern zend_module_entry zealphp_module_entry;
 
 PHP_MINIT_FUNCTION(zealphp);
 PHP_MSHUTDOWN_FUNCTION(zealphp);
+PHP_RINIT_FUNCTION(zealphp);
+PHP_RSHUTDOWN_FUNCTION(zealphp);
 PHP_MINFO_FUNCTION(zealphp);
 
 PHP_FUNCTION(zealphp_override);

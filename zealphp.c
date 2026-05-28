@@ -916,9 +916,20 @@ PHP_FUNCTION(zealphp_restore)
         RETURN_FALSE;
     }
 
+    /* COMPARE-AND-RESTORE: only put the original handler back if the
+     * current handler is still our dispatch thunk. If another extension
+     * (uopz, datadog APM, etc.) hooked the same slot after us, leave it
+     * alone — clobbering their hook silently is exactly the integrity
+     * failure flagged in the v0.3.8 security review. We still drop our
+     * bookkeeping so a future zealphp_override of the same name works. */
     zend_function *func = zend_hash_find_ptr(CG(function_table), lc);
-    if (func) {
+    if (func && func->internal_function.handler == zealphp_dispatch) {
         func->internal_function.handler = (zif_handler)orig;
+    } else if (func) {
+        php_error_docref(NULL, E_NOTICE,
+            "ext-zealphp: refusing to restore '%s' — handler was swapped "
+            "by another extension after override (bookkeeping cleared)",
+            ZSTR_VAL(func_name));
     }
 
     zend_hash_del(&zealphp_orig_handlers, lc);
@@ -939,7 +950,9 @@ PHP_FUNCTION(zealphp_restore_all)
 
     ZEND_HASH_FOREACH_STR_KEY_PTR(&zealphp_orig_handlers, key, orig) {
         zend_function *func = zend_hash_find_ptr(CG(function_table), key);
-        if (func) {
+        /* Same compare-and-restore guard as zealphp_restore — don't
+         * clobber downstream extensions' hooks on bulk restore. */
+        if (func && func->internal_function.handler == zealphp_dispatch) {
             func->internal_function.handler = (zif_handler)orig;
         }
     } ZEND_HASH_FOREACH_END();
@@ -1760,8 +1773,24 @@ PHP_FUNCTION(zealphp_silent_redeclare)
 
 PHP_MINIT_FUNCTION(zealphp)
 {
+    /* zealphp_orig_handlers stays persistent=1 — it stores raw C function
+     * pointers (zif_handler), never any request-heap zval/zend_object.
+     * Those pointers live in shared objects (.so .text) for the entire
+     * process lifetime, so a persistent table here is correct. */
     zend_hash_init(&zealphp_orig_handlers, 32, NULL, NULL, 1);
-    zend_hash_init(&zealphp_callbacks, 32, NULL, ZVAL_PTR_DTOR, 1);
+
+    /* HIGH-severity finding from the v0.3.8 security review (fixed):
+     * zealphp_callbacks / zealphp_request_constants / zealphp_globals_snapshot
+     * were initially persistent=1 but stored request-heap values (Closure
+     * zend_object*, per-request zend_string* keys) — classic cross-request
+     * UAF when the table outlives the request that populated it. They've
+     * been MOVED to PHP_RINIT (init) / PHP_RSHUTDOWN (destroy) so their
+     * lifetime matches the PHP request lifecycle. Under OpenSwoole's
+     * default config (one PHP request per worker), this still effectively
+     * means worker-lifetime; under CLI/FPM/CGI it means per-request.
+     * See PHP_RINIT_FUNCTION(zealphp) / PHP_RSHUTDOWN_FUNCTION(zealphp)
+     * further down in this file. */
+
     zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
@@ -1771,8 +1800,10 @@ PHP_MINIT_FUNCTION(zealphp)
     /* persistent=0 — parent snapshot contents come from the per-request heap.
      * Cleared explicitly via zealphp_globals_parent_clear() on disable. */
     zend_hash_init(&zealphp_coro_globals_parent, 128, NULL, ZVAL_PTR_DTOR, 0);
-    zend_hash_init(&zealphp_request_constants, 64, NULL, ZVAL_PTR_DTOR, 1);
-    zend_hash_init(&zealphp_globals_snapshot, 128, NULL, ZVAL_PTR_DTOR, 1);
+    /* The three *_snapshot tables below capture name SETS (no request-heap
+     * zvals — value is IS_LONG 1 throughout). Keys are zend_string* that
+     * get persistently-dup'd into the bucket arena by the persistent=1
+     * hash. Safe as-is. */
     zend_hash_init(&zealphp_snapshot_files, 256, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_classes, 256, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_functions, 256, NULL, ZVAL_PTR_DTOR, 1);
@@ -1860,6 +1891,66 @@ PHP_MSHUTDOWN_FUNCTION(zealphp)
      * Calling zend_hash_destroy on tables whose zval dtors touch freed memory
      * causes SIGSEGV. The OS reclaims all process memory on exit — this is
      * the standard pattern used by opcache and other core extensions. */
+    return SUCCESS;
+}
+
+/* Tracks whether per-request tables have been initialized — protects the
+ * persistent=0 hashes from double-init / use-after-destroy if RINIT and
+ * RSHUTDOWN fire out of order under any future SAPI weirdness. */
+static bool zealphp_request_tables_live = false;
+
+PHP_RINIT_FUNCTION(zealphp)
+{
+    /* Per-request init for the three tables that hold request-heap values
+     * (closures, per-request zend_string keys). Initializing here — and
+     * destroying in RSHUTDOWN — ensures their lifetime matches the values
+     * they hold. Fixes the HIGH-severity UAF flagged in the v0.3.8
+     * security review.
+     *
+     * The guard makes double-init a no-op so an embedded SAPI that calls
+     * MINIT then RINIT then more RINITs (unusual but legal) doesn't leak
+     * the old tables. */
+    if (!zealphp_request_tables_live) {
+        zend_hash_init(&zealphp_callbacks,          32,  NULL, ZVAL_PTR_DTOR, 0);
+        zend_hash_init(&zealphp_request_constants,  64,  NULL, ZVAL_PTR_DTOR, 0);
+        zend_hash_init(&zealphp_globals_snapshot,  128,  NULL, ZVAL_PTR_DTOR, 0);
+        zealphp_request_tables_live = true;
+    }
+    return SUCCESS;
+}
+
+PHP_RSHUTDOWN_FUNCTION(zealphp)
+{
+    /* Per-request teardown. zend_hash_destroy walks the bucket array and
+     * applies the dtor (ZVAL_PTR_DTOR for these three) to each value —
+     * properly releasing the closures' refcounts and freeing the zend_string
+     * keys. After this the table memory itself is gone too. */
+    if (zealphp_request_tables_live) {
+        /* Restore any handlers we overrode before destroying the closure
+         * table — otherwise the dispatch thunk would still be installed on
+         * builtins after RSHUTDOWN with no callback to dispatch to, and
+         * the next call into header() / setcookie() etc. would hit the
+         * "callback not found" branch and silently return NULL.
+         *
+         * Walks zealphp_orig_handlers (persistent, survives) and puts
+         * each saved handler back, using the same compare-and-restore
+         * guard as zealphp_restore_all so we never clobber a third-party
+         * extension's hook. */
+        zend_string *key;
+        void *orig;
+        ZEND_HASH_FOREACH_STR_KEY_PTR(&zealphp_orig_handlers, key, orig) {
+            zend_function *func = zend_hash_find_ptr(CG(function_table), key);
+            if (func && func->internal_function.handler == zealphp_dispatch) {
+                func->internal_function.handler = (zif_handler)orig;
+            }
+        } ZEND_HASH_FOREACH_END();
+        zend_hash_clean(&zealphp_orig_handlers);
+
+        zend_hash_destroy(&zealphp_callbacks);
+        zend_hash_destroy(&zealphp_request_constants);
+        zend_hash_destroy(&zealphp_globals_snapshot);
+        zealphp_request_tables_live = false;
+    }
     return SUCCESS;
 }
 
@@ -1968,8 +2059,8 @@ zend_module_entry zealphp_module_entry = {
     zealphp_functions,
     PHP_MINIT(zealphp),
     PHP_MSHUTDOWN(zealphp),
-    NULL, /* RINIT */
-    NULL, /* RSHUTDOWN */
+    PHP_RINIT(zealphp),
+    PHP_RSHUTDOWN(zealphp),
     PHP_MINFO(zealphp),
     PHP_ZEALPHP_VERSION,
     STANDARD_MODULE_PROPERTIES
