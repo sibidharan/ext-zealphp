@@ -20,6 +20,7 @@
 #include "php_ini.h"
 #include "ext/standard/info.h"
 #include "zend_exceptions.h"
+#include "zend_vm.h"
 #include "php_zealphp.h"
 #include <dlfcn.h>
 
@@ -1546,6 +1547,125 @@ PHP_FUNCTION(zealphp_define_hook)
 
 /* ── Module lifecycle ────────────────────────────────────────────── */
 
+/* ── Stage 3: silent-redeclare opcode hooks ───────────────────────────
+ *
+ * Top-level `function foo() {}` / `class Bar {}` in legacy PHP fires
+ * E_COMPILE_ERROR ("Cannot redeclare ...") on the SECOND request in a
+ * long-running worker — the symbol from request 1 is still in
+ * EG(function_table) / CG(class_table). FPM doesn't hit this because each
+ * request gets a fresh PHP process; ZealPHP's Mode 1 Pool sidesteps it via
+ * subprocess scope. But Mode 3/4/5 share one process.
+ *
+ * The opcodes that bind a compiled declaration into the runtime symbol
+ * table are:
+ *   - ZEND_DECLARE_FUNCTION        (top-level fn declared in a compiled file)
+ *   - ZEND_DECLARE_CLASS           (top-level class without parent)
+ *   - ZEND_DECLARE_CLASS_DELAYED   (class WITH parent — bind deferred until
+ *                                   parent class is autoloaded)
+ *
+ * Hook strategy:
+ *   - Check if the target symbol already exists in the global table.
+ *   - If yes → SKIP the opcode (ZEND_USER_OPCODE_CONTINUE advances IP past
+ *     the do_bind_*() call that would E_COMPILE_ERROR).
+ *   - If no  → dispatch to the original handler.
+ *
+ * Semantics: "first declaration wins" — matches what FPM produces by
+ * recycling the process every request (whatever declared on request N
+ * stays for request N+1+...). User code that intentionally redefines a
+ * symbol must use uopz / closures / autoloaders instead.
+ */
+
+static bool zealphp_silent_redeclare_enabled = false;
+
+/* Extract the lowercased target name from a DECLARE_FUNCTION / DECLARE_CLASS
+ * opline. Both opcodes use op1 as the "destination key" string constant. */
+static zend_string *zealphp_decl_target_lcname(const zend_op *opline, zend_execute_data *execute_data)
+{
+    zval *src = NULL;
+    if (opline->op1_type == IS_CONST) {
+        src = RT_CONSTANT(opline, opline->op1);
+    }
+    if (!src || Z_TYPE_P(src) != IS_STRING) {
+        return NULL;
+    }
+    /* DECLARE_FUNCTION / DECLARE_CLASS op1 is already-lowercased per the
+     * compiler — see zend_compile_func_decl / zend_compile_class_decl in
+     * Zend/zend_compile.c. We can use the string as-is. */
+    return Z_STR_P(src);
+}
+
+static int zealphp_declare_function_handler(zend_execute_data *execute_data)
+{
+    if (!zealphp_silent_redeclare_enabled) {
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+    const zend_op *opline = EX(opline);
+    zend_string *lcname = zealphp_decl_target_lcname(opline, execute_data);
+    if (lcname && zend_hash_exists(EG(function_table), lcname)) {
+        /* Already declared. Skip do_bind_function. */
+        EX(opline)++;
+        return ZEND_USER_OPCODE_CONTINUE;
+    }
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+static int zealphp_declare_class_handler(zend_execute_data *execute_data)
+{
+    if (!zealphp_silent_redeclare_enabled) {
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+    const zend_op *opline = EX(opline);
+    zend_string *lcname = zealphp_decl_target_lcname(opline, execute_data);
+    if (lcname && zend_hash_exists(CG(class_table), lcname)) {
+        EX(opline)++;
+        return ZEND_USER_OPCODE_CONTINUE;
+    }
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data)
+{
+    if (!zealphp_silent_redeclare_enabled) {
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+    /* DELAYED variant uses op2 for the destination (the parent-required key
+     * lives in op1). Conservative behaviour: dispatch normally if we can't
+     * confirm a duplicate. */
+    const zend_op *opline = EX(opline);
+    zval *src = NULL;
+    if (opline->op2_type == IS_CONST) {
+        src = RT_CONSTANT(opline, opline->op2);
+    }
+    if (src && Z_TYPE_P(src) == IS_STRING
+        && zend_hash_exists(CG(class_table), Z_STR_P(src))) {
+        EX(opline)++;
+        return ZEND_USER_OPCODE_CONTINUE;
+    }
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+/* Public API: zealphp_silent_redeclare(bool $on = true): bool
+ * Returns previous state. */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_silent_redeclare, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
+PHP_FUNCTION(zealphp_silent_redeclare)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = zealphp_silent_redeclare_enabled;
+    if (!on_is_null) {
+        zealphp_silent_redeclare_enabled = (bool)on;
+    }
+    RETURN_BOOL(prev);
+}
+
 PHP_MINIT_FUNCTION(zealphp)
 {
     zend_hash_init(&zealphp_orig_handlers, 32, NULL, NULL, 1);
@@ -1604,6 +1724,30 @@ PHP_MINIT_FUNCTION(zealphp)
             os_get_cid = (coro_get_cid_fn_t)dlsym(handle, "swoole_coroutine_get_current_id");
         dlclose(handle);
     }
+
+    /* Stage 3: register silent-redeclare opcode handlers.
+     *
+     * Opcode handlers catch RUNTIME declarations (ZEND_DECLARE_FUNCTION /
+     * ZEND_DECLARE_CLASS / _DELAYED — emitted for declarations inside an
+     * if/function/method scope). They check the target name against the
+     * existing CG(function_table) / CG(class_table); if it's already
+     * defined, the opcode is skipped silently (first-declaration wins).
+     *
+     * Top-level (file-scope) `function foo() {}` declarations are bound at
+     * COMPILE time via zend_register_top_func — they don't emit a runtime
+     * opcode, so the opcode hook can't see them. A naive compile_file
+     * intercept that snapshots+restores class_entry pointers around the
+     * compile breaks class inheritance / method-table invariants
+     * (validated by test failures on 019/020 when wired up). That's
+     * deferred to Stage 4 — see docs/architecture/state-isolation-reference.md.
+     *
+     * The gate is `zealphp_silent_redeclare_enabled`, set via the public
+     * `zealphp_silent_redeclare(bool)` PHP function. Handlers fall through
+     * (DISPATCH) when the flag is off, so installing them in MINIT is a
+     * one-time pointer write with zero runtime overhead until opted in. */
+    zend_set_user_opcode_handler(ZEND_DECLARE_FUNCTION,       zealphp_declare_function_handler);
+    zend_set_user_opcode_handler(ZEND_DECLARE_CLASS,          zealphp_declare_class_handler);
+    zend_set_user_opcode_handler(ZEND_DECLARE_CLASS_DELAYED,  zealphp_declare_class_delayed_handler);
 
     return SUCCESS;
 }
@@ -1712,6 +1856,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_process_state_snapshot, arginfo_zealphp_process_state_snapshot)
     PHP_FE(zealphp_process_state_clean,    arginfo_zealphp_process_state_clean)
     PHP_FE(zealphp_protect_classes,        arginfo_zealphp_protect_classes)
+    PHP_FE(zealphp_silent_redeclare,       arginfo_zealphp_silent_redeclare)
     PHP_FE_END
 };
 
