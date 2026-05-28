@@ -848,6 +848,32 @@ static HashTable zealphp_snapshot_classes;
 static HashTable zealphp_snapshot_functions;
 static bool zealphp_state_snapshotted = false;
 
+/* Add class names to the snapshot so they survive process_state_clean.
+ * Used to preserve autoloader-referenced classes (spl_autoload_functions)
+ * that get registered lazily during request handling.
+ */
+PHP_FUNCTION(zealphp_protect_classes)
+{
+    zval *names;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY(names)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!zealphp_state_snapshotted) return;
+
+    zval one;
+    ZVAL_LONG(&one, 1);
+
+    zval *val;
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(names), val) {
+        if (Z_TYPE_P(val) == IS_STRING) {
+            zend_string *key = zend_string_tolower(Z_STR_P(val));
+            zend_hash_update(&zealphp_snapshot_classes, key, &one);
+            zend_string_release(key);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
 PHP_FUNCTION(zealphp_process_state_snapshot)
 {
     zend_string *key;
@@ -1270,6 +1296,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_define_hook, 0, 1, _IS_B
     ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_protect_classes, 0, 1, IS_VOID, 0)
+    ZEND_ARG_TYPE_INFO(0, names, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_override,               arginfo_zealphp_override)
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
@@ -1286,6 +1316,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_globals_clean,          arginfo_zealphp_globals_clean)
     PHP_FE(zealphp_process_state_snapshot, arginfo_zealphp_process_state_snapshot)
     PHP_FE(zealphp_process_state_clean,    arginfo_zealphp_process_state_clean)
+    PHP_FE(zealphp_protect_classes,        arginfo_zealphp_protect_classes)
     PHP_FE_END
 };
 
