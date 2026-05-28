@@ -1644,6 +1644,120 @@ static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data
     return ZEND_USER_OPCODE_DISPATCH;
 }
 
+/* ── Stage 4: compile-time silent-redeclare ────────────────────────────
+ *
+ * Top-level `function foo() {}` / `class Bar {}` at file scope are bound
+ * to CG(function_table) / CG(class_table) at COMPILE time by
+ * zend_register_top_func / zend_register_top_class — they never emit a
+ * runtime ZEND_DECLARE_* opcode that Stage 3 could intercept.
+ *
+ * The naive intercept (snapshot pointer → del entry → compile → restore
+ * via update_ptr) segfaults: `zend_hash_del` triggers `destroy_zend_class`
+ * / `zend_function_dtor` which tear down the entry's internals
+ * (function_table, properties, op_array body) even though our saved
+ * pointer is still valid. The saved entry's methods point at freed
+ * memory by the time we restore it.
+ *
+ * Stage 4 fix: BUMP the refcount before removing. `destroy_zend_class`
+ * is gated on `--ce->refcount == 0`; with one extra refcount, the dtor
+ * just decrements and returns, leaving the entry intact. Same for
+ * `destroy_op_array`, gated on `--(*op_array->refcount) > 0`.
+ *
+ * The dance:
+ *   1. Walk CG(function_table) / CG(class_table) for USER entries.
+ *      For each: bump refcount, copy ptr into saved hash.
+ *   2. zend_hash_del each saved key from the global table. Engine
+ *      destructor runs, decrements refcount, sees it's still > 0,
+ *      returns without freeing → entry stays intact.
+ *   3. Run original zend_compile_file. The dup-check (`zend_hash_add_ptr`)
+ *      sees an empty slot and succeeds.
+ *   4. For each saved entry: if the compile added a duplicate at the
+ *      same key, `zend_hash_del` it (drops compile's refcount). Then
+ *      `zend_hash_update_ptr` puts our saved entry back. Drop OUR extra
+ *      refcount so the global table now owns the only reference (back
+ *      to the original state).
+ *
+ * First-declaration wins — matches FPM's fresh-proc semantic across
+ * requests. The compile-added duplicate's internals get torn down
+ * correctly because its refcount truly hits zero.
+ */
+static zend_op_array *(*zealphp_original_compile_file)(zend_file_handle *file_handle, int type) = NULL;
+
+static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, int type)
+{
+    if (!zealphp_silent_redeclare_enabled || !zealphp_original_compile_file) {
+        return zealphp_original_compile_file
+            ? zealphp_original_compile_file(file_handle, type)
+            : NULL;
+    }
+
+    HashTable saved_funcs;
+    HashTable saved_classes;
+    zend_hash_init(&saved_funcs,   32, NULL, NULL, 0);
+    zend_hash_init(&saved_classes, 32, NULL, NULL, 0);
+
+    zend_string *key;
+    void *ptr;
+
+    /* Phase 1 — snapshot user functions with refcount bump */
+    ZEND_HASH_FOREACH_STR_KEY_PTR(CG(function_table), key, ptr) {
+        zend_function *fn = (zend_function*)ptr;
+        if (key && fn && fn->type == ZEND_USER_FUNCTION) {
+            if (fn->op_array.refcount) {
+                (*fn->op_array.refcount)++;
+            }
+            zend_hash_add_ptr(&saved_funcs, key, ptr);
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    /* Phase 1 — snapshot user classes with refcount bump */
+    ZEND_HASH_FOREACH_STR_KEY_PTR(CG(class_table), key, ptr) {
+        zend_class_entry *ce = (zend_class_entry*)ptr;
+        if (key && ce && ce->type == ZEND_USER_CLASS) {
+            ce->refcount++;
+            zend_hash_add_ptr(&saved_classes, key, ptr);
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    /* Phase 2 — detach saved entries from CG. The destructors run but
+     * find refcount > 0 (we bumped above) and return without freeing. */
+    ZEND_HASH_FOREACH_STR_KEY(&saved_funcs, key) {
+        zend_hash_del(CG(function_table), key);
+    } ZEND_HASH_FOREACH_END();
+    ZEND_HASH_FOREACH_STR_KEY(&saved_classes, key) {
+        zend_hash_del(CG(class_table), key);
+    } ZEND_HASH_FOREACH_END();
+
+    /* Phase 3 — compile. Top-level decls now succeed (slot is empty). */
+    zend_op_array *result = zealphp_original_compile_file(file_handle, type);
+
+    /* Phase 4 — restore: first-wins semantic. If the compile added a
+     * duplicate, delete it (drops its refcount, frees its internals
+     * properly). Then re-attach our saved entry. Finally drop OUR bumped
+     * refcount so the global table owns the only reference, mirroring
+     * the pre-hook state. */
+    ZEND_HASH_FOREACH_STR_KEY_PTR(&saved_funcs, key, ptr) {
+        zend_function *fn = (zend_function*)ptr;
+        zend_hash_del(CG(function_table), key);            /* drop compile-added dup if any */
+        zend_hash_update_ptr(CG(function_table), key, fn); /* re-install saved */
+        if (fn->op_array.refcount && *fn->op_array.refcount > 1) {
+            (*fn->op_array.refcount)--;                    /* drop our bump */
+        }
+    } ZEND_HASH_FOREACH_END();
+    ZEND_HASH_FOREACH_STR_KEY_PTR(&saved_classes, key, ptr) {
+        zend_class_entry *ce = (zend_class_entry*)ptr;
+        zend_hash_del(CG(class_table), key);
+        zend_hash_update_ptr(CG(class_table), key, ce);
+        if (ce->refcount > 1) {
+            ce->refcount--;
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    zend_hash_destroy(&saved_funcs);
+    zend_hash_destroy(&saved_classes);
+    return result;
+}
+
 /* Public API: zealphp_silent_redeclare(bool $on = true): bool
  * Returns previous state. */
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_silent_redeclare, 0, 0, _IS_BOOL, 0)
@@ -1748,6 +1862,14 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_set_user_opcode_handler(ZEND_DECLARE_FUNCTION,       zealphp_declare_function_handler);
     zend_set_user_opcode_handler(ZEND_DECLARE_CLASS,          zealphp_declare_class_handler);
     zend_set_user_opcode_handler(ZEND_DECLARE_CLASS_DELAYED,  zealphp_declare_class_delayed_handler);
+
+    /* Stage 4: compile-time silent-redeclare. NOT YET WIRED — the
+     * straightforward refcount-protected swap hangs in production
+     * because every nested compile_file (autoloader chains, vendor
+     * requires) walks + mutates the entire global function/class table.
+     * The hook is in the source for future iteration but disabled at
+     * MINIT. See Stage 4 design notes in
+     * docs/architecture/state-isolation-reference.md. */
 
     return SUCCESS;
 }

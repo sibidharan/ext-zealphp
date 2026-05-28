@@ -4,19 +4,17 @@ Stage 3: top-level (file-scope) decls fall back to native error (Stage 4 territo
 zealphp
 --SKIPIF--
 <?php
-// This test PINS the documented Stage 3 limitation:
-// top-level `function foo() {}` / `class Bar {}` at file scope are bound
-// at COMPILE time via zend_register_top_func / zend_register_top_class,
-// NOT through the runtime ZEND_DECLARE_* opcodes that our hook intercepts.
-// So a second include of the same file STILL fatals with the native
-// "Cannot redeclare" error — Stage 3 does not change this. Closing this
-// requires a careful compile_file intercept that properly tears down
-// existing class entries (method tables, inheritance, refcounting) and
-// is reserved for Stage 4. Mode 1 Pool remains the workaround.
-//
-// Skipping rather than asserting the failure mode because exact wording
-// and stacktrace format varies across PHP minor releases.
-echo "skip top-level redeclare is Stage 4 territory\n";
+// PINS the Stage 3 limitation: top-level `function foo() {}` / `class Bar {}`
+// at file scope are bound at COMPILE time via zend_register_top_func /
+// zend_register_top_class, NOT through the runtime ZEND_DECLARE_* opcodes
+// that Stage 3 intercepts. A naive `zend_compile_file` wrapper (Stage 4
+// first attempt) deadlocks on autoloader-driven compile recursion: every
+// nested require walks + mutates the global function/class tables, and
+// the cumulative O(N*M) cost — plus interactions with opcache's late-bind
+// path — hangs the worker. Stage 4 needs a per-file diff approach (only
+// touch what the current compile is about to define) rather than a
+// blanket detach/reattach of the whole user-symbol space. Deferred.
+echo "skip top-level redeclare is Stage 4 territory (compile_file hook deferred)\n";
 ?>
 --FILE--
 <?php
