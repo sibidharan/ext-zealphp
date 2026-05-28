@@ -66,6 +66,19 @@ static HashTable zealphp_coro_ini_snapshots;
 /* Per-coroutine static property snapshots: coro_id → HashTable(class_name → zval[]) */
 static HashTable zealphp_coro_static_snapshots;
 
+/* ── Per-coroutine full $GLOBALS / EG(symbol_table) isolation ───────── */
+
+/* Per-coroutine $GLOBALS snapshots: coro_id → zval (array deep-copy of
+ * EG(symbol_table)). Activated by zealphp_coroutine_globals(true).
+ *
+ * Implementation note: We deep-copy each zval entry rather than memcpy'ing
+ * the HashTable struct. The struct-swap approach is faster but shares
+ * arData pointers between EG and coro-snapshots → on close we cannot
+ * safely free without risking double-free or use-after-free against EG.
+ * Deep-copy matches the existing zealphp_coro_snapshots pattern. */
+static HashTable zealphp_coro_globals_snapshots;
+static bool zealphp_coro_globals_hooks_active = false;
+
 /* ── Per-request define() isolation ─────────────────────────────────── */
 
 /* Track constants defined during the current request so they can be
@@ -303,6 +316,114 @@ static void zealphp_statics_snapshot_delete(long cid)
     zend_hash_index_del(&zealphp_coro_static_snapshots, (zend_ulong)cid);
 }
 
+/* ── Full $GLOBALS snapshot save/restore/delete ──────────────────────── */
+
+/* Set of EG(symbol_table) keys we should NOT snapshot — the superglobals
+ * are handled by the existing zealphp_coro_snapshots mechanism. Skipping
+ * them here avoids duplicate work and keeps the two layers cleanly
+ * separated: superglobals_on_yield owns the 7 SG slots, globals_on_yield
+ * owns everything else (user globals, $GLOBALS-injected keys, etc.). */
+static bool zealphp_globals_is_superglobal_key(const char *key, size_t len)
+{
+    for (const char **n = sg_names; *n; n++) {
+        if (strlen(*n) == len && memcmp(*n, key, len) == 0) {
+            return true;
+        }
+    }
+    /* "GLOBALS" itself is a special self-referential alias — skip to
+     * avoid infinite-recursion-style copies in the snapshot. PHP's
+     * engine maintains GLOBALS as a reference to symbol_table. */
+    if (len == sizeof("GLOBALS") - 1 && memcmp("GLOBALS", key, len) == 0) {
+        return true;
+    }
+    return false;
+}
+
+/* Save EG(symbol_table) into per-coroutine snapshot. Deep-copies every
+ * non-superglobal user variable. Called on yield. */
+static void zealphp_globals_snapshot_save(long cid)
+{
+    /* Guard: EG(symbol_table) may be invalid during coroutine teardown. */
+    if (!EG(symbol_table).nTableMask) return;
+
+    zval snapshot;
+    array_init(&snapshot);
+
+    zend_string *key;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, val) {
+        if (!key) continue;
+        if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) {
+            continue;
+        }
+        /* Deep-copy the zval so the snapshot owns its own storage,
+         * independent of any subsequent mutation of EG(symbol_table). */
+        zval copy;
+        ZVAL_DUP(&copy, val);
+        zend_hash_add_new(Z_ARRVAL(snapshot), key, &copy);
+    } ZEND_HASH_FOREACH_END();
+
+    zend_hash_index_update(&zealphp_coro_globals_snapshots, (zend_ulong)cid, &snapshot);
+}
+
+/* Restore EG(symbol_table) entries from this coroutine's snapshot.
+ * Clears non-superglobal entries first to avoid stale leftover data
+ * from the previously-resumed coroutine. */
+static void zealphp_globals_snapshot_restore(long cid)
+{
+    if (!EG(symbol_table).nTableMask) return;
+
+    zval *snapshot = zend_hash_index_find(&zealphp_coro_globals_snapshots, (zend_ulong)cid);
+
+    /* Step 1: collect non-superglobal keys currently in EG(symbol_table)
+     * and remove them. We cannot mutate the HashTable while iterating it. */
+    zend_string **to_delete = NULL;
+    uint32_t delete_count = 0;
+    uint32_t delete_cap = 32;
+    to_delete = emalloc(sizeof(zend_string *) * delete_cap);
+
+    zend_string *key;
+    ZEND_HASH_FOREACH_STR_KEY(&EG(symbol_table), key) {
+        if (key && !zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) {
+            if (delete_count >= delete_cap) {
+                delete_cap *= 2;
+                to_delete = erealloc(to_delete, sizeof(zend_string *) * delete_cap);
+            }
+            /* zend_string_addref so the key survives the hash_del below
+             * (which may release the last reference). */
+            zend_string_addref(key);
+            to_delete[delete_count++] = key;
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    for (uint32_t i = 0; i < delete_count; i++) {
+        zend_hash_del(&EG(symbol_table), to_delete[i]);
+        zend_string_release(to_delete[i]);
+    }
+    efree(to_delete);
+
+    /* Step 2: re-insert snapshot entries (deep-copied) if we have one.
+     * First-resume coroutines (no snapshot) end up with a symbol_table
+     * containing only the superglobals — clean slate for user globals. */
+    if (snapshot && Z_TYPE_P(snapshot) == IS_ARRAY) {
+        zval *val;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(snapshot), key, val) {
+            if (!key) continue;
+            zval copy;
+            ZVAL_DUP(&copy, val);
+            /* zend_hash_add_new is safe: we just cleared all non-SG keys. */
+            zend_hash_add_new(&EG(symbol_table), key, &copy);
+        } ZEND_HASH_FOREACH_END();
+    }
+}
+
+/* Delete per-coroutine globals snapshot. Storage is freed via the
+ * HashTable's ZVAL_PTR_DTOR. */
+static void zealphp_globals_snapshot_delete(long cid)
+{
+    zend_hash_index_del(&zealphp_coro_globals_snapshots, (zend_ulong)cid);
+}
+
 static void zealphp_snapshot_save(long cid)
 {
     /* Guard: EG(symbol_table) may be invalid during coroutine teardown.
@@ -382,6 +503,13 @@ static void zealphp_on_yield(void *arg)
     zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
+    /* Full $GLOBALS snapshot: runs AFTER superglobals save so the
+     * snapshot reflects whatever the request handler last wrote. The
+     * is_superglobal_key filter inside this call deliberately skips the
+     * 7 SG slots — those are owned by zealphp_snapshot_save above. */
+    if (zealphp_coro_globals_hooks_active) {
+        zealphp_globals_snapshot_save((zend_long)(uintptr_t)arg);
+    }
     /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap */
     if (orig_on_yield) orig_on_yield(arg);
 }
@@ -392,6 +520,12 @@ static void zealphp_on_resume(void *arg)
      * so EG(symbol_table) is valid when we read/write superglobals */
     if (orig_on_resume) orig_on_resume(arg);
     if (!arg) return;
+    /* Full $GLOBALS restore runs BEFORE superglobals restore so that
+     * the superglobals layer can overwrite the 7 SG slots last and win
+     * any race against stale snapshot data. */
+    if (zealphp_coro_globals_hooks_active) {
+        zealphp_globals_snapshot_restore((zend_long)(uintptr_t)arg);
+    }
     zealphp_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_restore((zend_long)(uintptr_t)arg);
@@ -407,6 +541,7 @@ static void zealphp_on_close(void *arg)
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_globals_snapshot_delete((zend_long)(uintptr_t)arg);
 }
 
 /* ── Allowlist ───────────────────────────────────────────────────────── */
@@ -835,6 +970,76 @@ PHP_FUNCTION(zealphp_coroutine_superglobals)
     RETURN_TRUE;
 }
 
+/* ── zealphp_coroutine_globals(bool $enable): bool ─────────────────── */
+/* Activates per-coroutine full $GLOBALS (EG(symbol_table)) save/restore.
+ * Sits on top of the same OpenSwoole yield/resume/close hooks installed
+ * by zealphp_coroutine_superglobals — both flags can be toggled
+ * independently. Returns true on success, false if the underlying
+ * scheduler hooks are unavailable. */
+PHP_FUNCTION(zealphp_coroutine_globals)
+{
+    bool enable;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_BOOL(enable)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!enable) {
+        zealphp_coro_globals_hooks_active = false;
+        zend_hash_clean(&zealphp_coro_globals_snapshots);
+        RETURN_TRUE;
+    }
+
+    if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+        php_error_docref(NULL, E_WARNING,
+            "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+            "Per-coroutine $GLOBALS isolation requires OpenSwoole.");
+        RETURN_FALSE;
+    }
+
+    /* Ensure the scheduler callbacks chain through our on_yield/on_resume/
+     * on_close wrappers. Idempotent — if zealphp_coroutine_superglobals
+     * already installed them, this is a no-op (set_on_yield with the same
+     * function pointer is safe). */
+    if (!zealphp_coro_hooks_active && !zealphp_coro_globals_hooks_active) {
+        void *handle = dlopen(NULL, RTLD_LAZY);
+        if (handle) {
+            static const char *yield_var_names[] = {
+                "_ZN10openswoole9Coroutine8on_yieldE",
+                "_ZN6swoole9Coroutine8on_yieldE", NULL
+            };
+            static const char *resume_var_names[] = {
+                "_ZN10openswoole9Coroutine9on_resumeE",
+                "_ZN6swoole9Coroutine9on_resumeE", NULL
+            };
+            static const char *close_var_names[] = {
+                "_ZN10openswoole9Coroutine8on_closeE",
+                "_ZN6swoole9Coroutine8on_closeE", NULL
+            };
+            for (const char **n = yield_var_names; *n && !orig_on_yield; n++) {
+                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+                if (p) orig_on_yield = *p;
+            }
+            for (const char **n = resume_var_names; *n && !orig_on_resume; n++) {
+                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+                if (p) orig_on_resume = *p;
+            }
+            for (const char **n = close_var_names; *n && !orig_on_close; n++) {
+                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+                if (p) orig_on_close = *p;
+            }
+            dlclose(handle);
+        }
+
+        os_set_on_yield(zealphp_on_yield);
+        os_set_on_resume(zealphp_on_resume);
+        os_set_on_close(zealphp_on_close);
+    }
+
+    zealphp_coro_globals_hooks_active = true;
+    RETURN_TRUE;
+}
+
 /* ── Process-state snapshot/clean (included_files + classes + functions) ── */
 
 /* Full process-state snapshot for pool workers. Captures:
@@ -1169,6 +1374,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_globals_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_request_constants, 64, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_globals_snapshot, 128, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_files, 256, NULL, ZVAL_PTR_DTOR, 1);
@@ -1277,6 +1483,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_coroutine_superglobals, 
     ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_coroutine_globals, 0, 1, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_constants_clear, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
@@ -1309,6 +1519,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_superglobals_save,      arginfo_zealphp_superglobals_save)
     PHP_FE(zealphp_superglobals_restore,   arginfo_zealphp_superglobals_restore)
     PHP_FE(zealphp_coroutine_superglobals, arginfo_zealphp_coroutine_superglobals)
+    PHP_FE(zealphp_coroutine_globals,      arginfo_zealphp_coroutine_globals)
     PHP_FE(zealphp_constants_clear,        arginfo_zealphp_constants_clear)
     PHP_FE(zealphp_ini_restore,           arginfo_zealphp_constants_clear)
     PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
