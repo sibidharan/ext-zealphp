@@ -1,23 +1,38 @@
 --TEST--
-Stage 3: top-level (file-scope) decls fall back to native error (Stage 4 territory)
+Stage 4: silent-redeclare survives compile-time top-level redeclarations (CG-swap design)
 --EXTENSIONS--
 zealphp
---SKIPIF--
-<?php
-// PINS the Stage 3 limitation: top-level `function foo() {}` / `class Bar {}`
-// at file scope are bound at COMPILE time via zend_register_top_func /
-// zend_register_top_class, NOT through the runtime ZEND_DECLARE_* opcodes
-// that Stage 3 intercepts. A naive `zend_compile_file` wrapper (Stage 4
-// first attempt) deadlocks on autoloader-driven compile recursion: every
-// nested require walks + mutates the global function/class tables, and
-// the cumulative O(N*M) cost — plus interactions with opcache's late-bind
-// path — hangs the worker. Stage 4 needs a per-file diff approach (only
-// touch what the current compile is about to define) rather than a
-// blanket detach/reattach of the whole user-symbol space. Deferred.
-echo "skip top-level redeclare is Stage 4 territory (compile_file hook deferred)\n";
-?>
 --FILE--
 <?php
-echo "unreachable\n";
+$tmp = tempnam(sys_get_temp_dir(), 'zealphp_toplevel_');
+$file = $tmp . '.php';
+file_put_contents($file, '<?php
+function zealphp_test_toplevel_fn() { return "first"; }
+class ZealphpTestToplevelCls { public function w() { return "first-cls"; } }
+');
+
+require $file;
+echo zealphp_test_toplevel_fn(), "\n";
+echo (new ZealphpTestToplevelCls)->w(), "\n";
+
+zealphp_silent_redeclare(true);
+
+// Re-include the SAME file. Stage 4's CG-table swap routes compile-time
+// declares into scratch tables that get merged into the real table
+// first-wins, so top-level redecls no longer dup-error.
+require $file;
+echo "second-include ok\n";
+
+echo zealphp_test_toplevel_fn(), "\n";
+echo (new ZealphpTestToplevelCls)->w(), "\n";
+
+zealphp_silent_redeclare(false);
+@unlink($tmp);
+@unlink($file);
 ?>
 --EXPECT--
+first
+first-cls
+second-include ok
+first
+first-cls

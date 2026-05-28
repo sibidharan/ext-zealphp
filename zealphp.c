@@ -1644,42 +1644,35 @@ static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data
     return ZEND_USER_OPCODE_DISPATCH;
 }
 
-/* ── Stage 4: compile-time silent-redeclare ────────────────────────────
+/* ── Stage 4: compile-time silent-redeclare via CG-table swap ──────────
  *
  * Top-level `function foo() {}` / `class Bar {}` at file scope are bound
  * to CG(function_table) / CG(class_table) at COMPILE time by
  * zend_register_top_func / zend_register_top_class — they never emit a
- * runtime ZEND_DECLARE_* opcode that Stage 3 could intercept.
+ * runtime ZEND_DECLARE_* opcode for Stage 3 to intercept.
  *
- * The naive intercept (snapshot pointer → del entry → compile → restore
- * via update_ptr) segfaults: `zend_hash_del` triggers `destroy_zend_class`
- * / `zend_function_dtor` which tear down the entry's internals
- * (function_table, properties, op_array body) even though our saved
- * pointer is still valid. The saved entry's methods point at freed
- * memory by the time we restore it.
+ * The earlier attempt (snapshot-detach-compile-restore the WHOLE user
+ * symbol space per compile) deadlocked production: every nested
+ * compile_file walks + mutates O(N) entries; with autoloader chains
+ * doing M nested compiles per request the cumulative cost was O(N*M)
+ * and worker recycle timeouts fired before any request completed.
  *
- * Stage 4 fix: BUMP the refcount before removing. `destroy_zend_class`
- * is gated on `--ce->refcount == 0`; with one extra refcount, the dtor
- * just decrements and returns, leaving the entry intact. Same for
- * `destroy_op_array`, gated on `--(*op_array->refcount) > 0`.
+ * New design: SWAP CG(function_table) / CG(class_table) pointers to
+ * empty scratch tables for the duration of compile. The dup check in
+ * zend_register_top_func reads CG(function_table) — pointed at an
+ * empty hash, it sees no dup and succeeds. Reads during compile use
+ * EG(function_table) (PHP convention) so internal-function resolution
+ * and earlier user definitions stay visible. After compile, merge
+ * scratch into the real table with first-wins semantic.
  *
- * The dance:
- *   1. Walk CG(function_table) / CG(class_table) for USER entries.
- *      For each: bump refcount, copy ptr into saved hash.
- *   2. zend_hash_del each saved key from the global table. Engine
- *      destructor runs, decrements refcount, sees it's still > 0,
- *      returns without freeing → entry stays intact.
- *   3. Run original zend_compile_file. The dup-check (`zend_hash_add_ptr`)
- *      sees an empty slot and succeeds.
- *   4. For each saved entry: if the compile added a duplicate at the
- *      same key, `zend_hash_del` it (drops compile's refcount). Then
- *      `zend_hash_update_ptr` puts our saved entry back. Drop OUR extra
- *      refcount so the global table now owns the only reference (back
- *      to the original state).
+ * Cost per compile: O(K) where K = symbols this file declares.
+ * Independent of how many symbols exist process-wide. Re-entrant safe:
+ * the swap is stack-local; nested compiles get their own scratch
+ * tables, restore in reverse order.
  *
- * First-declaration wins — matches FPM's fresh-proc semantic across
- * requests. The compile-added duplicate's internals get torn down
- * correctly because its refcount truly hits zero.
+ * First-wins matches FPM's "fresh process per request" semantic — the
+ * symbol the user originally got back is the symbol the user keeps
+ * getting back.
  */
 static zend_op_array *(*zealphp_original_compile_file)(zend_file_handle *file_handle, int type) = NULL;
 
@@ -1691,70 +1684,55 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
             : NULL;
     }
 
-    HashTable saved_funcs;
-    HashTable saved_classes;
-    zend_hash_init(&saved_funcs,   32, NULL, NULL, 0);
-    zend_hash_init(&saved_classes, 32, NULL, NULL, 0);
+    /* Save real table pointers — restore on exit (nested-safe via stack). */
+    HashTable *real_fn = CG(function_table);
+    HashTable *real_cl = CG(class_table);
 
+    /* Scratch tables with NULL dtor — we manage entry lifecycle below. */
+    HashTable scratch_fn, scratch_cl;
+    zend_hash_init(&scratch_fn, 8, NULL, NULL, 0);
+    zend_hash_init(&scratch_cl, 8, NULL, NULL, 0);
+
+    CG(function_table) = &scratch_fn;
+    CG(class_table)    = &scratch_cl;
+
+    zend_op_array *result = zealphp_original_compile_file(file_handle, type);
+
+    /* Restore BEFORE merging — merge uses real_fn / real_cl directly. */
+    CG(function_table) = real_fn;
+    CG(class_table)    = real_cl;
+
+    /* Merge first-wins: only insert keys not already present in real. */
     zend_string *key;
     void *ptr;
 
-    /* Phase 1 — snapshot user functions with refcount bump */
-    ZEND_HASH_FOREACH_STR_KEY_PTR(CG(function_table), key, ptr) {
-        zend_function *fn = (zend_function*)ptr;
-        if (key && fn && fn->type == ZEND_USER_FUNCTION) {
-            if (fn->op_array.refcount) {
-                (*fn->op_array.refcount)++;
-            }
-            zend_hash_add_ptr(&saved_funcs, key, ptr);
+    ZEND_HASH_FOREACH_STR_KEY_PTR(&scratch_fn, key, ptr) {
+        if (key && !zend_hash_exists(real_fn, key)) {
+            zend_hash_add_ptr(real_fn, key, ptr);
+        } else if (ptr) {
+            /* Loser: first declaration already in real. Free the dup so
+             * we don't leak its op_array body. ZEND_FUNCTION_DTOR equivalent. */
+            destroy_zend_function((zend_function*)ptr);
         }
     } ZEND_HASH_FOREACH_END();
 
-    /* Phase 1 — snapshot user classes with refcount bump */
-    ZEND_HASH_FOREACH_STR_KEY_PTR(CG(class_table), key, ptr) {
-        zend_class_entry *ce = (zend_class_entry*)ptr;
-        if (key && ce && ce->type == ZEND_USER_CLASS) {
-            ce->refcount++;
-            zend_hash_add_ptr(&saved_classes, key, ptr);
+    ZEND_HASH_FOREACH_STR_KEY_PTR(&scratch_cl, key, ptr) {
+        if (key && !zend_hash_exists(real_cl, key)) {
+            zend_hash_add_ptr(real_cl, key, ptr);
+        } else if (ptr) {
+            /* destroy_zend_class wants a zval — build one pointing at
+             * the class entry. ZEND_CLASS_DTOR is the same impl. */
+            zval cl_zv;
+            ZVAL_PTR(&cl_zv, ptr);
+            destroy_zend_class(&cl_zv);
         }
     } ZEND_HASH_FOREACH_END();
 
-    /* Phase 2 — detach saved entries from CG. The destructors run but
-     * find refcount > 0 (we bumped above) and return without freeing. */
-    ZEND_HASH_FOREACH_STR_KEY(&saved_funcs, key) {
-        zend_hash_del(CG(function_table), key);
-    } ZEND_HASH_FOREACH_END();
-    ZEND_HASH_FOREACH_STR_KEY(&saved_classes, key) {
-        zend_hash_del(CG(class_table), key);
-    } ZEND_HASH_FOREACH_END();
-
-    /* Phase 3 — compile. Top-level decls now succeed (slot is empty). */
-    zend_op_array *result = zealphp_original_compile_file(file_handle, type);
-
-    /* Phase 4 — restore: first-wins semantic. If the compile added a
-     * duplicate, delete it (drops its refcount, frees its internals
-     * properly). Then re-attach our saved entry. Finally drop OUR bumped
-     * refcount so the global table owns the only reference, mirroring
-     * the pre-hook state. */
-    ZEND_HASH_FOREACH_STR_KEY_PTR(&saved_funcs, key, ptr) {
-        zend_function *fn = (zend_function*)ptr;
-        zend_hash_del(CG(function_table), key);            /* drop compile-added dup if any */
-        zend_hash_update_ptr(CG(function_table), key, fn); /* re-install saved */
-        if (fn->op_array.refcount && *fn->op_array.refcount > 1) {
-            (*fn->op_array.refcount)--;                    /* drop our bump */
-        }
-    } ZEND_HASH_FOREACH_END();
-    ZEND_HASH_FOREACH_STR_KEY_PTR(&saved_classes, key, ptr) {
-        zend_class_entry *ce = (zend_class_entry*)ptr;
-        zend_hash_del(CG(class_table), key);
-        zend_hash_update_ptr(CG(class_table), key, ce);
-        if (ce->refcount > 1) {
-            ce->refcount--;
-        }
-    } ZEND_HASH_FOREACH_END();
-
-    zend_hash_destroy(&saved_funcs);
-    zend_hash_destroy(&saved_classes);
+    /* Scratch tables had NULL dtor — destroy_zend_hash just frees the
+     * buckets, not the values (the values are now either in real or
+     * already destroyed via the loser branch above). */
+    zend_hash_destroy(&scratch_fn);
+    zend_hash_destroy(&scratch_cl);
     return result;
 }
 
@@ -1863,13 +1841,13 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_set_user_opcode_handler(ZEND_DECLARE_CLASS,          zealphp_declare_class_handler);
     zend_set_user_opcode_handler(ZEND_DECLARE_CLASS_DELAYED,  zealphp_declare_class_delayed_handler);
 
-    /* Stage 4: compile-time silent-redeclare. NOT YET WIRED — the
-     * straightforward refcount-protected swap hangs in production
-     * because every nested compile_file (autoloader chains, vendor
-     * requires) walks + mutates the entire global function/class table.
-     * The hook is in the source for future iteration but disabled at
-     * MINIT. See Stage 4 design notes in
-     * docs/architecture/state-isolation-reference.md. */
+    /* Stage 4: compile-time silent-redeclare via CG-table swap.
+     * Pointer-swap design — O(K) per compile (K = symbols this file
+     * declares), independent of total user-symbol count. Reentrant
+     * safe (scratch tables are stack-local). See the hook function's
+     * docblock for the full design rationale. */
+    zealphp_original_compile_file = zend_compile_file;
+    zend_compile_file = zealphp_compile_file_hook;
 
     return SUCCESS;
 }
