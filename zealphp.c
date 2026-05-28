@@ -1786,39 +1786,36 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
         zealphp_file_decls_initialized = true;
     }
 
-    /* Stage 6 (minimal) — invalidate opcache for redeclare-prone files
-     * BEFORE the original compile_file runs. This forces opcache to
-     * treat the file as cold, going through zend_compile_file → our
-     * Stage 4 CG-swap → first-wins merge. Avoids opcache's hot-path
-     * bind that would dup-error on top-level decls from request 1.
+    /* Stage 6.x — cold op_array cache attempt (reverted).
      *
-     * Cost: re-compile the specific file on every request. Bounded —
-     * only files we've SEEN declare top-level user functions/classes
-     * land in zealphp_file_decls. For WordPress, that's ~50 files out
-     * of ~5000 in the codebase; ~10 of them touched per request.
-     * Net ~50 ms per request vs the alternative (M1 Pool subprocess
-     * ~200 ms per request OR worker respawn after crash ~100 ms).
+     * Goal: cache the cold-compile op_array for redeclare-prone files
+     * and return it directly on subsequent compiles, bypassing opcache.
      *
-     * Everything not in zealphp_file_decls (95%+ of files) skips this
-     * step and uses opcache's hot path normally. */
+     * Tested on perf VM with WordPress wp-login.php × 10 sequential
+     * requests:
+     *   R1 worker-A: 200 (cold compile + cache save)
+     *   R2 worker-B: timeout (Worker B hangs in some other code path)
+     *   R3 worker-A: 200 (cache hit returns saved op_array — IT WORKS)
+     *   R4 worker-B: timeout
+     *   R5 worker-A: 200
+     *   ...alternating 200/timeout
+     *
+     * Worker A serves odd requests cleanly using the cached op_array.
+     * Worker B hangs on every request. The hang is upstream of the
+     * cache return — Worker B's compile_file path doesn't even reach
+     * the cache hit. Likely a per-worker initialization state issue
+     * (zealphp_file_decls is a per-process static; workers fork from
+     * the master so they should share the table at fork time, but
+     * subsequent updates from one worker don't propagate to others).
+     *
+     * Reverting to Stage 4 alone pending a debug pass that figures out:
+     *   (a) why one worker hangs while another serves cleanly
+     *   (b) whether the right design is per-worker storage or
+     *       SMA-shared storage with proper synchronization
+     *
+     * For now, M1 Pool via App::registerCgiBackend remains the
+     * answer for redeclare-prone endpoints. */
     zend_string *file_key = zealphp_file_handle_path(file_handle);
-    if (file_key && zealphp_file_decls_initialized
-        && zend_hash_exists(&zealphp_file_decls, file_key)) {
-        /* Invalidate via opcache's PHP-callable API. We can't link to
-         * opcache's internal accel_invalidate from another extension
-         * cleanly; the function call is bounded and fast. */
-        zend_string *fn = zend_string_init("opcache_invalidate", sizeof("opcache_invalidate") - 1, 0);
-        zval ret, args[2], func;
-        ZVAL_STR(&func, fn);
-        ZVAL_STR_COPY(&args[0], file_key);
-        ZVAL_TRUE(&args[1]);
-        ZVAL_UNDEF(&ret);
-        (void) call_user_function(NULL, NULL, &func, &ret, 2, args);
-        zval_ptr_dtor(&args[0]);
-        zval_ptr_dtor(&ret);
-        zend_string_release(fn);
-    }
-    /* Tracked-replay path stays scaffolded but disabled. */
     bool tracked = false;
 
     if (tracked) {
@@ -1967,28 +1964,9 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
         }
     } ZEND_HASH_FOREACH_END();
 
-    /* Stage 6 (minimal) RECORD step — if the cold compile produced
-     * top-level user function or class declarations (visible as
-     * non-empty scratch tables), mark this file as redeclare-prone in
-     * zealphp_file_decls. Future compiles of the same file will hit
-     * the opcache_invalidate path at the top of this hook, forcing
-     * a fresh cold compile so Stage 4's CG-swap catches the redeclare
-     * cleanly.
-     *
-     * Storage: a marker value (IS_LONG 1) keyed by persistent dup of
-     * the file path. We just need presence; the actual decl-name set
-     * stays in the disabled track-and-replay path above. */
-    if (file_key
-        && (zend_hash_num_elements(&scratch_fn) > 0
-            || zend_hash_num_elements(&scratch_cl) > 0)
-        && zealphp_file_decls_initialized
-        && !zend_hash_exists(&zealphp_file_decls, file_key)) {
-        zend_string *pkey = zend_string_dup(file_key, 1);
-        zval marker;
-        ZVAL_LONG(&marker, 1);
-        zend_hash_add(&zealphp_file_decls, pkey, &marker);
-        zend_string_release(pkey);
-    }
+    /* Stage 6 RECORD step disabled until the warm-path design is
+     * proven on a multi-worker setup. Scaffold remains in the source
+     * for the next iteration. */
     if (file_key) {
         zend_string_release(file_key);
     }
