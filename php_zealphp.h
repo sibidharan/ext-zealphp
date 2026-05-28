@@ -4,7 +4,7 @@
 extern zend_module_entry zealphp_module_entry;
 #define phpext_zealphp_ptr &zealphp_module_entry
 
-#define PHP_ZEALPHP_VERSION "0.3.8"
+#define PHP_ZEALPHP_VERSION "0.3.9"
 
 PHP_MINIT_FUNCTION(zealphp);
 PHP_MSHUTDOWN_FUNCTION(zealphp);
@@ -31,5 +31,6 @@ PHP_FUNCTION(zealphp_process_state_clean);
 PHP_FUNCTION(zealphp_protect_classes);
 PHP_FUNCTION(zealphp_silent_redeclare);
 PHP_FUNCTION(zealphp_include_isolation);
+PHP_FUNCTION(zealphp_coroutine_statics);
 
 #endif

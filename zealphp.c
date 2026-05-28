@@ -83,6 +83,13 @@ static HashTable zealphp_coro_ini_snapshots;
 /* Per-coroutine static property snapshots: coro_id → HashTable(class_name → zval[]) */
 static HashTable zealphp_coro_static_snapshots;
 
+/* Per-coroutine FUNCTION-local static snapshots: coro_id → HashTable(
+ * (zend_ulong) op_array->static_variables [template ptr, stable & unique per
+ * function/method with statics] → HashTable(var_name → zval value) ).
+ * Opt-in (heavier walk than the others) — Stage 5, gated behind the flag. */
+static HashTable zealphp_coro_fn_static_snapshots;
+static bool zealphp_fn_statics_active = false;
+
 /* ── Per-coroutine full $GLOBALS / EG(symbol_table) isolation ───────── */
 
 /* Per-coroutine $GLOBALS Stage 2 (COW deltas). Activated by
@@ -362,6 +369,138 @@ static void zealphp_statics_snapshot_restore(long cid)
 static void zealphp_statics_snapshot_delete(long cid)
 {
     zend_hash_index_del(&zealphp_coro_static_snapshots, (zend_ulong)cid);
+}
+
+/* ── Stage 5: Per-coroutine FUNCTION-local static isolation ──────────────
+ *
+ * PHP 8 stores a function's runtime static vars in a per-process HashTable
+ * resolved via ZEND_MAP_PTR_GET(op_array->static_variables_ptr); the
+ * op_array->static_variables pointer is the immutable *template*. The earlier
+ * attempt swapped CG(map_ptr_base) per coroutine — that corrupts run_time_cache
+ * (CE-identity "X, X given" TypeErrors) and needs a coroutine-create hook the
+ * scheduler doesn't expose. This instead rides the SAME snapshot/restore model
+ * already proven for class statics, constants and ini: on yield, snapshot each
+ * instantiated function's live static table; on resume, restore THIS
+ * coroutine's values. Cooperative scheduling makes it correct — every coroutine
+ * writes its statics after its own restore and reads them before its next
+ * yield, so values never bleed across coroutines.
+ *
+ * Touches only the per-process live static HashTable (never run_time_cache,
+ * never the map_ptr base), so it is opcache-mode-agnostic and crash-safe.
+ *
+ * static vars are stored as IS_REFERENCE once ZEND_BIND_STATIC binds them to a
+ * CV (the executing frame's CV shares the slot), so we deref on save and
+ * write-THROUGH the reference on restore — same discipline as the superglobal
+ * snapshot. Clobbering the reference wrapper would desync the running CV. */
+
+typedef void (*zealphp_opa_static_cb)(zend_op_array *opa, HashTable *live, void *ctx);
+
+/* Visit every user function / method whose statics have been instantiated
+ * (live table exists and differs from the immutable template). Inherited
+ * non-overridden methods share one op_array/template, so the same template key
+ * may be visited once — idempotent for both save and restore. */
+static void zealphp_walk_fn_statics(zealphp_opa_static_cb cb, void *ctx)
+{
+    zval *zv;
+    /* Global user functions. */
+    ZEND_HASH_FOREACH_VAL(CG(function_table), zv) {
+        zend_function *fn = Z_PTR_P(zv);
+        if (!fn || fn->type != ZEND_USER_FUNCTION) continue;
+        zend_op_array *opa = &fn->op_array;
+        if (!opa->static_variables) continue;
+        HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+        if (!live || live == opa->static_variables) continue;
+        cb(opa, live, ctx);
+    } ZEND_HASH_FOREACH_END();
+
+    /* Methods of user classes. */
+    zval *czv;
+    ZEND_HASH_FOREACH_VAL(CG(class_table), czv) {
+        zend_class_entry *ce = Z_PTR_P(czv);
+        if (!ce || ce->type != ZEND_USER_CLASS) continue;
+        zend_function *mfn;
+        ZEND_HASH_FOREACH_PTR(&ce->function_table, mfn) {
+            if (!mfn || mfn->type != ZEND_USER_FUNCTION) continue;
+            zend_op_array *opa = &mfn->op_array;
+            if (!opa->static_variables) continue;
+            HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+            if (!live || live == opa->static_variables) continue;
+            cb(opa, live, ctx);
+        } ZEND_HASH_FOREACH_END();
+    } ZEND_HASH_FOREACH_END();
+}
+
+static void zealphp_fn_statics_save_cb(zend_op_array *opa, HashTable *live, void *ctx)
+{
+    zval *outer = (zval *)ctx;
+    zend_ulong key = (zend_ulong)(uintptr_t)opa->static_variables;
+
+    zval inner;
+    array_init(&inner);
+    zend_string *vn;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(live, vn, val) {
+        if (!vn) continue;
+        zval *src = Z_ISREF_P(val) ? Z_REFVAL_P(val) : val;
+        zval copy;
+        ZVAL_DUP(&copy, src);
+        zend_hash_update(Z_ARRVAL(inner), vn, &copy);
+    } ZEND_HASH_FOREACH_END();
+    /* update (not add_new): an op_array may be reached twice via inheritance. */
+    zend_hash_index_update(Z_ARRVAL_P(outer), key, &inner);
+}
+
+static void zealphp_fn_statics_restore_cb(zend_op_array *opa, HashTable *live, void *ctx)
+{
+    zval *outer = (zval *)ctx;
+    zend_ulong key = (zend_ulong)(uintptr_t)opa->static_variables;
+
+    zval *inner = zend_hash_index_find(Z_ARRVAL_P(outer), key);
+    if (!inner || Z_TYPE_P(inner) != IS_ARRAY) return;
+
+    zend_string *vn;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(inner), vn, val) {
+        if (!vn) continue;
+        zval *slot = zend_hash_find(live, vn);
+        if (!slot) {
+            zval copy;
+            ZVAL_DUP(&copy, val);
+            zend_hash_add(live, vn, &copy);
+            continue;
+        }
+        /* Write THROUGH an IS_REFERENCE so the executing frame's CV (which
+         * shares the reference) sees this coroutine's value. */
+        zval *target = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot;
+        zval old;
+        ZVAL_COPY_VALUE(&old, target);
+        ZVAL_DUP(target, val);
+        zval_ptr_dtor(&old);
+    } ZEND_HASH_FOREACH_END();
+}
+
+static void zealphp_fn_statics_snapshot_save(long cid)
+{
+    zval outer;
+    array_init(&outer);
+    zealphp_walk_fn_statics(zealphp_fn_statics_save_cb, &outer);
+    if (zend_hash_num_elements(Z_ARRVAL(outer)) > 0) {
+        zend_hash_index_update(&zealphp_coro_fn_static_snapshots, (zend_ulong)cid, &outer);
+    } else {
+        zval_ptr_dtor(&outer);
+    }
+}
+
+static void zealphp_fn_statics_snapshot_restore(long cid)
+{
+    zval *outer = zend_hash_index_find(&zealphp_coro_fn_static_snapshots, (zend_ulong)cid);
+    if (!outer || Z_TYPE_P(outer) != IS_ARRAY) return;
+    zealphp_walk_fn_statics(zealphp_fn_statics_restore_cb, outer);
+}
+
+static void zealphp_fn_statics_snapshot_delete(long cid)
+{
+    zend_hash_index_del(&zealphp_coro_fn_static_snapshots, (zend_ulong)cid);
 }
 
 /* ── Full $GLOBALS snapshot save/restore/delete ──────────────────────── */
@@ -720,6 +859,9 @@ static void zealphp_on_yield(void *arg)
     zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
+    if (zealphp_fn_statics_active) {
+        zealphp_fn_statics_snapshot_save((zend_long)(uintptr_t)arg);
+    }
     /* Full $GLOBALS snapshot: runs AFTER superglobals save so the
      * snapshot reflects whatever the request handler last wrote. The
      * is_superglobal_key filter inside this call deliberately skips the
@@ -747,6 +889,9 @@ static void zealphp_on_resume(void *arg)
     zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_restore((zend_long)(uintptr_t)arg);
+    if (zealphp_fn_statics_active) {
+        zealphp_fn_statics_snapshot_restore((zend_long)(uintptr_t)arg);
+    }
 }
 
 static void zealphp_on_close(void *arg)
@@ -758,6 +903,7 @@ static void zealphp_on_close(void *arg)
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_fn_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_globals_snapshot_delete((zend_long)(uintptr_t)arg);
 }
 
@@ -1299,6 +1445,70 @@ PHP_FUNCTION(zealphp_coroutine_globals)
     }
 
     zealphp_coro_globals_hooks_active = true;
+    RETURN_TRUE;
+}
+
+/* Stage 5 — per-coroutine function-local static isolation (opt-in).
+ * Sets the flag the on_yield/on_resume hooks check. The scheduler callbacks
+ * are normally already chained (coroutine-legacy enables superglobals/globals
+ * isolation first); if called standalone, install them idempotently. */
+PHP_FUNCTION(zealphp_coroutine_statics)
+{
+    bool enable;
+
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_BOOL(enable)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!enable) {
+        zealphp_fn_statics_active = false;
+        zend_hash_clean(&zealphp_coro_fn_static_snapshots);
+        RETURN_TRUE;
+    }
+
+    if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+        php_error_docref(NULL, E_WARNING,
+            "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+            "Per-coroutine function-static isolation requires OpenSwoole.");
+        RETURN_FALSE;
+    }
+
+    if (!zealphp_coro_hooks_active && !zealphp_coro_globals_hooks_active && !zealphp_fn_statics_active) {
+        void *handle = dlopen(NULL, RTLD_LAZY);
+        if (handle) {
+            static const char *yield_var_names[] = {
+                "_ZN10openswoole9Coroutine8on_yieldE",
+                "_ZN6swoole9Coroutine8on_yieldE", NULL
+            };
+            static const char *resume_var_names[] = {
+                "_ZN10openswoole9Coroutine9on_resumeE",
+                "_ZN6swoole9Coroutine9on_resumeE", NULL
+            };
+            static const char *close_var_names[] = {
+                "_ZN10openswoole9Coroutine8on_closeE",
+                "_ZN6swoole9Coroutine8on_closeE", NULL
+            };
+            for (const char **n = yield_var_names; *n && !orig_on_yield; n++) {
+                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+                if (p) orig_on_yield = *p;
+            }
+            for (const char **n = resume_var_names; *n && !orig_on_resume; n++) {
+                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+                if (p) orig_on_resume = *p;
+            }
+            for (const char **n = close_var_names; *n && !orig_on_close; n++) {
+                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+                if (p) orig_on_close = *p;
+            }
+            dlclose(handle);
+        }
+
+        os_set_on_yield(zealphp_on_yield);
+        os_set_on_resume(zealphp_on_resume);
+        os_set_on_close(zealphp_on_close);
+    }
+
+    zealphp_fn_statics_active = true;
     RETURN_TRUE;
 }
 
@@ -2204,6 +2414,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_globals_deltas,     256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_globals_tombstones, 256, NULL, ZVAL_PTR_DTOR, 0);
     /* persistent=0 — parent snapshot contents come from the per-request heap.
@@ -2441,6 +2652,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_coroutine_globals, 0, 1,
     ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_coroutine_statics, 0, 1, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_constants_clear, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
@@ -2474,6 +2689,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_superglobals_restore,   arginfo_zealphp_superglobals_restore)
     PHP_FE(zealphp_coroutine_superglobals, arginfo_zealphp_coroutine_superglobals)
     PHP_FE(zealphp_coroutine_globals,      arginfo_zealphp_coroutine_globals)
+    PHP_FE(zealphp_coroutine_statics,      arginfo_zealphp_coroutine_statics)
     PHP_FE(zealphp_constants_clear,        arginfo_zealphp_constants_clear)
     PHP_FE(zealphp_ini_restore,           arginfo_zealphp_constants_clear)
     PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
