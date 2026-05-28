@@ -1762,18 +1762,21 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     zend_hash_init(&scratch_cl, 8, NULL, NULL, 0);
 
     /* Stage 4: swap CG only. EG stays pointing at the real table so
-     * internal function/class lookups during compile (e.g., Closure for
-     * type hints, attribute classes) still resolve.
+     * internal function/class lookups during compile (Closure for type
+     * hints, attribute classes, parent classes for inheritance fixup)
+     * still resolve.
      *
-     * Stage 5 attempt — swapping EG too — was reverted: opcache's hot
-     * path bind-check that motivated the EG swap actually doesn't go
-     * through EG(function_table). Investigation showed opcache's
-     * zend_accel_load_script's failure path is different from what
-     * we modeled. The wp-login.php case needs engine-level
-     * cooperation (a hook on do_bind_function itself) which can't
-     * be installed from a PHP extension without LD_PRELOAD. Documented
-     * in docs/compatibility-database.md as the residual opcache hot-
-     * path gap; M1 Pool stays the answer for those specific endpoints. */
+     * Stage 4-v2 attempt — swapping EG(function_table) only, keeping
+     * EG(class_table) real — also broke compiles. Even the WordPress
+     * homepage that previously worked started returning 500 on the
+     * second request. The function_table swap interacts with the
+     * compiler's internal machinery in ways that aren't surface-
+     * documented. Reverted.
+     *
+     * The opcache hot path (zend_accel_load_script) remains the gap.
+     * Closing it cleanly needs an engine-level hook on do_bind_function
+     * or a configuration the engine doesn't expose. M1 Pool for the
+     * specific endpoints stays the documented FPM pair-up. */
     CG(function_table) = &scratch_fn;
     CG(class_table)    = &scratch_cl;
 
@@ -1798,8 +1801,8 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     /* Restore BEFORE anything else — must hold even on the bailout path. */
     CG(function_table) = real_cg_fn;
     CG(class_table)    = real_cg_cl;
-    /* EG was never swapped (Stage 5 revert) — these locals are kept for
-     * the merge step's "are CG/EG the same hash?" sanity check. */
+    /* EG was never swapped (Stage 4 CG-only design) — keep these
+     * locals referenced so the compiler doesn't warn. */
     (void) real_eg_fn;
     (void) real_eg_cl;
 
