@@ -1001,8 +1001,16 @@ PHP_FUNCTION(zealphp_restore_all)
 
 /* ── Superglobals management ─────────────────────────────────────── */
 
-/* Map superglobal name to PG(http_globals) TRACK_VARS index.
- * Returns -1 for _SESSION/_ENV (no TRACK_VARS slot). */
+/* Map superglobal name to a PG(http_globals) storage slot.
+ * Returns -1 for names with no backing slot in the array.
+ *
+ * IMPORTANT: PG(http_globals) is declared `zval http_globals[6]` (valid
+ * indices 0-5: POST/GET/COOKIE/SERVER/ENV/FILES). TRACK_VARS_REQUEST is 6,
+ * which is OUT OF BOUNDS for that array — PHP never stores $_REQUEST there;
+ * it builds $_REQUEST from GET+POST+COOKIE and keeps it only in the symbol
+ * table. So _REQUEST (and _SESSION/_ENV) must return -1: the symbol-table
+ * write in zealphp_set_superglobal is what makes them visible. Returning 6
+ * here read/wrote past the end of the struct and segfaulted in zval_ptr_dtor. */
 static int zealphp_track_vars_index(const char *name)
 {
     if (name[0] != '_') return -1;
@@ -1011,7 +1019,7 @@ static int zealphp_track_vars_index(const char *name)
     if (strcmp(name, "_COOKIE") == 0)  return TRACK_VARS_COOKIE;
     if (strcmp(name, "_SERVER") == 0)  return TRACK_VARS_SERVER;
     if (strcmp(name, "_FILES") == 0)   return TRACK_VARS_FILES;
-    if (strcmp(name, "_REQUEST") == 0) return TRACK_VARS_REQUEST;
+    /* _REQUEST has no http_globals slot (index 6 is OOB) — symbol table only. */
     return -1;
 }
 
