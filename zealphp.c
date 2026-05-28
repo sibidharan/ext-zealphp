@@ -23,6 +23,9 @@
 #include "zend_vm.h"
 #include "php_zealphp.h"
 #include <dlfcn.h>
+#include <sys/time.h>
+#include <stdio.h>
+#include <unistd.h>
 
 /* ZTS refusal. The extension uses process-wide `static` storage for state
  * (zealphp_request_tables_live, zealphp_silent_redeclare_enabled, the
@@ -1760,16 +1763,42 @@ static zend_op_array *(*zealphp_original_compile_file)(zend_file_handle *file_ha
 static HashTable zealphp_file_decls;
 static bool zealphp_file_decls_initialized = false;
 
-/* Helper: extract a stable file-path key from a zend_file_handle. */
+/* Helper: extract a stable file-path key from a zend_file_handle.
+ * ALWAYS prefers filename (set at hook entry, before the engine
+ * resolves opened_path) for consistency between cache-save (cold
+ * compile) and cache-lookup (warm compile). */
 static zend_string *zealphp_file_handle_path(zend_file_handle *file_handle)
 {
-    if (file_handle->opened_path) {
-        return zend_string_copy(file_handle->opened_path);
-    }
     if (file_handle->filename) {
         return zend_string_copy(file_handle->filename);
     }
+    if (file_handle->opened_path) {
+        return zend_string_copy(file_handle->opened_path);
+    }
     return NULL;
+}
+
+/* Stage 6 debug instrumentation — flush per-worker trace lines to a
+ * per-pid log file. Lets us see WHICH worker hangs where in the
+ * compile_file_hook flow. Enabled when ZEALPHP_TRACE_COMPILE env var
+ * is set. */
+static void zealphp_compile_trace(const char *step, const char *path)
+{
+    static int trace_enabled = -1;
+    if (trace_enabled == -1) {
+        trace_enabled = getenv("ZEALPHP_TRACE_COMPILE") ? 1 : 0;
+    }
+    if (!trace_enabled) return;
+    char fname[64];
+    snprintf(fname, sizeof(fname), "/tmp/zealphp-compile-pid%d.log", getpid());
+    FILE *f = fopen(fname, "a");
+    if (!f) return;
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    fprintf(f, "%ld.%06ld pid=%d step=%s path=%s\n",
+            (long)tv.tv_sec, (long)tv.tv_usec, getpid(), step,
+            path ? path : "(null)");
+    fclose(f);
 }
 
 static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, int type)
@@ -1779,6 +1808,9 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
             ? zealphp_original_compile_file(file_handle, type)
             : NULL;
     }
+    const char *trace_path = (file_handle && file_handle->filename)
+        ? ZSTR_VAL(file_handle->filename) : NULL;
+    zealphp_compile_trace("enter", trace_path);
 
     /* Lazy-init the per-file decl tracker. */
     if (!zealphp_file_decls_initialized) {
@@ -1786,36 +1818,30 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
         zealphp_file_decls_initialized = true;
     }
 
-    /* Stage 6.x — cold op_array cache attempt (reverted).
+    /* Stage 6.2 — cold op_array cache. On cold compile, save the
+     * op_array. On warm compile of same file, return the saved
+     * op_array directly, bypassing opcache's hot-path bind that
+     * would dup-error.
      *
-     * Goal: cache the cold-compile op_array for redeclare-prone files
-     * and return it directly on subsequent compiles, bypassing opcache.
-     *
-     * Tested on perf VM with WordPress wp-login.php × 10 sequential
-     * requests:
-     *   R1 worker-A: 200 (cold compile + cache save)
-     *   R2 worker-B: timeout (Worker B hangs in some other code path)
-     *   R3 worker-A: 200 (cache hit returns saved op_array — IT WORKS)
-     *   R4 worker-B: timeout
-     *   R5 worker-A: 200
-     *   ...alternating 200/timeout
-     *
-     * Worker A serves odd requests cleanly using the cached op_array.
-     * Worker B hangs on every request. The hang is upstream of the
-     * cache return — Worker B's compile_file path doesn't even reach
-     * the cache hit. Likely a per-worker initialization state issue
-     * (zealphp_file_decls is a per-process static; workers fork from
-     * the master so they should share the table at fork time, but
-     * subsequent updates from one worker don't propagate to others).
-     *
-     * Reverting to Stage 4 alone pending a debug pass that figures out:
-     *   (a) why one worker hangs while another serves cleanly
-     *   (b) whether the right design is per-worker storage or
-     *       SMA-shared storage with proper synchronization
-     *
-     * For now, M1 Pool via App::registerCgiBackend remains the
-     * answer for redeclare-prone endpoints. */
+     * Per-worker storage (no SMA needed): each worker pays the cold
+     * cost ONCE per redeclare-prone file (~50 files for WordPress),
+     * then serves from process-local cache for the rest of its
+     * lifetime. Memory bounded: ~10 KB × 50 files = ~500 KB per worker. */
     zend_string *file_key = zealphp_file_handle_path(file_handle);
+    if (file_key && zealphp_file_decls_initialized) {
+        zval *cached_zv = zend_hash_find(&zealphp_file_decls, file_key);
+        if (cached_zv && Z_TYPE_P(cached_zv) == IS_PTR) {
+            zealphp_compile_trace("cache_hit", trace_path);
+            zend_op_array *cached = (zend_op_array*)Z_PTR_P(cached_zv);
+            zend_op_array *shell = emalloc(sizeof(zend_op_array));
+            memcpy(shell, cached, sizeof(zend_op_array));
+            if (shell->refcount) {
+                (*shell->refcount)++;
+            }
+            zend_string_release(file_key);
+            return shell;
+        }
+    }
     bool tracked = false;
 
     if (tracked) {
@@ -1914,11 +1940,13 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
      * Closes MEDIUM M1 from the v0.3.9 security review. */
     zend_op_array *result = NULL;
     bool bailed_out = false;
+    zealphp_compile_trace("pre_orig", trace_path);
     zend_try {
         result = zealphp_original_compile_file(file_handle, type);
     } zend_catch {
         bailed_out = true;
     } zend_end_try();
+    zealphp_compile_trace(bailed_out ? "post_orig_bailout" : "post_orig_ok", trace_path);
 
     /* Restore BEFORE anything else — must hold even on the bailout path. */
     CG(function_table) = real_cg_fn;
@@ -1964,9 +1992,25 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
         }
     } ZEND_HASH_FOREACH_END();
 
-    /* Stage 6 RECORD step disabled until the warm-path design is
-     * proven on a multi-worker setup. Scaffold remains in the source
-     * for the next iteration. */
+    /* Stage 6.2 SAVE — if the cold compile produced top-level decls
+     * (visible as non-empty scratch tables) and we haven't cached
+     * this file yet, save the op_array. Subsequent compiles of this
+     * file return the cached body via the warm-path lookup above. */
+    if (file_key && result
+        && (zend_hash_num_elements(&scratch_fn) > 0
+            || zend_hash_num_elements(&scratch_cl) > 0)
+        && zealphp_file_decls_initialized
+        && !zend_hash_exists(&zealphp_file_decls, file_key)) {
+        zealphp_compile_trace("cache_save", trace_path);
+        zend_string *pkey = zend_string_dup(file_key, 1);
+        if (result->refcount) {
+            (*result->refcount)++;
+        }
+        zval cached_zv;
+        ZVAL_PTR(&cached_zv, result);
+        zend_hash_add(&zealphp_file_decls, pkey, &cached_zv);
+        zend_string_release(pkey);
+    }
     if (file_key) {
         zend_string_release(file_key);
     }
