@@ -237,10 +237,14 @@ static void zealphp_ini_snapshot_save(long cid)
             zval val;
             ZVAL_STR_COPY(&val, ini_entry->value);
             zend_hash_update(Z_ARRVAL(snapshot), name, &val);
-            /* Restore original value */
+            /* Restore original value. zend_alter_ini_entry_ex's first arg is
+             * the entry name (zend_string*), not the entry pointer — older
+             * code accidentally passed the entry struct, which was emitting
+             * an -Wincompatible-pointer-types warning that hardens to error
+             * on stricter PHP build flags. */
             if (ini_entry->orig_value) {
                 zend_string *orig = zend_string_copy(ini_entry->orig_value);
-                zend_alter_ini_entry_ex(ini_entry, orig,
+                zend_alter_ini_entry_ex(name, orig,
                     ini_entry->modifiable, ZEND_INI_STAGE_RUNTIME, 1);
                 zend_string_release(orig);
             }
