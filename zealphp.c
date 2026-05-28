@@ -68,16 +68,32 @@ static HashTable zealphp_coro_static_snapshots;
 
 /* ── Per-coroutine full $GLOBALS / EG(symbol_table) isolation ───────── */
 
-/* Per-coroutine $GLOBALS snapshots: coro_id → zval (array deep-copy of
- * EG(symbol_table)). Activated by zealphp_coroutine_globals(true).
+/* Per-coroutine $GLOBALS Stage 2 (COW deltas). Activated by
+ * zealphp_coroutine_globals(true).
  *
- * Implementation note: We deep-copy each zval entry rather than memcpy'ing
- * the HashTable struct. The struct-swap approach is faster but shares
- * arData pointers between EG and coro-snapshots → on close we cannot
- * safely free without risking double-free or use-after-free against EG.
- * Deep-copy matches the existing zealphp_coro_snapshots pattern. */
-static HashTable zealphp_coro_globals_snapshots;
+ * Design:
+ *   - At first activation we deep-copy EG(symbol_table) into a shared parent
+ *     HashTable (zealphp_coro_globals_parent). All coroutines share it.
+ *   - On yield, compute DELTA = entries that differ from parent (adds +
+ *     overrides) stored in zealphp_coro_globals_deltas[cid].
+ *     Keys present in parent but absent from EG are stored as a TOMBSTONE
+ *     SET in zealphp_coro_globals_tombstones[cid] (key presence = tombstone;
+ *     values are dummy IS_LONG 1 so ZEND_HASH_FOREACH never skips them).
+ *     We cannot encode tombstones inside the delta array as IS_UNDEF zvals
+ *     because ZEND_HASH_FOREACH_STR_KEY_VAL silently skips IS_UNDEF slots —
+ *     that is Zend's own marker for a deleted hash bucket.
+ *   - After saving, reset EG to parent baseline so the next coroutine
+ *     (including ones launched inline via Coroutine::create) starts clean.
+ *   - On resume: reset EG → parent, apply delta overrides, delete tombstones.
+ *
+ * Memory: parent (1×) + N × O(delta_keys) instead of N × O(all_keys). */
+static HashTable zealphp_coro_globals_deltas;      /* cid → zval-array (live overrides) */
+static HashTable zealphp_coro_globals_tombstones;  /* cid → zval-array (set of deleted keys) */
 static bool zealphp_coro_globals_hooks_active = false;
+
+/* Shared parent snapshot. */
+static HashTable zealphp_coro_globals_parent;
+static bool zealphp_coro_globals_parent_set = false;
 
 /* ── Per-request define() isolation ─────────────────────────────────── */
 
@@ -339,15 +355,53 @@ static bool zealphp_globals_is_superglobal_key(const char *key, size_t len)
     return false;
 }
 
-/* Save EG(symbol_table) into per-coroutine snapshot. Deep-copies every
- * non-superglobal user variable. Called on yield. */
-static void zealphp_globals_snapshot_save(long cid)
+/* Identity check used to decide whether a zval needs to be in the delta.
+ * Returns true when `a` and `b` would be indistinguishable from PHP code
+ * — same type, same scalar value, OR same refcounted storage pointer
+ * (string/array/object). Two arrays with the same contents but different
+ * arData pointers are NOT identical (matches PHP's `===` semantics for
+ * objects and the COW refcount-share invariant for arrays/strings). */
+static bool zealphp_globals_zval_identical(const zval *a, const zval *b)
 {
-    /* Guard: EG(symbol_table) may be invalid during coroutine teardown. */
-    if (!EG(symbol_table).nTableMask) return;
+    if (!a || !b) return false;
+    if (Z_TYPE_P(a) != Z_TYPE_P(b)) return false;
+    switch (Z_TYPE_P(a)) {
+        case IS_NULL:
+        case IS_TRUE:
+        case IS_FALSE:
+            return true;
+        case IS_LONG:
+            return Z_LVAL_P(a) == Z_LVAL_P(b);
+        case IS_DOUBLE:
+            return Z_DVAL_P(a) == Z_DVAL_P(b);
+        case IS_STRING:
+            /* Same zend_string pointer (COW share) OR same content. */
+            if (Z_STR_P(a) == Z_STR_P(b)) return true;
+            if (Z_STRLEN_P(a) != Z_STRLEN_P(b)) return false;
+            return memcmp(Z_STRVAL_P(a), Z_STRVAL_P(b), Z_STRLEN_P(a)) == 0;
+        case IS_ARRAY:
+            /* Same arData pointer = COW share. Two arrays with identical
+             * content but different arData are considered DIFFERENT here
+             * so any user mutation lands in the delta. */
+            return Z_ARRVAL_P(a) == Z_ARRVAL_P(b);
+        case IS_OBJECT:
+            return Z_OBJ_P(a) == Z_OBJ_P(b);
+        case IS_RESOURCE:
+            return Z_RES_P(a) == Z_RES_P(b);
+        case IS_REFERENCE:
+            return Z_REF_P(a) == Z_REF_P(b);
+        default:
+            return false;
+    }
+}
 
-    zval snapshot;
-    array_init(&snapshot);
+/* Take the shared parent snapshot from current EG(symbol_table). Called
+ * once when zealphp_coroutine_globals(true) flips on. Deep-copies every
+ * non-superglobal user var so the parent owns its storage. */
+static void zealphp_globals_parent_snapshot(void)
+{
+    if (zealphp_coro_globals_parent_set) return;
+    if (!EG(symbol_table).nTableMask) return;
 
     zend_string *key;
     zval *val;
@@ -356,27 +410,34 @@ static void zealphp_globals_snapshot_save(long cid)
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) {
             continue;
         }
-        /* Deep-copy the zval so the snapshot owns its own storage,
-         * independent of any subsequent mutation of EG(symbol_table). */
         zval copy;
         ZVAL_DUP(&copy, val);
-        zend_hash_add_new(Z_ARRVAL(snapshot), key, &copy);
+        zend_hash_add_new(&zealphp_coro_globals_parent, key, &copy);
     } ZEND_HASH_FOREACH_END();
 
-    zend_hash_index_update(&zealphp_coro_globals_snapshots, (zend_ulong)cid, &snapshot);
+    zealphp_coro_globals_parent_set = true;
 }
 
-/* Restore EG(symbol_table) entries from this coroutine's snapshot.
- * Clears non-superglobal entries first to avoid stale leftover data
- * from the previously-resumed coroutine. */
-static void zealphp_globals_snapshot_restore(long cid)
+/* Release the shared parent snapshot. Called on disable so the next enable
+ * re-snapshots a fresh parent. Storage is freed via the table's ZVAL_PTR_DTOR. */
+static void zealphp_globals_parent_clear(void)
+{
+    if (!zealphp_coro_globals_parent_set) return;
+    zend_hash_clean(&zealphp_coro_globals_parent);
+    zealphp_coro_globals_parent_set = false;
+}
+
+/* Reset EG(symbol_table) to the shared parent baseline:
+ *   - Remove every non-superglobal key currently present.
+ *   - Reinstall every parent key (refcount-shared via ZVAL_COPY).
+ * Used by both snapshot_save (post-yield reset so the next coroutine
+ * inherits clean state) and snapshot_restore (pre-delta cleanup). */
+static void zealphp_globals_reset_to_parent(void)
 {
     if (!EG(symbol_table).nTableMask) return;
 
-    zval *snapshot = zend_hash_index_find(&zealphp_coro_globals_snapshots, (zend_ulong)cid);
-
-    /* Step 1: collect non-superglobal keys currently in EG(symbol_table)
-     * and remove them. We cannot mutate the HashTable while iterating it. */
+    /* Pass 1: collect & remove non-SG keys. We cannot mutate while
+     * iterating the hash table. */
     zend_string **to_delete = NULL;
     uint32_t delete_count = 0;
     uint32_t delete_cap = 32;
@@ -389,8 +450,6 @@ static void zealphp_globals_snapshot_restore(long cid)
                 delete_cap *= 2;
                 to_delete = erealloc(to_delete, sizeof(zend_string *) * delete_cap);
             }
-            /* zend_string_addref so the key survives the hash_del below
-             * (which may release the last reference). */
             zend_string_addref(key);
             to_delete[delete_count++] = key;
         }
@@ -402,26 +461,139 @@ static void zealphp_globals_snapshot_restore(long cid)
     }
     efree(to_delete);
 
-    /* Step 2: re-insert snapshot entries (deep-copied) if we have one.
-     * First-resume coroutines (no snapshot) end up with a symbol_table
-     * containing only the superglobals — clean slate for user globals. */
-    if (snapshot && Z_TYPE_P(snapshot) == IS_ARRAY) {
+    /* Pass 2: reinstall parent baseline. */
+    if (zealphp_coro_globals_parent_set) {
         zval *val;
-        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(snapshot), key, val) {
+        ZEND_HASH_FOREACH_STR_KEY_VAL(&zealphp_coro_globals_parent, key, val) {
             if (!key) continue;
             zval copy;
-            ZVAL_DUP(&copy, val);
-            /* zend_hash_add_new is safe: we just cleared all non-SG keys. */
+            ZVAL_COPY(&copy, val);
             zend_hash_add_new(&EG(symbol_table), key, &copy);
         } ZEND_HASH_FOREACH_END();
     }
 }
 
-/* Delete per-coroutine globals snapshot. Storage is freed via the
- * HashTable's ZVAL_PTR_DTOR. */
+/* Save EG(symbol_table) into per-coroutine delta + tombstone tables.
+ *
+ * Delta table  (zealphp_coro_globals_deltas[cid]):
+ *   Keys whose value differs from parent (added or overridden).
+ *   Stored via ZVAL_COPY — refcount-shared for arrays/strings/objects.
+ *
+ * Tombstone table (zealphp_coro_globals_tombstones[cid]):
+ *   Keys present in parent but absent from EG (coroutine ran unset()).
+ *   Values are IS_LONG 1 — only key membership matters.
+ *   We use a SEPARATE table instead of encoding IS_UNDEF inside the delta
+ *   because ZEND_HASH_FOREACH_STR_KEY_VAL silently skips IS_UNDEF slots
+ *   (that type is Zend's internal "deleted bucket" marker).
+ *
+ * After saving, resets EG to parent baseline so the next coroutine
+ * (even one started inline via Coroutine::create before any channel yield)
+ * always inherits a clean parent state rather than leftover writes. */
+static void zealphp_globals_snapshot_save(long cid)
+{
+    if (!EG(symbol_table).nTableMask) return;
+
+    zval delta;
+    array_init(&delta);
+
+    /* Pass 1: record adds and overrides relative to parent. */
+    zend_string *key;
+    zval *val;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, val) {
+        if (!key) continue;
+        if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
+        if (zealphp_coro_globals_parent_set) {
+            zval *pv = zend_hash_find(&zealphp_coro_globals_parent, key);
+            if (pv && zealphp_globals_zval_identical(val, pv)) continue;
+        }
+        zval copy;
+        ZVAL_COPY(&copy, val);
+        zend_hash_add_new(Z_ARRVAL(delta), key, &copy);
+    } ZEND_HASH_FOREACH_END();
+
+    zend_hash_index_update(&zealphp_coro_globals_deltas, (zend_ulong)cid, &delta);
+
+    /* Pass 2: tombstone parent keys that are now absent from EG. */
+    if (zealphp_coro_globals_parent_set) {
+        zval tombstones;
+        array_init(&tombstones);
+        bool has_tombs = false;
+
+        zval *pv;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(&zealphp_coro_globals_parent, key, pv) {
+            (void)pv;
+            if (!key) continue;
+            if (zend_hash_exists(&EG(symbol_table), key)) continue;
+            /* dummy value — key presence is the tombstone signal */
+            zval one;
+            ZVAL_LONG(&one, 1);
+            zend_hash_add_new(Z_ARRVAL(tombstones), key, &one);
+            has_tombs = true;
+        } ZEND_HASH_FOREACH_END();
+
+        if (has_tombs) {
+            zend_hash_index_update(&zealphp_coro_globals_tombstones, (zend_ulong)cid, &tombstones);
+        } else {
+            zval_ptr_dtor(&tombstones);
+        }
+    }
+
+    /* Reset EG to parent baseline so the next coroutine starts clean. */
+    zealphp_globals_reset_to_parent();
+}
+
+/* Restore EG(symbol_table) for coroutine `cid`:
+ *   1. Reset to parent baseline.
+ *   2. Apply delta overrides (writes).
+ *   3. Delete tombstoned keys. */
+static void zealphp_globals_snapshot_restore(long cid)
+{
+    if (!EG(symbol_table).nTableMask) return;
+
+    /* Step 1 — parent baseline (belt-and-suspenders: on_yield reset it too,
+     * but on_resume may fire without a preceding on_yield if OpenSwoole
+     * resumes a coroutine that was never explicitly yielded). */
+    zealphp_globals_reset_to_parent();
+
+    /* Step 2 — apply delta (adds / overrides). */
+    zval *delta = zend_hash_index_find(&zealphp_coro_globals_deltas, (zend_ulong)cid);
+    if (delta && Z_TYPE_P(delta) == IS_ARRAY) {
+        zend_string *key;
+        zval *val;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(delta), key, val) {
+            if (!key) continue;
+            zval *existing = zend_hash_find(&EG(symbol_table), key);
+            if (existing) {
+                zval old;
+                ZVAL_COPY_VALUE(&old, existing);
+                ZVAL_COPY(existing, val);
+                zval_ptr_dtor(&old);
+            } else {
+                zval copy;
+                ZVAL_COPY(&copy, val);
+                zend_hash_add_new(&EG(symbol_table), key, &copy);
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+
+    /* Step 3 — delete tombstoned keys (parent keys this coroutine unset). */
+    zval *tombs = zend_hash_index_find(&zealphp_coro_globals_tombstones, (zend_ulong)cid);
+    if (tombs && Z_TYPE_P(tombs) == IS_ARRAY) {
+        zend_string *key;
+        zval *dummy;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(tombs), key, dummy) {
+            (void)dummy;
+            if (!key) continue;
+            zend_hash_del(&EG(symbol_table), key);
+        } ZEND_HASH_FOREACH_END();
+    }
+}
+
+/* Delete both per-coroutine tables on coroutine close. */
 static void zealphp_globals_snapshot_delete(long cid)
 {
-    zend_hash_index_del(&zealphp_coro_globals_snapshots, (zend_ulong)cid);
+    zend_hash_index_del(&zealphp_coro_globals_deltas,     (zend_ulong)cid);
+    zend_hash_index_del(&zealphp_coro_globals_tombstones, (zend_ulong)cid);
 }
 
 static void zealphp_snapshot_save(long cid)
@@ -986,7 +1158,10 @@ PHP_FUNCTION(zealphp_coroutine_globals)
 
     if (!enable) {
         zealphp_coro_globals_hooks_active = false;
-        zend_hash_clean(&zealphp_coro_globals_snapshots);
+        zend_hash_clean(&zealphp_coro_globals_deltas);
+        zend_hash_clean(&zealphp_coro_globals_tombstones);
+        /* Drop the shared parent so the next enable re-snapshots fresh. */
+        zealphp_globals_parent_clear();
         RETURN_TRUE;
     }
 
@@ -996,6 +1171,11 @@ PHP_FUNCTION(zealphp_coroutine_globals)
             "Per-coroutine $GLOBALS isolation requires OpenSwoole.");
         RETURN_FALSE;
     }
+
+    /* First activation — snapshot the parent baseline. Idempotent guard
+     * inside zealphp_globals_parent_snapshot() handles the case where the
+     * extension is enabled twice in succession without a disable. */
+    zealphp_globals_parent_snapshot();
 
     /* Ensure the scheduler callbacks chain through our on_yield/on_resume/
      * on_close wrappers. Idempotent — if zealphp_coroutine_superglobals
@@ -1374,7 +1554,11 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
-    zend_hash_init(&zealphp_coro_globals_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_globals_deltas,     256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_globals_tombstones, 256, NULL, ZVAL_PTR_DTOR, 0);
+    /* persistent=0 — parent snapshot contents come from the per-request heap.
+     * Cleared explicitly via zealphp_globals_parent_clear() on disable. */
+    zend_hash_init(&zealphp_coro_globals_parent, 128, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_request_constants, 64, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_globals_snapshot, 128, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_files, 256, NULL, ZVAL_PTR_DTOR, 1);
