@@ -90,6 +90,22 @@ static HashTable zealphp_coro_static_snapshots;
 static HashTable zealphp_coro_fn_static_snapshots;
 static bool zealphp_fn_statics_active = false;
 
+/* Touched-set registry: (zend_ulong) op_array->static_variables (template ptr)
+ * → zend_op_array*. Populated by the ZEND_BIND_STATIC opcode hook as functions
+ * first instantiate their statics, so the per-yield snapshot iterates ONLY the
+ * functions that actually use statics (a small fraction of the table) instead
+ * of walking every function + method. Worker-global; NEVER cleared per request
+ * (only on explicit deactivation / worker shutdown). Stores only stable,
+ * table-resident op_arrays (named functions + methods) — closures and
+ * eval/top-level code are excluded because their op_arrays have per-instance
+ * heap lifetime and would dangle. This is exactly the population the full-table
+ * walk covers, so it's semantic parity. */
+static HashTable zealphp_fn_static_registry;
+typedef int (*zealphp_user_opcode_t)(zend_execute_data *);
+static zealphp_user_opcode_t zealphp_prev_bind_static = NULL;
+static bool zealphp_bind_static_installed = false;
+static int zealphp_bind_static_handler(zend_execute_data *execute_data); /* fwd */
+
 /* ── Per-coroutine full $GLOBALS / EG(symbol_table) isolation ───────── */
 
 /* Per-coroutine $GLOBALS Stage 2 (COW deltas). Activated by
@@ -430,6 +446,39 @@ static void zealphp_walk_fn_statics(zealphp_opa_static_cb cb, void *ctx)
     } ZEND_HASH_FOREACH_END();
 }
 
+/* Registry walk — the hot path. Visits ONLY the op_arrays the ZEND_BIND_STATIC
+ * hook recorded (functions that actually instantiated statics), so per-yield
+ * cost scales with static-using functions, not total functions. Re-derives the
+ * live table each call (so a not-yet-instantiated entry is skipped, and a
+ * re-instantiated table is picked up). */
+static void zealphp_walk_fn_statics_registry(zealphp_opa_static_cb cb, void *ctx)
+{
+    zend_op_array *opa;
+    ZEND_HASH_FOREACH_PTR(&zealphp_fn_static_registry, opa) {
+        if (!opa || !opa->static_variables) continue;
+        HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+        if (!live || live == opa->static_variables) continue;
+        cb(opa, live, ctx);
+    } ZEND_HASH_FOREACH_END();
+}
+
+/* One-time registry seed at activation: add every already-instantiated
+ * function/method static to the registry via the full walk. Closes the gap
+ * where a static with a non-constant initializer was first-bound during
+ * bootstrap BEFORE the BIND_STATIC hook went live (opcode 203
+ * BIND_INIT_STATIC_OR_JMP then JMPs past 183 on every later call, so the hook
+ * would never fire for it). The full walk only visits CG(function_table) +
+ * class methods — all table-resident, no closures — so this adds nothing
+ * unstable. */
+static void zealphp_fn_static_seed_cb(zend_op_array *opa, HashTable *live, void *ctx)
+{
+    (void)live; (void)ctx;
+    zend_ulong key = (zend_ulong)(uintptr_t)opa->static_variables;
+    if (!zend_hash_index_exists(&zealphp_fn_static_registry, key)) {
+        zend_hash_index_add_ptr(&zealphp_fn_static_registry, key, opa);
+    }
+}
+
 static void zealphp_fn_statics_save_cb(zend_op_array *opa, HashTable *live, void *ctx)
 {
     zval *outer = (zval *)ctx;
@@ -483,7 +532,7 @@ static void zealphp_fn_statics_snapshot_save(long cid)
 {
     zval outer;
     array_init(&outer);
-    zealphp_walk_fn_statics(zealphp_fn_statics_save_cb, &outer);
+    zealphp_walk_fn_statics_registry(zealphp_fn_statics_save_cb, &outer);
     if (zend_hash_num_elements(Z_ARRVAL(outer)) > 0) {
         zend_hash_index_update(&zealphp_coro_fn_static_snapshots, (zend_ulong)cid, &outer);
     } else {
@@ -495,7 +544,7 @@ static void zealphp_fn_statics_snapshot_restore(long cid)
 {
     zval *outer = zend_hash_index_find(&zealphp_coro_fn_static_snapshots, (zend_ulong)cid);
     if (!outer || Z_TYPE_P(outer) != IS_ARRAY) return;
-    zealphp_walk_fn_statics(zealphp_fn_statics_restore_cb, outer);
+    zealphp_walk_fn_statics_registry(zealphp_fn_statics_restore_cb, outer);
 }
 
 static void zealphp_fn_statics_snapshot_delete(long cid)
@@ -1463,6 +1512,9 @@ PHP_FUNCTION(zealphp_coroutine_statics)
     if (!enable) {
         zealphp_fn_statics_active = false;
         zend_hash_clean(&zealphp_coro_fn_static_snapshots);
+        /* Clear the touched-set so a later re-enable re-seeds fresh. The
+         * BIND_STATIC handler stays installed but is gated by the flag. */
+        zend_hash_clean(&zealphp_fn_static_registry);
         RETURN_TRUE;
     }
 
@@ -1471,6 +1523,17 @@ PHP_FUNCTION(zealphp_coroutine_statics)
             "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
             "Per-coroutine function-static isolation requires OpenSwoole.");
         RETURN_FALSE;
+    }
+
+    /* Install the ZEND_BIND_STATIC opcode hook ONCE (chain-aware vs uopz),
+     * then seed the registry with everything already instantiated. Installing
+     * at activation (runtime, after all extension MINITs) means we capture
+     * whatever handler is already there and never get clobbered by load order;
+     * BIND_STATIC stays completely untouched for apps that don't use Stage 5. */
+    if (!zealphp_bind_static_installed) {
+        zealphp_prev_bind_static = zend_get_user_opcode_handler(ZEND_BIND_STATIC);
+        zend_set_user_opcode_handler(ZEND_BIND_STATIC, zealphp_bind_static_handler);
+        zealphp_bind_static_installed = true;
     }
 
     if (!zealphp_coro_hooks_active && !zealphp_coro_globals_hooks_active && !zealphp_fn_statics_active) {
@@ -1508,7 +1571,11 @@ PHP_FUNCTION(zealphp_coroutine_statics)
         os_set_on_close(zealphp_on_close);
     }
 
+    /* Flag ON (after the scheduler-hook condition above, which checks
+     * !zealphp_fn_statics_active to decide whether to install on_yield/resume/
+     * close), then seed the registry with everything already instantiated. */
     zealphp_fn_statics_active = true;
+    zealphp_walk_fn_statics(zealphp_fn_static_seed_cb, NULL);
     RETURN_TRUE;
 }
 
@@ -1949,6 +2016,46 @@ static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data
         && zend_hash_exists(CG(class_table), Z_STR_P(src))) {
         EX(opline)++;
         return ZEND_USER_OPCODE_CONTINUE;
+    }
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
+/* Stage 5 touched-set: ZEND_BIND_STATIC (opcode 183) fires when a function
+ * binds a `static $x`. We record the executing op_array in the registry so the
+ * per-yield snapshot iterates only static-using functions. Idempotent (skip if
+ * already present), so the per-call cost is one hash lookup.
+ *
+ * Excludes closures (ZEND_ACC_CLOSURE) and eval/top-level code
+ * (function_name == NULL): their op_arrays have per-instance/eval heap lifetime
+ * and are NOT in the walked tables, so a stored pointer would dangle (UAF at a
+ * later yield). This is the exact population the full-table walk covers — pure
+ * semantic parity, not a regression (closure statics were never isolated).
+ *
+ * We deliberately do NOT hook opcode 203 (ZEND_BIND_INIT_STATIC_OR_JMP): the
+ * very first call to any static-using function always reaches 183 (203 only
+ * JMPs past 183 once the live table exists), so 183 alone catches every
+ * function exactly once. The activation-time seed walk covers anything bound
+ * before this hook went live.
+ *
+ * Chain-aware: if another extension (e.g. uopz's uopz_set_static) already
+ * installed a BIND_STATIC handler, we invoke it rather than clobber it. */
+static int zealphp_bind_static_handler(zend_execute_data *execute_data)
+{
+    if (zealphp_fn_statics_active) {
+        zend_function *fn = EX(func);
+        if (fn && fn->common.function_name != NULL
+            && !(fn->common.fn_flags & ZEND_ACC_CLOSURE)) {
+            zend_op_array *opa = &fn->op_array;
+            if (opa->static_variables) {
+                zend_ulong key = (zend_ulong)(uintptr_t)opa->static_variables;
+                if (!zend_hash_index_exists(&zealphp_fn_static_registry, key)) {
+                    zend_hash_index_add_ptr(&zealphp_fn_static_registry, key, opa);
+                }
+            }
+        }
+    }
+    if (zealphp_prev_bind_static) {
+        return zealphp_prev_bind_static(execute_data);
     }
     return ZEND_USER_OPCODE_DISPATCH;
 }
@@ -2415,6 +2522,8 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    /* Registry values are borrowed zend_op_array* — we don't own them, no dtor. */
+    zend_hash_init(&zealphp_fn_static_registry, 256, NULL, NULL, 0);
     zend_hash_init(&zealphp_coro_globals_deltas,     256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_globals_tombstones, 256, NULL, ZVAL_PTR_DTOR, 0);
     /* persistent=0 — parent snapshot contents come from the per-request heap.
