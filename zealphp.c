@@ -117,6 +117,12 @@ static bool zealphp_coro_globals_parent_set = false;
  * zealphp_define_intercept hook below can read it. */
 static bool zealphp_silent_redeclare_enabled = false;
 
+/* Stage 7: include_isolation. When enabled, the ZEND_INCLUDE_OR_EVAL
+ * opcode handler converts require_once/include_once to require/include
+ * for files NOT in the snapshot — so per-request code re-executes while
+ * bootstrap code stays cached. Zero cleanup needed per-request. */
+static bool zealphp_include_isolation_enabled = false;
+
 /* ── Per-request define() isolation ─────────────────────────────────── */
 
 /* Track constants defined during the current request so they can be
@@ -1721,6 +1727,71 @@ static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data
     return ZEND_USER_OPCODE_DISPATCH;
 }
 
+/* ── Stage 7: smart require_once via ZEND_INCLUDE_OR_EVAL opcode hook ──
+ *
+ * The fundamental problem: PHP's require_once cache (EG(included_files))
+ * is process-wide. In persistent servers, files included via require_once
+ * on request 1 become no-ops on request 2+. This breaks apps that put
+ * per-request routing/rendering logic in require_once'd files (WordPress's
+ * template-loader.php, Joomla's dispatcher, etc.).
+ *
+ * Solution: hook the ZEND_INCLUDE_OR_EVAL opcode. For require_once/
+ * include_once, check if the resolved file path is in the boot snapshot
+ * (zealphp_snapshot_files). If YES → standard require_once (cached).
+ * If NO → remove from EG(included_files) so the standard handler
+ * re-includes it. Bootstrap stays fast, per-request code re-executes.
+ *
+ * Combined with Stage 3 (silent function/class redeclare) and Stage 3.5
+ * (silent define redeclare), the re-included file's declarations are
+ * silently skipped while its per-request logic runs fresh. */
+
+static int zealphp_include_eval_handler(zend_execute_data *execute_data)
+{
+    if (!zealphp_include_isolation_enabled || !zealphp_state_snapshotted) {
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+
+    const zend_op *opline = EX(opline);
+
+    /* Only intercept require_once / include_once */
+    if (opline->extended_value != ZEND_INCLUDE_ONCE
+        && opline->extended_value != ZEND_REQUIRE_ONCE) {
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+
+    /* Get the filename operand */
+    zval *inc_filename = NULL;
+    if (opline->op1_type == IS_CONST) {
+        inc_filename = RT_CONSTANT(opline, opline->op1);
+    } else if (opline->op1_type == IS_CV || opline->op1_type == IS_TMP_VAR
+               || opline->op1_type == IS_VAR) {
+        inc_filename = EX_VAR(opline->op1.var);
+    }
+    if (!inc_filename || Z_TYPE_P(inc_filename) != IS_STRING) {
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+
+    /* Resolve the full path (same resolution PHP uses internally) */
+    zend_string *resolved = zend_resolve_path(Z_STR_P(inc_filename));
+    if (!resolved) {
+        /* Can't resolve → let the standard handler deal with the error */
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+
+    /* Bootstrap file (in snapshot) → normal require_once (cached) */
+    if (zend_hash_exists(&zealphp_snapshot_files, resolved)) {
+        zend_string_release(resolved);
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+
+    /* Per-request file (not in snapshot) → remove from include cache
+     * so the standard handler re-includes it as if it were never loaded. */
+    zend_hash_del(&EG(included_files), resolved);
+    zend_string_release(resolved);
+
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+
 /* ── Stage 4: compile-time silent-redeclare via CG-table swap ──────────
  *
  * Top-level `function foo() {}` / `class Bar {}` at file scope are bound
@@ -2070,6 +2141,28 @@ PHP_FUNCTION(zealphp_silent_redeclare)
     RETURN_BOOL(prev);
 }
 
+/* Public API: zealphp_include_isolation(bool $on = true): bool
+ * Enables Stage 7 smart require_once. Returns previous state. */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_include_isolation, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
+PHP_FUNCTION(zealphp_include_isolation)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = zealphp_include_isolation_enabled;
+    if (!on_is_null) {
+        zealphp_include_isolation_enabled = (bool)on;
+    }
+    RETURN_BOOL(prev);
+}
+
 PHP_MINIT_FUNCTION(zealphp)
 {
     /* zealphp_orig_handlers MOVED to RINIT/RSHUTDOWN in the v0.3.9 sec
@@ -2171,6 +2264,11 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_set_user_opcode_handler(ZEND_DECLARE_FUNCTION,       zealphp_declare_function_handler);
     zend_set_user_opcode_handler(ZEND_DECLARE_CLASS,          zealphp_declare_class_handler);
     zend_set_user_opcode_handler(ZEND_DECLARE_CLASS_DELAYED,  zealphp_declare_class_delayed_handler);
+
+    /* Stage 7: smart require_once. Same zero-overhead-when-off pattern as
+     * Stage 3 — the handler checks zealphp_include_isolation_enabled and
+     * returns DISPATCH immediately when disabled. */
+    zend_set_user_opcode_handler(ZEND_INCLUDE_OR_EVAL,        zealphp_include_eval_handler);
 
     /* Stage 4: compile-time silent-redeclare via CG-table swap.
      * Pointer-swap design — O(K) per compile (K = symbols this file
@@ -2369,6 +2467,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_process_state_clean,    arginfo_zealphp_process_state_clean)
     PHP_FE(zealphp_protect_classes,        arginfo_zealphp_protect_classes)
     PHP_FE(zealphp_silent_redeclare,       arginfo_zealphp_silent_redeclare)
+    PHP_FE(zealphp_include_isolation,     arginfo_zealphp_include_isolation)
     PHP_FE_END
 };
 

@@ -30,5 +30,6 @@ PHP_FUNCTION(zealphp_process_state_snapshot);
 PHP_FUNCTION(zealphp_process_state_clean);
 PHP_FUNCTION(zealphp_protect_classes);
 PHP_FUNCTION(zealphp_silent_redeclare);
+PHP_FUNCTION(zealphp_include_isolation);
 
 #endif
