@@ -638,12 +638,20 @@ static void zealphp_snapshot_save(long cid)
     array_init(&snapshot);
     for (const char **n = sg_names; *n; n++) {
         zval *sg = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
-        if (sg && Z_TYPE_P(sg) == IS_ARRAY) {
+        if (!sg) continue;
+        /* $_GET et al. may be wrapped in IS_REFERENCE — ZealPHP's
+         * RequestContext &__get() hands back $GLOBALS['_GET'] BY REFERENCE,
+         * flipping the symbol-table slot to a reference. Deref so we snapshot
+         * the underlying array. Without this the `== IS_ARRAY` gate skipped a
+         * referenced superglobal entirely, dropping it on resume (the
+         * "$_GET cleared after yield once code touches $g->get" leak). */
+        zval *arr = Z_ISREF_P(sg) ? Z_REFVAL_P(sg) : sg;
+        if (Z_TYPE_P(arr) == IS_ARRAY) {
             /* Deep copy the array to avoid sharing zvals with the live
              * symbol table — the original may be modified or freed between
              * yield and resume/close. */
             zval copy;
-            ZVAL_DUP(&copy, sg);
+            ZVAL_DUP(&copy, arr);
             add_assoc_zval(&snapshot, *n, &copy);
         }
     }
@@ -664,9 +672,14 @@ static void zealphp_snapshot_restore(long cid)
              * (no COW separation on write). */
             zval *existing = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
             if (existing) {
+                /* If the live slot is an IS_REFERENCE (a $g->get alias bound
+                 * via &__get), update the value the reference points at rather
+                 * than clobbering the reference wrapper — keeps the alias valid
+                 * while restoring this coroutine's array. */
+                zval *slot = Z_ISREF_P(existing) ? Z_REFVAL_P(existing) : existing;
                 zval old;
-                ZVAL_COPY_VALUE(&old, existing);
-                ZVAL_DUP(existing, val);
+                ZVAL_COPY_VALUE(&old, slot);
+                ZVAL_DUP(slot, val);
                 zval_ptr_dtor(&old);
             } else {
                 zval copy;
