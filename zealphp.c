@@ -802,6 +802,9 @@ static const char *zealphp_allowed[] = {
     /* input filtering */
     "filter_input",
     "filter_input_array",
+    /* environment — per-coroutine putenv/getenv via the request-scoped $g store */
+    "putenv",
+    "getenv",
     /* session */
     "session_start",
     "session_id",
