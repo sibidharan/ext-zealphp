@@ -895,10 +895,16 @@ PHP_FUNCTION(zealphp_process_state_clean)
 {
     zend_string *key;
     zval *val;
+    zend_long flags = 7; /* default: all (1=files, 2=classes, 4=functions) */
+
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL Z_PARAM_LONG(flags)
+    ZEND_PARSE_PARAMETERS_END();
 
     if (!zealphp_state_snapshotted) return;
 
     /* --- Included files: remove entries not in snapshot --- */
+    if (!(flags & 1)) goto skip_files;
     zend_string **del_files = NULL;
     uint32_t df_count = 0, df_cap = 64;
     del_files = emalloc(sizeof(zend_string *) * df_cap);
@@ -911,8 +917,10 @@ PHP_FUNCTION(zealphp_process_state_clean)
     } ZEND_HASH_FOREACH_END();
     for (uint32_t i = 0; i < df_count; i++) zend_hash_del(&EG(included_files), del_files[i]);
     efree(del_files);
+skip_files:
 
     /* --- User classes: remove entries not in snapshot --- */
+    if (!(flags & 2)) goto skip_classes;
     /* SAFETY: skip classes that have initialized static members (runtime
      * copy of default_static_members_table). Removing such classes via
      * zend_hash_del leaves a zombie entry (class_exists returns true but
@@ -926,21 +934,22 @@ PHP_FUNCTION(zealphp_process_state_clean)
         if (key && !zend_hash_exists(&zealphp_snapshot_classes, key)) {
             zend_class_entry *ce = Z_PTR_P(val);
             if (ce && ce->type == ZEND_USER_CLASS) {
-                /* Skip if statics have been initialized at runtime */
-                if (ce->default_static_members_count > 0
-                    && CE_STATIC_MEMBERS(ce) != NULL
-                    && CE_STATIC_MEMBERS(ce) != ce->default_static_members_table) {
-                    continue;  /* unsafe to remove — zombie class risk */
-                }
                 if (dc_count >= dc_cap) { dc_cap *= 2; del_cls = erealloc(del_cls, sizeof(zend_string *) * dc_cap); }
                 del_cls[dc_count++] = key;
             }
         }
     } ZEND_HASH_FOREACH_END();
-    for (uint32_t i = 0; i < dc_count; i++) zend_hash_del(CG(class_table), del_cls[i]);
+    {
+        dtor_func_t saved = CG(class_table)->pDestructor;
+        CG(class_table)->pDestructor = NULL;
+        for (uint32_t i = 0; i < dc_count; i++) zend_hash_del(CG(class_table), del_cls[i]);
+        CG(class_table)->pDestructor = saved;
+    }
     efree(del_cls);
+skip_classes:
 
     /* --- User functions: remove entries not in snapshot --- */
+    if (!(flags & 4)) goto skip_functions;
     zend_string **del_fn = NULL;
     uint32_t dfn_count = 0, dfn_cap = 64;
     del_fn = emalloc(sizeof(zend_string *) * dfn_cap);
@@ -954,8 +963,18 @@ PHP_FUNCTION(zealphp_process_state_clean)
             }
         }
     } ZEND_HASH_FOREACH_END();
-    for (uint32_t i = 0; i < dfn_count; i++) zend_hash_del(CG(function_table), del_fn[i]);
+    /* Disable destructor to avoid freeing OPcache SHM op_arrays.
+     * Non-immutable entries leak negligibly per request; the worker
+     * recycle (ZEALPHP_POOL_MAX_REQUESTS) bounds total growth. */
+    {
+        dtor_func_t saved = CG(function_table)->pDestructor;
+        CG(function_table)->pDestructor = NULL;
+        for (uint32_t i = 0; i < dfn_count; i++) zend_hash_del(CG(function_table), del_fn[i]);
+        CG(function_table)->pDestructor = saved;
+    }
     efree(del_fn);
+skip_functions:
+    ;
 }
 
 /* ── $GLOBALS snapshot/clean ─────────────────────────────────────── */
