@@ -1751,14 +1751,29 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     }
 
     /* Save real table pointers — restore on exit (nested-safe via stack). */
-    HashTable *real_fn = CG(function_table);
-    HashTable *real_cl = CG(class_table);
+    HashTable *real_cg_fn = CG(function_table);
+    HashTable *real_cg_cl = CG(class_table);
+    HashTable *real_eg_fn = EG(function_table);
+    HashTable *real_eg_cl = EG(class_table);
 
     /* Scratch tables with NULL dtor — we manage entry lifecycle below. */
     HashTable scratch_fn, scratch_cl;
     zend_hash_init(&scratch_fn, 8, NULL, NULL, 0);
     zend_hash_init(&scratch_cl, 8, NULL, NULL, 0);
 
+    /* Stage 4: swap CG only. EG stays pointing at the real table so
+     * internal function/class lookups during compile (e.g., Closure for
+     * type hints, attribute classes) still resolve.
+     *
+     * Stage 5 attempt — swapping EG too — was reverted: opcache's hot
+     * path bind-check that motivated the EG swap actually doesn't go
+     * through EG(function_table). Investigation showed opcache's
+     * zend_accel_load_script's failure path is different from what
+     * we modeled. The wp-login.php case needs engine-level
+     * cooperation (a hook on do_bind_function itself) which can't
+     * be installed from a PHP extension without LD_PRELOAD. Documented
+     * in docs/compatibility-database.md as the residual opcache hot-
+     * path gap; M1 Pool stays the answer for those specific endpoints. */
     CG(function_table) = &scratch_fn;
     CG(class_table)    = &scratch_cl;
 
@@ -1781,8 +1796,12 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     } zend_end_try();
 
     /* Restore BEFORE anything else — must hold even on the bailout path. */
-    CG(function_table) = real_fn;
-    CG(class_table)    = real_cl;
+    CG(function_table) = real_cg_fn;
+    CG(class_table)    = real_cg_cl;
+    /* EG was never swapped (Stage 5 revert) — these locals are kept for
+     * the merge step's "are CG/EG the same hash?" sanity check. */
+    (void) real_eg_fn;
+    (void) real_eg_cl;
 
     if (bailed_out) {
         /* Engine is in fatal-error state. Just free what we own and
@@ -1799,8 +1818,8 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     void *ptr;
 
     ZEND_HASH_FOREACH_STR_KEY_PTR(&scratch_fn, key, ptr) {
-        if (key && !zend_hash_exists(real_fn, key)) {
-            zend_hash_add_ptr(real_fn, key, ptr);
+        if (key && !zend_hash_exists(real_cg_fn, key)) {
+            zend_hash_add_ptr(real_cg_fn, key, ptr);
         } else if (ptr) {
             /* Loser: first declaration already in real. Free the dup so
              * we don't leak its op_array body. ZEND_FUNCTION_DTOR equivalent. */
@@ -1809,8 +1828,8 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     } ZEND_HASH_FOREACH_END();
 
     ZEND_HASH_FOREACH_STR_KEY_PTR(&scratch_cl, key, ptr) {
-        if (key && !zend_hash_exists(real_cl, key)) {
-            zend_hash_add_ptr(real_cl, key, ptr);
+        if (key && !zend_hash_exists(real_cg_cl, key)) {
+            zend_hash_add_ptr(real_cg_cl, key, ptr);
         } else if (ptr) {
             /* destroy_zend_class wants a zval — build one pointing at
              * the class entry. ZEND_CLASS_DTOR is the same impl. */
