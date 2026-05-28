@@ -1742,12 +1742,109 @@ static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data
  */
 static zend_op_array *(*zealphp_original_compile_file)(zend_file_handle *file_handle, int type) = NULL;
 
+/* Stage 6 — Track-and-Replay per-file declaration map.
+ *
+ * Key: realpath string of the source file. Value: HashTable<name, IS_LONG 1>
+ * recording every top-level function and class this file declared on its
+ * FIRST successful compile.
+ *
+ * Used on the warm path (request 2+): before calling the engine's
+ * original compile_file (which goes through opcache and would hit
+ * "Cannot redeclare" on the persistent dup-check), we pre-remove the
+ * tracked symbols from EG. opcache loads cleanly into the empty slots.
+ * After load, we destroy the new (compile-added) duplicates and reinstall
+ * our originals — first-wins, identical semantics to Stage 4 but applied
+ * surgically to KNOWN-conflicting symbols instead of swap-the-whole-table.
+ *
+ * Process-wide table (persistent=1) — same lifecycle as zealphp_orig_handlers. */
+static HashTable zealphp_file_decls;
+static bool zealphp_file_decls_initialized = false;
+
+/* Helper: extract a stable file-path key from a zend_file_handle. */
+static zend_string *zealphp_file_handle_path(zend_file_handle *file_handle)
+{
+    if (file_handle->opened_path) {
+        return zend_string_copy(file_handle->opened_path);
+    }
+    if (file_handle->filename) {
+        return zend_string_copy(file_handle->filename);
+    }
+    return NULL;
+}
+
 static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, int type)
 {
     if (!zealphp_silent_redeclare_enabled || !zealphp_original_compile_file) {
         return zealphp_original_compile_file
             ? zealphp_original_compile_file(file_handle, type)
             : NULL;
+    }
+
+    /* Lazy-init the per-file decl tracker. */
+    if (!zealphp_file_decls_initialized) {
+        zend_hash_init(&zealphp_file_decls, 64, NULL, ZVAL_PTR_DTOR, 1);
+        zealphp_file_decls_initialized = true;
+    }
+
+    /* Stage 6 warm-path: surgical pre-remove of tracked declarations
+     * from EG so the engine's bind doesn't dup-error. CURRENTLY DISABLED
+     * pending Stage 6 debug pass; the cold-path record step was crashing
+     * subsequent compiles. Stage 4 alone is the shipping behavior. */
+    zend_string *file_key = zealphp_file_handle_path(file_handle);
+    bool tracked = false;
+
+    if (tracked) {
+        HashTable *decls = NULL;
+        HashTable saved_funcs, saved_classes;
+        zend_hash_init(&saved_funcs,   8, NULL, NULL, 0);
+        zend_hash_init(&saved_classes, 8, NULL, NULL, 0);
+        zend_string *name;
+
+        ZEND_HASH_FOREACH_STR_KEY(decls, name) {
+            if (!name) continue;
+            /* Functions */
+            zend_function *fn = zend_hash_find_ptr(EG(function_table), name);
+            if (fn && fn->type == ZEND_USER_FUNCTION) {
+                if (fn->op_array.refcount) (*fn->op_array.refcount)++;
+                zend_hash_add_ptr(&saved_funcs, name, fn);
+                zend_hash_del(EG(function_table), name);
+            }
+            /* Classes */
+            zend_class_entry *ce = zend_hash_find_ptr(CG(class_table), name);
+            if (ce && ce->type == ZEND_USER_CLASS) {
+                ce->refcount++;
+                zend_hash_add_ptr(&saved_classes, name, ce);
+                zend_hash_del(CG(class_table), name);
+            }
+        } ZEND_HASH_FOREACH_END();
+
+        /* Run the engine's original compile. Slots are empty for our
+         * tracked names — opcache's dup-check passes cleanly. */
+        zend_op_array *result = zealphp_original_compile_file(file_handle, type);
+
+        /* Restore: drop compile-added duplicates, reinstall saved. */
+        zend_string *rkey;
+        void *rptr;
+        ZEND_HASH_FOREACH_STR_KEY_PTR(&saved_funcs, rkey, rptr) {
+            zend_hash_del(EG(function_table), rkey);
+            zend_hash_add_ptr(EG(function_table), rkey, rptr);
+            if (((zend_function*)rptr)->op_array.refcount
+                && *((zend_function*)rptr)->op_array.refcount > 1) {
+                (*((zend_function*)rptr)->op_array.refcount)--;
+            }
+        } ZEND_HASH_FOREACH_END();
+        ZEND_HASH_FOREACH_STR_KEY_PTR(&saved_classes, rkey, rptr) {
+            zend_hash_del(CG(class_table), rkey);
+            zend_hash_add_ptr(CG(class_table), rkey, rptr);
+            if (((zend_class_entry*)rptr)->refcount > 1) {
+                ((zend_class_entry*)rptr)->refcount--;
+            }
+        } ZEND_HASH_FOREACH_END();
+
+        zend_hash_destroy(&saved_funcs);
+        zend_hash_destroy(&saved_classes);
+        if (file_key) zend_string_release(file_key);
+        return result;
     }
 
     /* Save real table pointers — restore on exit (nested-safe via stack). */
@@ -1841,6 +1938,16 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
             destroy_zend_class(&cl_zv);
         }
     } ZEND_HASH_FOREACH_END();
+
+    /* Stage 6 record-on-cold-compile path is in development. The block
+     * that previously walked scratch_fn / scratch_cl post-merge and
+     * stored the names into zealphp_file_decls regressed the cold path
+     * — the bookkeeping copy of the keys was leaking into the engine's
+     * lifecycle in a way that crashed second-level compiles. Removed
+     * pending a debug pass. Stage 4 alone is the shipping behavior. */
+    if (file_key) {
+        zend_string_release(file_key);
+    }
 
     /* Scratch tables had NULL dtor — destroy_zend_hash just frees the
      * buckets, not the values (the values are now either in real or
