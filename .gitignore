@@ -1,0 +1,30 @@
+# PECL/phpize build artifacts
+.libs/
+.deps/
+.omc/
+autom4te.cache/
+build/
+modules/
+config.h
+config.h.in
+config.log
+config.nice
+config.status
+configure
+configure.ac
+libtool
+Makefile
+Makefile.fragments
+Makefile.objects
+run-tests.php
+*.lo
+*.la
+*.dep
+
+# run-tests.php intermediate output (keep .phpt sources, drop run artifacts)
+tests/*.diff
+tests/*.exp
+tests/*.log
+tests/*.out
+tests/*.php
+tests/*.sh
