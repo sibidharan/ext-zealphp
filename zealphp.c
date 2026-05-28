@@ -24,6 +24,19 @@
 #include "php_zealphp.h"
 #include <dlfcn.h>
 
+/* ZTS refusal. The extension uses process-wide `static` storage for state
+ * (zealphp_request_tables_live, zealphp_silent_redeclare_enabled, the
+ * persistent hash tables, the OpenSwoole dlsym function pointers, ...).
+ * None of it is TSRM-managed. On ZTS builds two threads racing on those
+ * statics produce UAFs and double-frees (HIGH from the v0.3.9 security
+ * review). Rather than ship a half-thread-safe build that's hazardous in
+ * Apache mpm-worker / mod_php-zts, fail at compile-time so the user knows
+ * to use an NTS build of PHP (which is the production default for FPM,
+ * OpenSwoole, and ZealPHP anyway). */
+#ifdef ZTS
+#error "ext-zealphp does not support ZTS PHP builds. Use NTS — PHP's production default for FPM / OpenSwoole / ZealPHP. See ARCHITECTURE.md."
+#endif
+
 /* ── Storage ─────────────────────────────────────────────────────────── */
 
 /* original handler pointers, keyed by lowercase function name */
@@ -802,12 +815,22 @@ static ZEND_NAMED_FUNCTION(zealphp_dispatch)
     zend_string *fname = execute_data->func->common.function_name;
     zend_string *lc = zend_string_tolower(fname);
 
-    zval *cb = zend_hash_find(&zealphp_callbacks, lc);
+    zval *cb_view = zend_hash_find(&zealphp_callbacks, lc);
     zend_string_release(lc);
 
-    if (!cb || Z_TYPE_P(cb) == IS_UNDEF) {
+    if (!cb_view || Z_TYPE_P(cb_view) == IS_UNDEF) {
         RETURN_NULL();
     }
+
+    /* PIN the callback. Under OpenSwoole's coroutine model the dispatch
+     * thunk can be suspended mid-call (a yield inside the user callback).
+     * If RSHUTDOWN fires during that suspension and destroys
+     * zealphp_callbacks, the closure object is freed and the cb_view
+     * pointer dangles. ZVAL_COPY bumps the closure's refcount so OUR
+     * reference survives the table destroy; zval_ptr_dtor below drops it.
+     * Closes HIGH H2 from the v0.3.9 security review. */
+    zval cb;
+    ZVAL_COPY(&cb, cb_view);
 
     uint32_t argc = ZEND_CALL_NUM_ARGS(execute_data);
     zval *args = NULL;
@@ -818,7 +841,7 @@ static ZEND_NAMED_FUNCTION(zealphp_dispatch)
     zval retval;
     ZVAL_UNDEF(&retval);
 
-    if (call_user_function(NULL, NULL, cb, &retval, argc, args) == SUCCESS) {
+    if (call_user_function(NULL, NULL, &cb, &retval, argc, args) == SUCCESS) {
         if (Z_TYPE(retval) != IS_UNDEF) {
             ZVAL_COPY_VALUE(return_value, &retval);
         } else {
@@ -826,12 +849,12 @@ static ZEND_NAMED_FUNCTION(zealphp_dispatch)
         }
     } else {
         zval_ptr_dtor(&retval);
-        if (EG(exception)) {
-            return;
+        if (!EG(exception)) {
+            php_error_docref(NULL, E_WARNING,
+                "ext-zealphp: callback for %s failed", ZSTR_VAL(fname));
         }
-        php_error_docref(NULL, E_WARNING,
-            "ext-zealphp: callback for %s failed", ZSTR_VAL(fname));
     }
+    zval_ptr_dtor(&cb);
 }
 
 /* ── zealphp_override(string $name, callable $cb): bool ──────────── */
@@ -926,10 +949,13 @@ PHP_FUNCTION(zealphp_restore)
     if (func && func->internal_function.handler == zealphp_dispatch) {
         func->internal_function.handler = (zif_handler)orig;
     } else if (func) {
+        /* Notice is generic on purpose — function name might be attacker-
+         * controlled (e.g., user PHP doing zealphp_restore($_GET['x']))
+         * and we don't want it landing in production logs. The bookkeeping
+         * is still cleared so a future override of the same name works. */
         php_error_docref(NULL, E_NOTICE,
-            "ext-zealphp: refusing to restore '%s' — handler was swapped "
-            "by another extension after override (bookkeeping cleared)",
-            ZSTR_VAL(func_name));
+            "ext-zealphp: refusing to restore — handler was swapped by "
+            "another extension after override (bookkeeping cleared)");
     }
 
     zend_hash_del(&zealphp_orig_handlers, lc);
@@ -1709,11 +1735,37 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     CG(function_table) = &scratch_fn;
     CG(class_table)    = &scratch_cl;
 
-    zend_op_array *result = zealphp_original_compile_file(file_handle, type);
+    /* Bailout-safe compile. E_COMPILE_ERROR / OOM / E_ERROR fire
+     * zend_bailout() which longjmps to the engine's bailout setjmp WITHOUT
+     * unwinding back through this function — if we leave CG pointing at
+     * our stack-local scratch when the stack frame goes away, the next
+     * access to CG(function_table) is a use-after-free.
+     *
+     * zend_try/zend_catch sets up a local bailout context. On bailout we
+     * restore CG pointers, free the scratch tables, then re-raise the
+     * bailout so the engine's outer handler still terminates the request.
+     * Closes MEDIUM M1 from the v0.3.9 security review. */
+    zend_op_array *result = NULL;
+    bool bailed_out = false;
+    zend_try {
+        result = zealphp_original_compile_file(file_handle, type);
+    } zend_catch {
+        bailed_out = true;
+    } zend_end_try();
 
-    /* Restore BEFORE merging — merge uses real_fn / real_cl directly. */
+    /* Restore BEFORE anything else — must hold even on the bailout path. */
     CG(function_table) = real_fn;
     CG(class_table)    = real_cl;
+
+    if (bailed_out) {
+        /* Engine is in fatal-error state. Just free what we own and
+         * re-raise. The buckets in scratch may hold partially-constructed
+         * declarations from before the error; the engine's per-arena
+         * teardown handles them — we just drop our wrapper. */
+        zend_hash_destroy(&scratch_fn);
+        zend_hash_destroy(&scratch_cl);
+        zend_bailout();
+    }
 
     /* Merge first-wins: only insert keys not already present in real. */
     zend_string *key;
@@ -1773,11 +1825,12 @@ PHP_FUNCTION(zealphp_silent_redeclare)
 
 PHP_MINIT_FUNCTION(zealphp)
 {
-    /* zealphp_orig_handlers stays persistent=1 — it stores raw C function
-     * pointers (zif_handler), never any request-heap zval/zend_object.
-     * Those pointers live in shared objects (.so .text) for the entire
-     * process lifetime, so a persistent table here is correct. */
-    zend_hash_init(&zealphp_orig_handlers, 32, NULL, NULL, 1);
+    /* zealphp_orig_handlers MOVED to RINIT/RSHUTDOWN in the v0.3.9 sec
+     * follow-up — even though it only stores raw C function pointers
+     * (zif_handler), keeping it persistent meant the dispatch-restore
+     * walk in RSHUTDOWN could see stale entries across SAPI module
+     * lifecycles where shared objects unload between requests. The
+     * lifecycle-aligned table closes that window. See RINIT below. */
 
     /* HIGH-severity finding from the v0.3.8 security review (fixed):
      * zealphp_callbacks / zealphp_request_constants / zealphp_globals_snapshot
@@ -1901,16 +1954,17 @@ static bool zealphp_request_tables_live = false;
 
 PHP_RINIT_FUNCTION(zealphp)
 {
-    /* Per-request init for the three tables that hold request-heap values
+    /* Per-request init for the four tables that hold request-heap values
      * (closures, per-request zend_string keys). Initializing here — and
      * destroying in RSHUTDOWN — ensures their lifetime matches the values
-     * they hold. Fixes the HIGH-severity UAF flagged in the v0.3.8
-     * security review.
+     * they hold.
      *
-     * The guard makes double-init a no-op so an embedded SAPI that calls
-     * MINIT then RINIT then more RINITs (unusual but legal) doesn't leak
-     * the old tables. */
+     * zealphp_orig_handlers was promoted into this lifecycle (was
+     * persistent=1 prior to v0.3.9 sec follow-up) so the RSHUTDOWN
+     * dispatch-uninstall walk can never see a stale handler from a
+     * previously-unloaded shared object. */
     if (!zealphp_request_tables_live) {
+        zend_hash_init(&zealphp_orig_handlers,      32,  NULL, NULL,          0);
         zend_hash_init(&zealphp_callbacks,          32,  NULL, ZVAL_PTR_DTOR, 0);
         zend_hash_init(&zealphp_request_constants,  64,  NULL, ZVAL_PTR_DTOR, 0);
         zend_hash_init(&zealphp_globals_snapshot,  128,  NULL, ZVAL_PTR_DTOR, 0);
@@ -1921,31 +1975,51 @@ PHP_RINIT_FUNCTION(zealphp)
 
 PHP_RSHUTDOWN_FUNCTION(zealphp)
 {
-    /* Per-request teardown. zend_hash_destroy walks the bucket array and
-     * applies the dtor (ZVAL_PTR_DTOR for these three) to each value —
-     * properly releasing the closures' refcounts and freeing the zend_string
-     * keys. After this the table memory itself is gone too. */
+    /* Per-request teardown. Order matters: restore mutated state FIRST so
+     * no late call (shutdown handler, persistent object dtor, coroutine
+     * resumption) can land on a swapped-but-orphaned handler, THEN destroy
+     * the per-request tables. */
     if (zealphp_request_tables_live) {
-        /* Restore any handlers we overrode before destroying the closure
-         * table — otherwise the dispatch thunk would still be installed on
-         * builtins after RSHUTDOWN with no callback to dispatch to, and
-         * the next call into header() / setcookie() etc. would hit the
-         * "callback not found" branch and silently return NULL.
-         *
-         * Walks zealphp_orig_handlers (persistent, survives) and puts
-         * each saved handler back, using the same compare-and-restore
-         * guard as zealphp_restore_all so we never clobber a third-party
-         * extension's hook. */
-        zend_string *key;
-        void *orig;
-        ZEND_HASH_FOREACH_STR_KEY_PTR(&zealphp_orig_handlers, key, orig) {
-            zend_function *func = zend_hash_find_ptr(CG(function_table), key);
-            if (func && func->internal_function.handler == zealphp_dispatch) {
-                func->internal_function.handler = (zif_handler)orig;
+        /* (1) Restore define() if zealphp_define_hook(true) was called.
+         * The intercept handler at zealphp.c writes into
+         * zealphp_request_constants — destroying that table while the
+         * intercept is still wired would UAF on any post-RSHUTDOWN
+         * define() call (CRITICAL C2 from the v0.3.9 security review). */
+        if (zealphp_define_hooked && CG(function_table) && zealphp_orig_define_handler) {
+            zend_function *df = zend_hash_str_find_ptr(
+                CG(function_table), "define", sizeof("define") - 1);
+            if (df && df->type == ZEND_INTERNAL_FUNCTION) {
+                df->internal_function.handler = zealphp_orig_define_handler;
             }
-        } ZEND_HASH_FOREACH_END();
-        zend_hash_clean(&zealphp_orig_handlers);
+            zealphp_orig_define_handler = NULL;
+            zealphp_define_hooked = false;
+        }
 
+        /* (2) Restore any handlers we overrode via zealphp_override.
+         * Compare-and-restore protects downstream extensions that hooked
+         * the slot after us. */
+        if (CG(function_table)) {
+            zend_string *key;
+            void *orig;
+            ZEND_HASH_FOREACH_STR_KEY_PTR(&zealphp_orig_handlers, key, orig) {
+                if (!key) continue;
+                zend_function *func = zend_hash_find_ptr(CG(function_table), key);
+                if (func && func->type == ZEND_INTERNAL_FUNCTION
+                    && func->internal_function.handler == zealphp_dispatch) {
+                    func->internal_function.handler = (zif_handler)orig;
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+
+        /* (3) Reset any other static flags that gate writes into the
+         * about-to-be-destroyed tables, so that if another request comes
+         * in with stale "we already initialized" state, we don't write
+         * into a freed table. */
+        zealphp_globals_snapshotted = false;
+
+        /* (4) Destroy the per-request tables. ZVAL_PTR_DTOR releases each
+         * stored closure / zval refcount. */
+        zend_hash_destroy(&zealphp_orig_handlers);
         zend_hash_destroy(&zealphp_callbacks);
         zend_hash_destroy(&zealphp_request_constants);
         zend_hash_destroy(&zealphp_globals_snapshot);

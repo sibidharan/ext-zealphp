@@ -348,6 +348,68 @@ The security review at the bottom of `zealphp.c`'s git history (see commits `9b8
 
 ---
 
+## Memory management — does it leak under long-running workloads?
+
+ZealPHP workers can serve millions of requests over days without restart. ext-zealphp is on the hot path for nearly every one of those — superglobal save/restore on yield/resume, `$GLOBALS` deltas, function overrides, opcode hooks, etc. Memory pressure was an active concern during design.
+
+**Four cleanup tiers, layered defense-in-depth.** Nothing accumulates past tier 4.
+
+### Tier 1 — per-coroutine (when a single coroutine ends)
+
+`zealphp_on_close()` (`zealphp.c` near line 708) deletes every per-`cid` entry:
+
+- `zealphp_coro_snapshots[cid]` — superglobals zval-array
+- `zealphp_coro_constant_snapshots[cid]` — user `define()` constants
+- `zealphp_coro_ini_snapshots[cid]` — `ini_set()` overrides
+- `zealphp_coro_static_snapshots[cid]` — static class properties
+- `zealphp_coro_globals_deltas[cid]` + `zealphp_coro_globals_tombstones[cid]` — Stage 2 `$GLOBALS` deltas
+
+Each entry's `ZVAL_PTR_DTOR` fires → refcounts drop → engine frees the values. **Typical size: 1–10 KB per coroutine**. At 1000 coros/sec that's ~10 MB/sec churn, all reclaimed immediately. The COW design here matters: deltas only contain what the coroutine ACTUALLY wrote — not a full deep-copy of `$GLOBALS` per coroutine (which was Stage 1's design and the reason it was replaced).
+
+### Tier 2 — per-HTTP-request (framework explicitly calls cleanup)
+
+ZealPHP's `CoSessionManager::__invoke` (or `SessionManager::__invoke` in superglobals mode) runs in a `finally` after each handler. It calls into the extension:
+
+- `zealphp_globals_clean()` (`zealphp.c:1414`) — drops `$GLOBALS` user vars back to parent baseline.
+- `zealphp_constants_clear()` (`zealphp.c:1469`) — clears user-defined constants.
+- `zealphp_ini_restore()` (`zealphp.c:1487`) — undoes `ini_set()` calls.
+- `zealphp_process_state_clean($flags)` (`zealphp.c:1305`) — Mode 1/3 only: removes added functions/classes/included files (when no app autoloader is registered).
+
+Each of these walks the relevant Zend table, frees the per-request entries via the engine's standard dtors. The COW parent table is untouched — so the NEXT request starts from the same clean baseline.
+
+### Tier 3 — per-worker (PHP RINIT/RSHUTDOWN cycle)
+
+`PHP_RINIT_FUNCTION` and `PHP_RSHUTDOWN_FUNCTION` (`zealphp.c:1900+`) manage four `persistent=0` tables: `zealphp_orig_handlers`, `zealphp_callbacks`, `zealphp_request_constants`, `zealphp_globals_snapshot`. Under OpenSwoole's default config, RINIT fires once at worker boot and RSHUTDOWN once at worker exit — so these tables effectively live for the worker's lifetime. Under CLI / FPM / CGI, they cycle per PHP-request.
+
+The RSHUTDOWN sequence is order-sensitive:
+
+1. **Restore the `define()` handler** if `zealphp_define_hook(true)` was called — otherwise the intercept handler keeps writing into a just-destroyed table.
+2. **Compare-and-restore the override handlers** so the dispatch thunk isn't installed on built-ins with no callback table behind it.
+3. **Reset static-flag state** (`zealphp_globals_snapshotted` etc.) so the next request starts clean.
+4. **`zend_hash_destroy` each per-request table** — `ZVAL_PTR_DTOR` releases every closure / zval refcount.
+
+This ordering was hardened after the v0.3.9 security review flagged the original sequence as racing with in-flight dispatches. See `tests/021-security-restore-isolation.phpt` for the pinned regression.
+
+### Tier 4 — periodic worker recycle (the safety net)
+
+OpenSwoole's `max_request` setting (ZealPHP's typical config: 10,000–50,000) forks a new worker process after N requests. The old worker exits cleanly → OS reclaims the entire process address space → any leak in the C code or user PHP code is **bounded by the recycle threshold**. This is the same backstop FPM uses (`pm.max_requests`).
+
+### What can still leak (and what we do about it)
+
+- **Closure refcount cycles** in `zealphp_callbacks` if a user closure captures another closure that captures back. PHP's cycle collector runs every ~10,000 zval allocs and breaks these. No extension-side action needed.
+- **OpenSwoole coroutine context** if a coroutine is hard-killed (server crash, OOM). Tier 4 covers this — process exit reclaims everything.
+- **opcache shared memory** — persists across worker recycles. By design. `opcache_reset()` clears it; ZealPHP doesn't automate this.
+
+### What the security review changed
+
+The v0.3.9 follow-up moved THREE tables from `persistent=1` to RINIT/RSHUTDOWN — they had held request-heap closures and zend_string keys, which the persistent table outlived. Cross-request UAF window closed. The fourth table (`zealphp_orig_handlers`) joined the same lifecycle when the reviewer found that even raw `zif_handler` pointers could go stale across SAPI module-reload cycles.
+
+The `zealphp_dispatch` thunk now `ZVAL_COPY`-pins the callback before invoking it, so a concurrent RSHUTDOWN destroying the callbacks table during an in-flight call no longer dangles the cb pointer. The Stage 4 compile-file hook wraps the original compile in `zend_try`/`zend_catch` so `E_COMPILE_ERROR` / OOM bailout still restores `CG(function_table)` properly.
+
+**Net effect:** at idle, the extension's heap footprint is bounded by the worker's `max_request` count plus the size of the active coroutines' deltas. There is no monotonic growth across requests. The Docker lab has been left running 48+ hour soak tests on Modes 4/5 and RSS stays flat after the initial worker warm-up.
+
+---
+
 ## Conventions
 
 - **All persistent storage uses `static HashTable`** at file scope. No globals exposed via `php_zealphp.h`.
