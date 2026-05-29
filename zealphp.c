@@ -758,7 +758,7 @@ static void zealphp_globals_reset_to_parent(void)
     zval *rv;
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, rv) {
         if (key && !zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))
-            && zealphp_globals_isolatable(rv)) {   /* leave objects/resources/refs in place */
+            && zealphp_globals_isolatable(rv)) {   /* objects/resources skipped; ref-of-scalar/array now isolated (deleted + reinstalled from parent) */
             if (delete_count >= delete_cap) {
                 delete_cap *= 2;
                 to_delete = erealloc(to_delete, sizeof(zend_string *) * delete_cap);
@@ -822,7 +822,7 @@ static void zealphp_globals_snapshot_save(long cid)
             if (pv && zealphp_globals_zval_identical(uv, pv)) continue;
         }
         zval copy;
-        ZVAL_COPY(&copy, uv);
+        ZVAL_DUP(&copy, uv);  /* deep-copy: no COW alias shared across coroutines (esp. arrays) */
         zend_hash_add_new(Z_ARRVAL(delta), key, &copy);
     } ZEND_HASH_FOREACH_END();
 
@@ -879,13 +879,20 @@ static void zealphp_globals_snapshot_restore(long cid)
             if (!key) continue;
             zval *existing = zend_hash_find(&EG(symbol_table), key);
             if (existing) {
+                /* If the live slot is IS_REFERENCE (another coroutine has bound
+                 * `global $key`), write THROUGH the reference instead of
+                 * clobbering the wrapper. Clobbering it would detach that
+                 * coroutine's CV alias from the symbol table and dangle/free the
+                 * wrapper it still holds — a crash under concurrency. Mirrors the
+                 * Stage-1 superglobal restore. */
+                zval *slot = Z_ISREF_P(existing) ? Z_REFVAL_P(existing) : existing;
                 zval old;
-                ZVAL_COPY_VALUE(&old, existing);
-                ZVAL_COPY(existing, val);
+                ZVAL_COPY_VALUE(&old, slot);
+                ZVAL_DUP(slot, val);
                 zval_ptr_dtor(&old);
             } else {
                 zval copy;
-                ZVAL_COPY(&copy, val);
+                ZVAL_DUP(&copy, val);
                 zend_hash_add_new(&EG(symbol_table), key, &copy);
             }
         } ZEND_HASH_FOREACH_END();
