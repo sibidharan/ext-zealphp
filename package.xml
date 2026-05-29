@@ -13,8 +13,8 @@
  <date>2026-05-26</date>
  <time>10:30:00</time>
  <version>
-  <release>0.1.0</release>
-  <api>0.1.0</api>
+  <release>0.3.16</release>
+  <api>0.3.16</api>
  </version>
  <stability>
   <release>alpha</release>
