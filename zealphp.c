@@ -163,6 +163,27 @@ static bool zealphp_coro_globals_parent_set = false;
  * zealphp_define_intercept hook below can read it. */
 static bool zealphp_silent_redeclare_enabled = false;
 
+/* HAZARD-2 fix: per-coroutine save of an IN-PROGRESS CG-swap. compile_file_hook
+ * points the process-global CG(class_table)/CG(function_table) at STACK-LOCAL
+ * scratch tables during a compile. If that compile yields (a nested autoload of a
+ * dependency does hooked I/O), the global CG would stay pointing at THIS
+ * coroutine's stack scratch while OTHER coroutines run — their compiles/binds then
+ * resolve against the scratch (which has none of the established classes) →
+ * "Class X not found" cascade (ASAN+probe confirmed: 101 yields-in-swap under a
+ * 12-way burst, CG=coroutine-stack-scratch while EG=real). So on yield we stash
+ * the swap and restore CG=EG (the real tables); on resume we re-apply it. Keyed by
+ * the OpenSwoole Coroutine* arg (reliable in all scheduler callbacks), NULL dtor
+ * (we only borrow the stack-local pointers, never own them). */
+static HashTable zealphp_coro_cg_swap_fn;  /* cid → saved CG(function_table) scratch */
+static HashTable zealphp_coro_cg_swap_cl;  /* cid → saved CG(class_table) scratch */
+/* HAZARD-2: per-coroutine save of EG(in_autoload) (PHP's autoload-recursion set).
+ * That set is process-wide; a coroutine suspended mid-autoload leaves the class it
+ * is loading in the set, so a PEER coroutine wanting the same class hits the
+ * recursion guard (zend_hash_add fails) and gets "Class not found" instead of
+ * loading it. Stash+clear on yield, restore on resume, so each coroutine autoloads
+ * independently; silent-redeclare first-wins reconciles duplicate compiles. */
+static HashTable zealphp_coro_in_autoload;  /* cid → zval-array of class names */
+
 /* Stage 7: include_isolation. When enabled, the ZEND_INCLUDE_OR_EVAL
  * opcode handler converts require_once/include_once to require/include
  * for files NOT in the snapshot — so per-request code re-executes while
@@ -1021,6 +1042,26 @@ static void zealphp_snapshot_restore(long cid)
 static void zealphp_on_yield(void *arg)
 {
     if (!arg) return;
+    /* HAZARD-2: if this coroutine is suspended mid-CG-swap, stash the swap and
+     * restore the real (EG) tables so peers don't see our stack-local scratch. */
+    if (CG(class_table) != EG(class_table)) {
+        zend_ulong k = (zend_ulong)(uintptr_t)arg;
+        zend_hash_index_update_ptr(&zealphp_coro_cg_swap_fn, k, CG(function_table));
+        zend_hash_index_update_ptr(&zealphp_coro_cg_swap_cl, k, CG(class_table));
+        CG(function_table) = EG(function_table);
+        CG(class_table)    = EG(class_table);
+    }
+    /* HAZARD-2: stash + clear this coroutine's autoload-recursion set so peers
+     * autoloading the same class don't hit the shared recursion guard. */
+    if (EG(in_autoload) && zend_hash_num_elements(EG(in_autoload)) > 0) {
+        zval al; array_init(&al);
+        zend_string *ak;
+        ZEND_HASH_FOREACH_STR_KEY(EG(in_autoload), ak) {
+            if (ak) { zval one; ZVAL_LONG(&one, 1); zend_hash_add(Z_ARRVAL(al), ak, &one); }
+        } ZEND_HASH_FOREACH_END();
+        zend_hash_index_update(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg, &al);
+        zend_hash_clean(EG(in_autoload));
+    }
     zealphp_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
@@ -1045,6 +1086,31 @@ static void zealphp_on_resume(void *arg)
      * so EG(symbol_table) is valid when we read/write superglobals */
     if (orig_on_resume) orig_on_resume(arg);
     if (!arg) return;
+    /* HAZARD-2: re-apply this coroutine's in-progress CG-swap (stashed on yield)
+     * so its compile continues against its own scratch where it left off. */
+    {
+        zend_ulong k = (zend_ulong)(uintptr_t)arg;
+        HashTable *sfn = zend_hash_index_find_ptr(&zealphp_coro_cg_swap_fn, k);
+        if (sfn) {
+            HashTable *scl = zend_hash_index_find_ptr(&zealphp_coro_cg_swap_cl, k);
+            CG(function_table) = sfn;
+            if (scl) CG(class_table) = scl;
+            zend_hash_index_del(&zealphp_coro_cg_swap_fn, k);
+            zend_hash_index_del(&zealphp_coro_cg_swap_cl, k);
+        }
+    }
+    /* HAZARD-2: restore this coroutine's autoload-recursion set. */
+    {
+        zval *al = zend_hash_index_find(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg);
+        if (al && Z_TYPE_P(al) == IS_ARRAY && EG(in_autoload)) {
+            zend_hash_clean(EG(in_autoload));
+            zend_string *ak;
+            ZEND_HASH_FOREACH_STR_KEY(Z_ARRVAL_P(al), ak) {
+                if (ak) { zval one; ZVAL_LONG(&one, 1); zend_hash_add(EG(in_autoload), ak, &one); }
+            } ZEND_HASH_FOREACH_END();
+            zend_hash_index_del(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg);
+        }
+    }
     /* NB: os_get_cid() == -1 here (see the identity-rationale comment on
      * zealphp_on_yield) — we MUST key on arg, never os_get_cid(), in this path. */
     /* Full $GLOBALS restore runs BEFORE superglobals restore so that
@@ -1067,6 +1133,10 @@ static void zealphp_on_close(void *arg)
     /* Chain to OpenSwoole's PHPCoroutine::on_close FIRST */
     if (orig_on_close) orig_on_close(arg);
     if (!arg) return;
+    /* HAZARD-2: drop any stashed CG-swap for a coroutine torn down mid-compile. */
+    zend_hash_index_del(&zealphp_coro_cg_swap_fn, (zend_ulong)(uintptr_t)arg);
+    zend_hash_index_del(&zealphp_coro_cg_swap_cl, (zend_ulong)(uintptr_t)arg);
+    zend_hash_index_del(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -2658,6 +2728,9 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_reincluded, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_cg_swap_fn, 64, NULL, NULL, 0);
+    zend_hash_init(&zealphp_coro_cg_swap_cl, 64, NULL, NULL, 0);
+    zend_hash_init(&zealphp_coro_in_autoload, 64, NULL, ZVAL_PTR_DTOR, 0);
     /* Registry values are borrowed zend_op_array* — we don't own them, no dtor. */
     zend_hash_init(&zealphp_fn_static_registry, 256, NULL, NULL, 0);
     zend_hash_init(&zealphp_coro_globals_deltas,     256, NULL, ZVAL_PTR_DTOR, 0);
