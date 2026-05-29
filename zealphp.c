@@ -2281,20 +2281,16 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
      * then serves from process-local cache for the rest of its
      * lifetime. Memory bounded: ~10 KB × 50 files = ~500 KB per worker. */
     zend_string *file_key = zealphp_file_handle_path(file_handle);
-    if (file_key && zealphp_file_decls_initialized) {
-        zval *cached_zv = zend_hash_find(&zealphp_file_decls, file_key);
-        if (cached_zv && Z_TYPE_P(cached_zv) == IS_PTR) {
-            zealphp_compile_trace("cache_hit", trace_path);
-            zend_op_array *cached = (zend_op_array*)Z_PTR_P(cached_zv);
-            zend_op_array *shell = emalloc(sizeof(zend_op_array));
-            memcpy(shell, cached, sizeof(zend_op_array));
-            if (shell->refcount) {
-                (*shell->refcount)++;
-            }
-            zend_string_release(file_key);
-            return shell;
-        }
-    }
+    /* Stage 6 compile-cache REMOVED. It cached the compiled op_array and, on a
+     * later compile of the same file, returned a memcpy'd shell with
+     * (*shell->refcount)++. But the engine destroys the compiled op_array after
+     * executing it, so the cached `refcount` pointer DANGLES — the ++ is a
+     * use-after-free → worker SIGSEGV under load (phpmyadmin on the 50-app
+     * sweep; gdb: zealphp_compile_file_hook at "(*shell->refcount)++"). An
+     * op_array cannot be safely shared by shallow memcpy + refcount across
+     * requests. Stage 4's CG-table swap below already handles top-level
+     * redeclaration correctly on EVERY compile, so the cache was only a
+     * re-compile optimization — not worth a UAF. */
     bool tracked = false;
 
     if (tracked) {
@@ -2445,25 +2441,10 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
         }
     } ZEND_HASH_FOREACH_END();
 
-    /* Stage 6.2 SAVE — if the cold compile produced top-level decls
-     * (visible as non-empty scratch tables) and we haven't cached
-     * this file yet, save the op_array. Subsequent compiles of this
-     * file return the cached body via the warm-path lookup above. */
-    if (file_key && result
-        && (zend_hash_num_elements(&scratch_fn) > 0
-            || zend_hash_num_elements(&scratch_cl) > 0)
-        && zealphp_file_decls_initialized
-        && !zend_hash_exists(&zealphp_file_decls, file_key)) {
-        zealphp_compile_trace("cache_save", trace_path);
-        zend_string *pkey = zend_string_dup(file_key, 1);
-        if (result->refcount) {
-            (*result->refcount)++;
-        }
-        zval cached_zv;
-        ZVAL_PTR(&cached_zv, result);
-        zend_hash_add(&zealphp_file_decls, pkey, &cached_zv);
-        zend_string_release(pkey);
-    }
+    /* Stage 6.2 cache-save REMOVED — see the cache-hit note above: a cached
+     * op_array's refcount pointer dangles once the engine frees it, segfaulting
+     * the next compile. Stage 4 re-compiles + first-wins-merges every time,
+     * which is correct without the cache. */
     if (file_key) {
         zend_string_release(file_key);
     }
