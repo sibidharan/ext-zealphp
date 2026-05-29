@@ -289,6 +289,27 @@ static void zealphp_constants_snapshot_delete(long cid)
 
 /* ── Level 3: Per-coroutine ini_set isolation ──────────────────────── */
 
+/* Some ini directives cannot be safely re-applied on every coroutine switch.
+ * `session.*` directives have a stateful on_modify (OnUpdateSession*) that
+ * REJECTS changes once a session is active or headers are sent, emitting
+ * "Session ini settings cannot be changed after headers have already been sent"
+ * on EVERY yield (restore-to-orig) and EVERY resume (re-apply) — a per-switch
+ * warning flood that also feeds the async logger, which on its own resume
+ * re-triggers the warning (a logging feedback loop that can wedge a worker).
+ * They are owned by the framework's per-coroutine session layer anyway, so we
+ * exclude them from generic ini snapshotting. This is a documented "pattern
+ * that cannot be coroutine-isolated via ini snapshot": directives whose
+ * on_modify has side effects or is stage-gated. */
+static bool zealphp_ini_isolatable(zend_string *name)
+{
+    if (!name) return false;
+    if (ZSTR_LEN(name) >= sizeof("session.") - 1 &&
+        memcmp(ZSTR_VAL(name), "session.", sizeof("session.") - 1) == 0) {
+        return false;
+    }
+    return true;
+}
+
 /* Save modified ini entries for this coroutine and restore originals.
  * EG(modified_ini_directives) tracks entries changed via ini_set().
  * We save the current values and restore orig_value so the next
@@ -306,7 +327,7 @@ static void zealphp_ini_snapshot_save(long cid)
     zend_ini_entry *ini_entry;
     zend_string *name;
     ZEND_HASH_FOREACH_STR_KEY_PTR(EG(modified_ini_directives), name, ini_entry) {
-        if (name && ini_entry && ini_entry->value) {
+        if (name && ini_entry && ini_entry->value && zealphp_ini_isolatable(name)) {
             zval val;
             ZVAL_STR_COPY(&val, ini_entry->value);
             zend_hash_update(Z_ARRVAL(snapshot), name, &val);
@@ -335,7 +356,7 @@ static void zealphp_ini_snapshot_restore(long cid)
     zend_string *name;
     zval *val;
     ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(snapshot), name, val) {
-        if (name && Z_TYPE_P(val) == IS_STRING) {
+        if (name && Z_TYPE_P(val) == IS_STRING && zealphp_ini_isolatable(name)) {
             zend_string *value = Z_STR_P(val);
             zend_alter_ini_entry(name, value,
                 ZEND_INI_USER, ZEND_INI_STAGE_RUNTIME);
@@ -2283,6 +2304,7 @@ static zend_op_array *(*zealphp_original_compile_file)(zend_file_handle *file_ha
 static HashTable zealphp_file_decls;
 static bool zealphp_file_decls_initialized = false;
 
+
 /* Helper: extract a stable file-path key from a zend_file_handle.
  * ALWAYS prefers filename (set at hook entry, before the engine
  * resolves opened_path) for consistency between cache-save (cold
@@ -2362,6 +2384,19 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     CG(function_table) = &scratch_fn;
     CG(class_table)    = &scratch_cl;
 
+    /* COMPILE-ATOMICITY (critical coroutine-correctness invariant): this CG
+     * swap must NOT be crossed by a coroutine switch. HOOK_FILE coroutinizes the
+     * source-file read inside zend_compile_file below; if it yields while CG
+     * points at our stack-local scratch and a zend_try frame is live, the switch
+     * corrupts engine state (SIGSEGV under OPcache, lost-wakeup hang without it —
+     * gdb-confirmed, 50-app sweep / phpMyAdmin Symfony-DI bootstrap). The fix
+     * lives in the framework: App::run() drops HOOK_FILE whenever silentRedeclare
+     * + enableCoroutine are both on, so the compile-time file read runs BLOCKING
+     * and this window is atomic. (A per-compile enable/disable_hook toggle from
+     * here was tried and is WORSE — mid-request wrapper swaps have side effects.)
+     * Network/socket/sleep hooks stay on, so runtime coroutine concurrency is
+     * unaffected; only file I/O is synchronous under the compile hook. */
+
     /* Bailout-safe compile. E_COMPILE_ERROR / OOM / E_ERROR fire
      * zend_bailout() which longjmps to the engine's bailout setjmp WITHOUT
      * unwinding back through this function — if we leave CG pointing at
@@ -2406,9 +2441,20 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
         if (key && !zend_hash_exists(real_cg_fn, key)) {
             zend_hash_add_ptr(real_cg_fn, key, ptr);
         } else if (ptr) {
-            /* Loser: first declaration already in real. Free the dup so
-             * we don't leak its op_array body. ZEND_FUNCTION_DTOR equivalent. */
-            destroy_zend_function((zend_function*)ptr);
+            /* Loser: first declaration already in real. Free the dup so we
+             * don't leak its op_array body — BUT NEVER free an immutable
+             * (opcache SHM) op_array. Under OPcache, a cache hit binds the
+             * SHM op_array into CG (our scratch); if it loses the first-wins
+             * race, destroy_zend_function() would free shared memory the whole
+             * process (and future requests) still execute → use-after-free in
+             * execute_ex, a worker SIGSEGV that surfaces a request or two later
+             * (50-app sweep: phpMyAdmin period-3 200/500/CRASH, opcache-on only;
+             * gone with opcache off). Immutable losers are owned by OPcache —
+             * just drop our scratch reference and let it be. */
+            zend_function *lf = (zend_function *)ptr;
+            if (!(lf->common.fn_flags & ZEND_ACC_IMMUTABLE)) {
+                destroy_zend_function(lf);
+            }
         }
     } ZEND_HASH_FOREACH_END();
 
@@ -2416,11 +2462,14 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
         if (key && !zend_hash_exists(real_cg_cl, key)) {
             zend_hash_add_ptr(real_cg_cl, key, ptr);
         } else if (ptr) {
-            /* destroy_zend_class wants a zval — build one pointing at
-             * the class entry. ZEND_CLASS_DTOR is the same impl. */
-            zval cl_zv;
-            ZVAL_PTR(&cl_zv, ptr);
-            destroy_zend_class(&cl_zv);
+            /* Same immutable-SHM guard as functions above: never destroy an
+             * OPcache-owned (immutable) class entry. */
+            zend_class_entry *lce = (zend_class_entry *)ptr;
+            if (!(lce->ce_flags & ZEND_ACC_IMMUTABLE)) {
+                zval cl_zv;
+                ZVAL_PTR(&cl_zv, lce);
+                destroy_zend_class(&cl_zv);
+            }
         }
     } ZEND_HASH_FOREACH_END();
 
@@ -2599,6 +2648,9 @@ PHP_MINIT_FUNCTION(zealphp)
         os_get_cid = (coro_get_cid_fn_t)dlsym(handle, "openswoole_coroutine_get_current_id");
         if (!os_get_cid)
             os_get_cid = (coro_get_cid_fn_t)dlsym(handle, "swoole_coroutine_get_current_id");
+        /* PHPCoroutine::set_hook_flags(uint32_t) — for compile-atomicity. Both
+         * the openswoole and swoole mangled names; NULL if unavailable (then
+         * compile-atomic is a no-op and the user must drop HOOK_FILE manually). */
         dlclose(handle);
     }
 
