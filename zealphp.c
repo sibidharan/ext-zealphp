@@ -110,6 +110,25 @@ static zealphp_user_opcode_t zealphp_prev_bind_static = NULL;
 static bool zealphp_bind_static_installed = false;
 static int zealphp_bind_static_handler(zend_execute_data *execute_data); /* fwd */
 
+/* Previous user-opcode handlers, captured at MINIT before we install ours, so
+ * we CHAIN instead of clobbering a coexisting profiler/instrumentation
+ * extension (uopz, datadog, blackfire, …). Every fall-through path (feature
+ * gated off, or we chose not to act) must defer to the prior handler rather
+ * than blindly DISPATCH — DISPATCH skips the prior handler entirely. The paths
+ * where WE own the decision (skip a duplicate decl via opline++ + CONTINUE)
+ * are terminal and do not chain. */
+static zealphp_user_opcode_t zealphp_prev_declare_function = NULL;
+static zealphp_user_opcode_t zealphp_prev_declare_class = NULL;
+static zealphp_user_opcode_t zealphp_prev_declare_class_delayed = NULL;
+static zealphp_user_opcode_t zealphp_prev_include_eval = NULL;
+
+/* Defer to a captured prior handler, or DISPATCH the original opcode if none. */
+static zend_always_inline int zealphp_chain_or_dispatch(
+        zealphp_user_opcode_t prev, zend_execute_data *execute_data)
+{
+    return prev ? prev(execute_data) : ZEND_USER_OPCODE_DISPATCH;
+}
+
 /* ── Per-coroutine full $GLOBALS / EG(symbol_table) isolation ───────── */
 
 /* Per-coroutine $GLOBALS Stage 2 (COW deltas). Activated by
@@ -927,6 +946,29 @@ static void zealphp_snapshot_restore(long cid)
 /* OpenSwoole scheduler callbacks — called from C, no PHP stack needed.
  * Use the Coroutine* arg pointer itself as the unique key — guaranteed
  * unique per coroutine, no need to extract cid from the struct. */
+/* Per-coroutine identity in the scheduler callbacks: we key every snapshot hash
+ * on (uintptr_t)arg — the OpenSwoole Coroutine* pointer passed to the callback —
+ * NOT os_get_cid(). This is deliberate and load-bearing, not an oversight:
+ *
+ *   EMPIRICALLY VERIFIED (cid-probe, 3 concurrent coroutines, HOOK_ALL):
+ *     on_yield : os_get_cid() == the yielding coroutine's cid   (reliable)
+ *     on_resume: os_get_cid() == -1  ON EVERY RESUME            (UNRELIABLE)
+ *     on_close : os_get_cid() == the closing coroutine's cid    (reliable)
+ *
+ * on_resume fires BEFORE the scheduler has installed the resuming coroutine as
+ * "current", so os_get_cid() returns -1 there. Keying the snapshot RESTORE on
+ * os_get_cid() would therefore look up hash[-1] for every resume and silently
+ * restore nothing — cross-coroutine state corruption. The Coroutine* arg is the
+ * ONLY identity that is correct in all three callbacks, so the snapshots use it.
+ * Pointer reuse is not a hazard: on_close(arg) deletes this coroutine's snapshot
+ * as part of teardown, before the engine can free and reassign the struct.
+ *
+ * Stage 7's reincluded set is the deliberate exception — it is populated from the
+ * ZEND_INCLUDE_OR_EVAL opcode handler, which runs in PHP-execution context (NOT a
+ * scheduler callback), where os_get_cid() IS the running coroutine's cid; and it
+ * is cleaned in on_close, where os_get_cid() is also reliable (see above). It can
+ * only ever see os_get_cid(), never arg, so it consistently keys on cid — a
+ * separate hash from the snapshots, so the two schemes never collide. */
 static void zealphp_on_yield(void *arg)
 {
     if (!arg) return;
@@ -954,6 +996,8 @@ static void zealphp_on_resume(void *arg)
      * so EG(symbol_table) is valid when we read/write superglobals */
     if (orig_on_resume) orig_on_resume(arg);
     if (!arg) return;
+    /* NB: os_get_cid() == -1 here (see the identity-rationale comment on
+     * zealphp_on_yield) — we MUST key on arg, never os_get_cid(), in this path. */
     /* Full $GLOBALS restore runs BEFORE superglobals restore so that
      * the superglobals layer can overwrite the 7 SG slots last and win
      * any race against stale snapshot data. */
@@ -2010,22 +2054,22 @@ static zend_string *zealphp_decl_target_lcname(const zend_op *opline, zend_execu
 static int zealphp_declare_function_handler(zend_execute_data *execute_data)
 {
     if (!zealphp_silent_redeclare_enabled) {
-        return ZEND_USER_OPCODE_DISPATCH;
+        return zealphp_chain_or_dispatch(zealphp_prev_declare_function, execute_data);
     }
     const zend_op *opline = EX(opline);
     zend_string *lcname = zealphp_decl_target_lcname(opline, execute_data);
     if (lcname && zend_hash_exists(EG(function_table), lcname)) {
-        /* Already declared. Skip do_bind_function. */
+        /* Already declared — WE own this: skip do_bind_function (terminal). */
         EX(opline)++;
         return ZEND_USER_OPCODE_CONTINUE;
     }
-    return ZEND_USER_OPCODE_DISPATCH;
+    return zealphp_chain_or_dispatch(zealphp_prev_declare_function, execute_data);
 }
 
 static int zealphp_declare_class_handler(zend_execute_data *execute_data)
 {
     if (!zealphp_silent_redeclare_enabled) {
-        return ZEND_USER_OPCODE_DISPATCH;
+        return zealphp_chain_or_dispatch(zealphp_prev_declare_class, execute_data);
     }
     const zend_op *opline = EX(opline);
     zend_string *lcname = zealphp_decl_target_lcname(opline, execute_data);
@@ -2033,13 +2077,13 @@ static int zealphp_declare_class_handler(zend_execute_data *execute_data)
         EX(opline)++;
         return ZEND_USER_OPCODE_CONTINUE;
     }
-    return ZEND_USER_OPCODE_DISPATCH;
+    return zealphp_chain_or_dispatch(zealphp_prev_declare_class, execute_data);
 }
 
 static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data)
 {
     if (!zealphp_silent_redeclare_enabled) {
-        return ZEND_USER_OPCODE_DISPATCH;
+        return zealphp_chain_or_dispatch(zealphp_prev_declare_class_delayed, execute_data);
     }
     /* DELAYED variant uses op2 for the destination (the parent-required key
      * lives in op1). Conservative behaviour: dispatch normally if we can't
@@ -2054,7 +2098,7 @@ static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data
         EX(opline)++;
         return ZEND_USER_OPCODE_CONTINUE;
     }
-    return ZEND_USER_OPCODE_DISPATCH;
+    return zealphp_chain_or_dispatch(zealphp_prev_declare_class_delayed, execute_data);
 }
 
 /* Stage 5 touched-set: ZEND_BIND_STATIC (opcode 183) fires when a function
@@ -2118,7 +2162,7 @@ static int zealphp_bind_static_handler(zend_execute_data *execute_data)
 static int zealphp_include_eval_handler(zend_execute_data *execute_data)
 {
     if (!zealphp_include_isolation_enabled || !zealphp_state_snapshotted) {
-        return ZEND_USER_OPCODE_DISPATCH;
+        return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
     }
 
     const zend_op *opline = EX(opline);
@@ -2126,7 +2170,7 @@ static int zealphp_include_eval_handler(zend_execute_data *execute_data)
     /* Only intercept require_once / include_once */
     if (opline->extended_value != ZEND_INCLUDE_ONCE
         && opline->extended_value != ZEND_REQUIRE_ONCE) {
-        return ZEND_USER_OPCODE_DISPATCH;
+        return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
     }
 
     /* Get the filename operand */
@@ -2138,20 +2182,20 @@ static int zealphp_include_eval_handler(zend_execute_data *execute_data)
         inc_filename = EX_VAR(opline->op1.var);
     }
     if (!inc_filename || Z_TYPE_P(inc_filename) != IS_STRING) {
-        return ZEND_USER_OPCODE_DISPATCH;
+        return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
     }
 
     /* Resolve the full path (same resolution PHP uses internally) */
     zend_string *resolved = zend_resolve_path(Z_STR_P(inc_filename));
     if (!resolved) {
         /* Can't resolve → let the standard handler deal with the error */
-        return ZEND_USER_OPCODE_DISPATCH;
+        return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
     }
 
     /* Bootstrap file (in snapshot) → normal require_once (cached) */
     if (zend_hash_exists(&zealphp_snapshot_files, resolved)) {
         zend_string_release(resolved);
-        return ZEND_USER_OPCODE_DISPATCH;
+        return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
     }
 
     /* Per-request file (not in snapshot) → re-include it — but ONLY ONCE per
@@ -2173,7 +2217,7 @@ static int zealphp_include_eval_handler(zend_execute_data *execute_data)
         if (zend_hash_exists(seen_ht, resolved)) {
             /* already re-included this request — keep it cached (no-op) */
             zend_string_release(resolved);
-            return ZEND_USER_OPCODE_DISPATCH;
+            return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
         }
         zval one;
         ZVAL_LONG(&one, 1);
@@ -2183,7 +2227,10 @@ static int zealphp_include_eval_handler(zend_execute_data *execute_data)
     zend_hash_del(&EG(included_files), resolved);
     zend_string_release(resolved);
 
-    return ZEND_USER_OPCODE_DISPATCH;
+    /* We mutated EG(included_files) so the engine re-includes this file. Chain
+     * to any prior handler (a profiler may want to observe the include), then
+     * fall through to DISPATCH so the include actually happens. */
+    return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
 }
 
 /* ── Stage 4: compile-time silent-redeclare via CG-table swap ──────────
@@ -2575,13 +2622,19 @@ PHP_MINIT_FUNCTION(zealphp)
      * `zealphp_silent_redeclare(bool)` PHP function. Handlers fall through
      * (DISPATCH) when the flag is off, so installing them in MINIT is a
      * one-time pointer write with zero runtime overhead until opted in. */
+    /* Capture-and-chain (not clobber): if another extension already installed a
+     * handler for these opcodes, we defer to it on every fall-through path. */
+    zealphp_prev_declare_function = zend_get_user_opcode_handler(ZEND_DECLARE_FUNCTION);
     zend_set_user_opcode_handler(ZEND_DECLARE_FUNCTION,       zealphp_declare_function_handler);
+    zealphp_prev_declare_class = zend_get_user_opcode_handler(ZEND_DECLARE_CLASS);
     zend_set_user_opcode_handler(ZEND_DECLARE_CLASS,          zealphp_declare_class_handler);
+    zealphp_prev_declare_class_delayed = zend_get_user_opcode_handler(ZEND_DECLARE_CLASS_DELAYED);
     zend_set_user_opcode_handler(ZEND_DECLARE_CLASS_DELAYED,  zealphp_declare_class_delayed_handler);
 
     /* Stage 7: smart require_once. Same zero-overhead-when-off pattern as
      * Stage 3 — the handler checks zealphp_include_isolation_enabled and
-     * returns DISPATCH immediately when disabled. */
+     * chains/DISPATCHes immediately when disabled. */
+    zealphp_prev_include_eval = zend_get_user_opcode_handler(ZEND_INCLUDE_OR_EVAL);
     zend_set_user_opcode_handler(ZEND_INCLUDE_OR_EVAL,        zealphp_include_eval_handler);
 
     /* Stage 4: compile-time silent-redeclare via CG-table swap.
