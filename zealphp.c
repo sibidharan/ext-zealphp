@@ -382,7 +382,17 @@ static void zealphp_statics_snapshot_save(long cid)
 
     zend_string *class_name;
     zval *cls_zv;
-    ZEND_HASH_FOREACH_STR_KEY_VAL(CG(class_table), class_name, cls_zv) {
+    /* HAZARD-2 fix: iterate EG(class_table), NOT CG(class_table). The compile-file
+     * hook (Stage 4) swaps CG(class_table) to a STACK-LOCAL scratch table on the
+     * coroutine's stack during compile; EG is deliberately left pointing at the
+     * real global table (see the "Stage 4: swap CG only" note in
+     * zealphp_compile_file_hook). This snapshot fires on EVERY coroutine yield —
+     * including a yield mid-compile (autoload) or during bailout/teardown — so
+     * iterating CG(class_table) there can read a coroutine-stack scratch that
+     * becomes a use-after-free once that coroutine's stack is freed (ASAN-confirmed
+     * heap-use-after-free at this line on PHP 8.4/8.5). EG(class_table) is never
+     * swapped, so it is always the stable, real, process-global table. */
+    ZEND_HASH_FOREACH_STR_KEY_VAL(EG(class_table), class_name, cls_zv) {
         if (!class_name) continue;
         zend_class_entry *ce = Z_PTR_P(cls_zv);
         if (!ce || ce->type != ZEND_USER_CLASS) continue;
@@ -420,7 +430,8 @@ static void zealphp_statics_snapshot_restore(long cid)
     ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(snapshot), class_name, class_snapshot) {
         if (!class_name || Z_TYPE_P(class_snapshot) != IS_ARRAY) continue;
 
-        zval *cls_zv = zend_hash_find(CG(class_table), class_name);
+        /* HAZARD-2 fix: EG(class_table), not CG — see zealphp_statics_snapshot_save. */
+        zval *cls_zv = zend_hash_find(EG(class_table), class_name);
         if (!cls_zv) continue;
         zend_class_entry *ce = Z_PTR_P(cls_zv);
         if (!ce || ce->type != ZEND_USER_CLASS) continue;
@@ -475,8 +486,9 @@ typedef void (*zealphp_opa_static_cb)(zend_op_array *opa, HashTable *live, void 
 static void zealphp_walk_fn_statics(zealphp_opa_static_cb cb, void *ctx)
 {
     zval *zv;
-    /* Global user functions. */
-    ZEND_HASH_FOREACH_VAL(CG(function_table), zv) {
+    /* Global user functions. HAZARD-2 fix: EG(function_table), not CG — CG is
+     * swapped to coroutine-stack scratch during compile (see snapshot_save). */
+    ZEND_HASH_FOREACH_VAL(EG(function_table), zv) {
         zend_function *fn = Z_PTR_P(zv);
         if (!fn || fn->type != ZEND_USER_FUNCTION) continue;
         zend_op_array *opa = &fn->op_array;
@@ -486,9 +498,9 @@ static void zealphp_walk_fn_statics(zealphp_opa_static_cb cb, void *ctx)
         cb(opa, live, ctx);
     } ZEND_HASH_FOREACH_END();
 
-    /* Methods of user classes. */
+    /* Methods of user classes. HAZARD-2 fix: EG(class_table), not CG. */
     zval *czv;
-    ZEND_HASH_FOREACH_VAL(CG(class_table), czv) {
+    ZEND_HASH_FOREACH_VAL(EG(class_table), czv) {
         zend_class_entry *ce = Z_PTR_P(czv);
         if (!ce || ce->type != ZEND_USER_CLASS) continue;
         zend_function *mfn;
@@ -1758,6 +1770,28 @@ PHP_FUNCTION(zealphp_process_state_clean)
 
     if (!zealphp_state_snapshotted) return;
 
+    /* HAZARD-2 fix: NEVER delete user classes/functions from the shared
+     * process-global CG tables while silent-redeclare is on (coroutine-legacy).
+     *
+     * This "fresh process state per request" cleanup is the POOL-mode mechanism:
+     * a pool worker handles one request at a time, so deleting per-request
+     * classes/functions to let the next request re-declare them is safe there
+     * (and silent-redeclare is OFF in pool mode). Under COROUTINE concurrency the
+     * same delete is a data race: CG(class_table)/CG(function_table) are
+     * process-global and shared across all in-flight coroutines, so one request's
+     * request-end clean (e.g. CoSessionManager calling clean(6)) deletes a class
+     * (TableSessionHandler, an autoloaded controller, …) that a CONCURRENT
+     * coroutine is mid-use → intermittent "Class \"X\" not found" fatal → worker
+     * abort (ASAN-confirmed: the class-not-found cascade behind the shutdown
+     * bad-free on PHP 8.4/8.5). When silent-redeclare is on it ALSO makes the
+     * delete redundant: re-included files re-declare first-wins, so classes stay
+     * registered and stable WITHOUT being torn down per request. Strip the
+     * class(2)+function(4) bits; the include-cache reset is handled per-coroutine
+     * by Stage 7 (zealphp_include_eval_handler). */
+    if (zealphp_silent_redeclare_enabled) {
+        flags &= ~(zend_long)(2 | 4);
+    }
+
     /* --- Included files: remove entries not in snapshot --- */
     if (!(flags & 1)) goto skip_files;
     zend_string **del_files = NULL;
@@ -2370,9 +2404,21 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
      * requests. Stage 4's CG-table swap below already handles top-level
      * redeclaration correctly on EVERY compile, so the cache was only a
      * re-compile optimization — not worth a UAF. */
-    /* Save real table pointers — restore on exit (nested-safe via stack). */
-    HashTable *real_cg_fn = CG(function_table);
-    HashTable *real_cg_cl = CG(class_table);
+    /* Save real table pointers — restore on exit.
+     *
+     * HAZARD-2 fix: capture the real tables from EG, NOT CG. EG(function_table)/
+     * EG(class_table) are the STABLE process-global tables — this Stage-4 design
+     * swaps CG only, never EG. CG(class_table), by contrast, may CURRENTLY point at
+     * a *different* coroutine's stack-local scratch: OpenSwoole does not per-
+     * coroutine save/restore CG, so when another coroutine is suspended mid-compile
+     * the global CG is left pointing at its scratch. Capturing `real` from that CG
+     * makes both the restore (below) and the first-wins merge-back target a
+     * DANGLING pointer once that coroutine's stack is freed → zend_compile_class_decl
+     * adds into freed memory (heap-use-after-free) and zend_shutdown later frees it
+     * (bad-free) — both ASAN-confirmed on PHP 8.4/8.5. EG is always the true table,
+     * so capture+restore+merge through EG. */
+    HashTable *real_cg_fn = EG(function_table);
+    HashTable *real_cg_cl = EG(class_table);
     HashTable *real_eg_fn = EG(function_table);
     HashTable *real_eg_cl = EG(class_table);
 

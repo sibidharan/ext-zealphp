@@ -10,11 +10,11 @@
   <email>sibi@selfmade.ninja</email>
   <active>yes</active>
  </lead>
- <date>2026-05-26</date>
+ <date>2026-05-29</date>
  <time>10:30:00</time>
  <version>
-  <release>0.3.17</release>
-  <api>0.3.17</api>
+  <release>0.3.18</release>
+  <api>0.3.18</api>
  </version>
  <stability>
   <release>alpha</release>
