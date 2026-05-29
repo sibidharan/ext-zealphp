@@ -686,7 +686,14 @@ static bool zealphp_globals_zval_identical(const zval *a, const zval *b)
 static bool zealphp_globals_isolatable(zval *v)
 {
     if (Z_TYPE_P(v) == IS_REFERENCE) {
-        return false;  /* a $GLOBALS ref binds two slots; snapshotting one desyncs it */
+        /* Deref and judge the underlying value. `global $x; $x = ...` makes the
+         * EG(symbol_table) slot IS_REFERENCE (notably on PHP 8.4+, where the
+         * engine keeps the global slot as a reference); skipping refs left
+         * global-keyword request state un-isolated — it leaked across coroutines
+         * (CoroutineIsolationContractTest: 39/40 on 8.4). Mirror the Stage-1
+         * superglobal path: isolate ref-of-scalar/array, still leave
+         * ref-of-object/resource shared (handled by the switch below). */
+        v = Z_REFVAL_P(v);
     }
     switch (Z_TYPE_P(v)) {
         case IS_OBJECT:
@@ -712,9 +719,10 @@ static void zealphp_globals_parent_snapshot(void)
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) {
             continue;
         }
-        if (!zealphp_globals_isolatable(val)) continue;  /* leave objects/resources/refs shared */
+        if (!zealphp_globals_isolatable(val)) continue;  /* leave objects/resources shared */
+        zval *uv = Z_ISREF_P(val) ? Z_REFVAL_P(val) : val;  /* deref global-keyword refs */
         zval copy;
-        ZVAL_DUP(&copy, val);
+        ZVAL_DUP(&copy, uv);
         zend_hash_add_new(&zealphp_coro_globals_parent, key, &copy);
     } ZEND_HASH_FOREACH_END();
 
@@ -807,13 +815,14 @@ static void zealphp_globals_snapshot_save(long cid)
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, val) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
-        if (!zealphp_globals_isolatable(val)) continue;  /* objects/resources/refs stay shared */
+        if (!zealphp_globals_isolatable(val)) continue;  /* objects/resources stay shared */
+        zval *uv = Z_ISREF_P(val) ? Z_REFVAL_P(val) : val;  /* deref global-keyword refs */
         if (zealphp_coro_globals_parent_set) {
             zval *pv = zend_hash_find(&zealphp_coro_globals_parent, key);
-            if (pv && zealphp_globals_zval_identical(val, pv)) continue;
+            if (pv && zealphp_globals_zval_identical(uv, pv)) continue;
         }
         zval copy;
-        ZVAL_COPY(&copy, val);
+        ZVAL_COPY(&copy, uv);
         zend_hash_add_new(Z_ARRVAL(delta), key, &copy);
     } ZEND_HASH_FOREACH_END();
 
