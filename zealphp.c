@@ -625,6 +625,31 @@ static bool zealphp_globals_zval_identical(const zval *a, const zval *b)
     }
 }
 
+/* Stage 2 only isolates COPYABLE value globals (scalars, strings, arrays).
+ * Objects, resources, and references have identity + lifecycle that cannot be
+ * safely snapshot/restored by refcount juggling across coroutine yields:
+ * ZVAL_DUP/ZVAL_COPY + the per-yield reset/reinstall can drive a shared
+ * object/resource refcount to zero at the wrong point (firing a __destruct
+ * mid-restore, re-entering PHP from a C scheduler callback) or double-free a
+ * resource handle — a latent use-after-free of the same class as the Stage 6
+ * compile-cache UAF. Such globals are left in EG untouched (process-shared),
+ * matching the documented "process-level state is shared" boundary —
+ * request-scoped objects belong in $g, not $GLOBALS. (Confirmed by the v0.3.12
+ * security review, H1/H2.) */
+static bool zealphp_globals_isolatable(zval *v)
+{
+    if (Z_TYPE_P(v) == IS_REFERENCE) {
+        return false;  /* a $GLOBALS ref binds two slots; snapshotting one desyncs it */
+    }
+    switch (Z_TYPE_P(v)) {
+        case IS_OBJECT:
+        case IS_RESOURCE:
+            return false;
+        default:
+            return true;
+    }
+}
+
 /* Take the shared parent snapshot from current EG(symbol_table). Called
  * once when zealphp_coroutine_globals(true) flips on. Deep-copies every
  * non-superglobal user var so the parent owns its storage. */
@@ -640,6 +665,7 @@ static void zealphp_globals_parent_snapshot(void)
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) {
             continue;
         }
+        if (!zealphp_globals_isolatable(val)) continue;  /* leave objects/resources/refs shared */
         zval copy;
         ZVAL_DUP(&copy, val);
         zend_hash_add_new(&zealphp_coro_globals_parent, key, &copy);
@@ -674,8 +700,10 @@ static void zealphp_globals_reset_to_parent(void)
     to_delete = emalloc(sizeof(zend_string *) * delete_cap);
 
     zend_string *key;
-    ZEND_HASH_FOREACH_STR_KEY(&EG(symbol_table), key) {
-        if (key && !zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) {
+    zval *rv;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, rv) {
+        if (key && !zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))
+            && zealphp_globals_isolatable(rv)) {   /* leave objects/resources/refs in place */
             if (delete_count >= delete_cap) {
                 delete_cap *= 2;
                 to_delete = erealloc(to_delete, sizeof(zend_string *) * delete_cap);
@@ -732,6 +760,7 @@ static void zealphp_globals_snapshot_save(long cid)
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, val) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
+        if (!zealphp_globals_isolatable(val)) continue;  /* objects/resources/refs stay shared */
         if (zealphp_coro_globals_parent_set) {
             zval *pv = zend_hash_find(&zealphp_coro_globals_parent, key);
             if (pv && zealphp_globals_zval_identical(val, pv)) continue;
@@ -886,26 +915,6 @@ static void zealphp_snapshot_restore(long cid)
             }
         }
     }
-}
-
-/* Extract coroutine ID from the Coroutine* arg.
- * OpenSwoole's Coroutine class stores `long cid` after the vtable pointer
- * and a few base-class fields. We probe common offsets. */
-static long zealphp_cid_from_arg(void *arg)
-{
-    if (!arg) return -1;
-    /* Try reading cid at common struct offsets (bytes).
-     * OpenSwoole Coroutine inherits from a base with vtable (8 bytes on x64),
-     * then typically: long cid at offset 8, 16, or 24. */
-    long *p = (long *)arg;
-    /* Offset 0 (vtable ptr) — skip */
-    /* Offset 8 (first member after vtable) */
-    if (p[1] > 0 && p[1] < 1000000) return p[1];
-    /* Offset 16 */
-    if (p[2] > 0 && p[2] < 1000000) return p[2];
-    /* Offset 24 */
-    if (p[3] > 0 && p[3] < 1000000) return p[3];
-    return -1;
 }
 
 /* OpenSwoole scheduler callbacks — called from C, no PHP stack needed.
@@ -2291,62 +2300,6 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
      * requests. Stage 4's CG-table swap below already handles top-level
      * redeclaration correctly on EVERY compile, so the cache was only a
      * re-compile optimization — not worth a UAF. */
-    bool tracked = false;
-
-    if (tracked) {
-        HashTable *decls = NULL;
-        HashTable saved_funcs, saved_classes;
-        zend_hash_init(&saved_funcs,   8, NULL, NULL, 0);
-        zend_hash_init(&saved_classes, 8, NULL, NULL, 0);
-        zend_string *name;
-
-        ZEND_HASH_FOREACH_STR_KEY(decls, name) {
-            if (!name) continue;
-            /* Functions */
-            zend_function *fn = zend_hash_find_ptr(EG(function_table), name);
-            if (fn && fn->type == ZEND_USER_FUNCTION) {
-                if (fn->op_array.refcount) (*fn->op_array.refcount)++;
-                zend_hash_add_ptr(&saved_funcs, name, fn);
-                zend_hash_del(EG(function_table), name);
-            }
-            /* Classes */
-            zend_class_entry *ce = zend_hash_find_ptr(CG(class_table), name);
-            if (ce && ce->type == ZEND_USER_CLASS) {
-                ce->refcount++;
-                zend_hash_add_ptr(&saved_classes, name, ce);
-                zend_hash_del(CG(class_table), name);
-            }
-        } ZEND_HASH_FOREACH_END();
-
-        /* Run the engine's original compile. Slots are empty for our
-         * tracked names — opcache's dup-check passes cleanly. */
-        zend_op_array *result = zealphp_original_compile_file(file_handle, type);
-
-        /* Restore: drop compile-added duplicates, reinstall saved. */
-        zend_string *rkey;
-        void *rptr;
-        ZEND_HASH_FOREACH_STR_KEY_PTR(&saved_funcs, rkey, rptr) {
-            zend_hash_del(EG(function_table), rkey);
-            zend_hash_add_ptr(EG(function_table), rkey, rptr);
-            if (((zend_function*)rptr)->op_array.refcount
-                && *((zend_function*)rptr)->op_array.refcount > 1) {
-                (*((zend_function*)rptr)->op_array.refcount)--;
-            }
-        } ZEND_HASH_FOREACH_END();
-        ZEND_HASH_FOREACH_STR_KEY_PTR(&saved_classes, rkey, rptr) {
-            zend_hash_del(CG(class_table), rkey);
-            zend_hash_add_ptr(CG(class_table), rkey, rptr);
-            if (((zend_class_entry*)rptr)->refcount > 1) {
-                ((zend_class_entry*)rptr)->refcount--;
-            }
-        } ZEND_HASH_FOREACH_END();
-
-        zend_hash_destroy(&saved_funcs);
-        zend_hash_destroy(&saved_classes);
-        if (file_key) zend_string_release(file_key);
-        return result;
-    }
-
     /* Save real table pointers — restore on exit (nested-safe via stack). */
     HashTable *real_cg_fn = CG(function_table);
     HashTable *real_cg_cl = CG(class_table);
@@ -2810,6 +2763,9 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_constants_clear, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_ini_restore, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_globals_snapshot, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
@@ -2842,7 +2798,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_coroutine_globals,      arginfo_zealphp_coroutine_globals)
     PHP_FE(zealphp_coroutine_statics,      arginfo_zealphp_coroutine_statics)
     PHP_FE(zealphp_constants_clear,        arginfo_zealphp_constants_clear)
-    PHP_FE(zealphp_ini_restore,           arginfo_zealphp_constants_clear)
+    PHP_FE(zealphp_ini_restore,           arginfo_zealphp_ini_restore)
     PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
     PHP_FE(zealphp_globals_snapshot,       arginfo_zealphp_globals_snapshot)
     PHP_FE(zealphp_globals_clean,          arginfo_zealphp_globals_clean)
