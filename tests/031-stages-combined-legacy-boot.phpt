@@ -63,8 +63,9 @@ zealphp_process_state_snapshot();
 zealphp_include_isolation(true);
 zealphp_silent_redeclare(true);
 
-require_once $boot; // 1st boot
-require_once $boot; // 2nd boot — Stage 7 forces re-execution
+require_once $boot;                  // request 1: boot runs
+zealphp_include_isolation_reset();   // request boundary (each real request = fresh coroutine)
+require_once $boot;                  // request 2: Stage 7 re-executes the boot
 
 // APP_ROOT is __DIR__ of the boot file; compare to its real dirname so the
 // test stays portable across machines / temp-dir layouts. "first value kept"

@@ -146,6 +146,16 @@ static bool zealphp_silent_redeclare_enabled = false;
  * bootstrap code stays cached. Zero cleanup needed per-request. */
 static bool zealphp_include_isolation_enabled = false;
 
+/* Stage 7 once-per-request guard: set of files force-re-included this request,
+ * keyed by coroutine id (os_get_cid). require_once's contract is "once per
+ * process"; Stage 7 relaxes it to "once per REQUEST" (re-execute across
+ * requests). Without a per-request guard, a re-entrant or circular require_once
+ * within ONE request would be force-re-included repeatedly → infinite
+ * re-inclusion → 1 GB OOM + worker crash (phpmyadmin's sodium_compat autoload,
+ * nextcloud). A monotonic cid per request means each request starts with a
+ * fresh (absent) set; on_close drops the entry when the coroutine ends. */
+static HashTable zealphp_coro_reincluded;
+
 /* ── Per-request define() isolation ─────────────────────────────────── */
 
 /* Track constants defined during the current request so they can be
@@ -954,6 +964,13 @@ static void zealphp_on_close(void *arg)
     zealphp_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_fn_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_globals_snapshot_delete((zend_long)(uintptr_t)arg);
+    /* Stage 7: drop this coroutine's force-re-included set. Keyed by os_get_cid()
+     * (the handler's key); during a coroutine's own close callback os_get_cid()
+     * still returns its cid. Prevents the per-request set from accumulating
+     * across the worker's lifetime (cids are monotonic). */
+    if (os_get_cid) {
+        zend_hash_index_del(&zealphp_coro_reincluded, (zend_ulong)os_get_cid());
+    }
 }
 
 /* ── Allowlist ───────────────────────────────────────────────────────── */
@@ -2117,8 +2134,32 @@ static int zealphp_include_eval_handler(zend_execute_data *execute_data)
         return ZEND_USER_OPCODE_DISPATCH;
     }
 
-    /* Per-request file (not in snapshot) → remove from include cache
-     * so the standard handler re-includes it as if it were never loaded. */
+    /* Per-request file (not in snapshot) → re-include it — but ONLY ONCE per
+     * request. Re-deleting on a re-entrant / circular require_once (the file
+     * is being included right now, or was already re-included this request)
+     * would re-execute it mid-inclusion → unbounded recursion → OOM. Track the
+     * set of files already force-re-included this request, keyed by coroutine
+     * id; if we've already re-included this file this request, leave it cached
+     * (standard require_once no-op) to preserve within-request idempotency. */
+    if (os_get_cid) {
+        zend_long cid = os_get_cid();
+        zval *seen = zend_hash_index_find(&zealphp_coro_reincluded, (zend_ulong)cid);
+        if (!seen) {
+            zval z;
+            array_init(&z);
+            seen = zend_hash_index_update(&zealphp_coro_reincluded, (zend_ulong)cid, &z);
+        }
+        HashTable *seen_ht = Z_ARRVAL_P(seen);
+        if (zend_hash_exists(seen_ht, resolved)) {
+            /* already re-included this request — keep it cached (no-op) */
+            zend_string_release(resolved);
+            return ZEND_USER_OPCODE_DISPATCH;
+        }
+        zval one;
+        ZVAL_LONG(&one, 1);
+        zend_hash_add(seen_ht, resolved, &one);
+    }
+
     zend_hash_del(&EG(included_files), resolved);
     zend_string_release(resolved);
 
@@ -2476,6 +2517,9 @@ PHP_FUNCTION(zealphp_silent_redeclare)
 
 /* Public API: zealphp_include_isolation(bool $on = true): bool
  * Enables Stage 7 smart require_once. Returns previous state. */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_include_isolation_reset, 0, 0, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_include_isolation, 0, 0, _IS_BOOL, 0)
     ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
 ZEND_END_ARG_INFO()
@@ -2494,6 +2538,22 @@ PHP_FUNCTION(zealphp_include_isolation)
         zealphp_include_isolation_enabled = (bool)on;
     }
     RETURN_BOOL(prev);
+}
+
+/* Mark a request boundary for Stage 7: clears the current coroutine's
+ * "force-re-included this request" set, so files re-execute on the NEXT
+ * request while staying idempotent WITHIN a request. In real coroutine
+ * operation each request is a fresh coroutine (distinct cid) and on_close
+ * clears the set automatically, so this is mainly for explicit request
+ * boundaries (non-coroutine sync mode) and for tests that model multiple
+ * requests in one process. */
+PHP_FUNCTION(zealphp_include_isolation_reset)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    if (os_get_cid) {
+        zend_hash_index_del(&zealphp_coro_reincluded, (zend_ulong)os_get_cid());
+    }
+    RETURN_TRUE;
 }
 
 PHP_MINIT_FUNCTION(zealphp)
@@ -2522,6 +2582,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_reincluded, 256, NULL, ZVAL_PTR_DTOR, 0);
     /* Registry values are borrowed zend_op_array* — we don't own them, no dtor. */
     zend_hash_init(&zealphp_fn_static_registry, 256, NULL, NULL, 0);
     zend_hash_init(&zealphp_coro_globals_deltas,     256, NULL, ZVAL_PTR_DTOR, 0);
@@ -2809,6 +2870,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_protect_classes,        arginfo_zealphp_protect_classes)
     PHP_FE(zealphp_silent_redeclare,       arginfo_zealphp_silent_redeclare)
     PHP_FE(zealphp_include_isolation,     arginfo_zealphp_include_isolation)
+    PHP_FE(zealphp_include_isolation_reset, arginfo_zealphp_include_isolation_reset)
     PHP_FE_END
 };
 
