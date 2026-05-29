@@ -23,7 +23,6 @@
 #include "zend_vm.h"
 #include "php_zealphp.h"
 #include <dlfcn.h>
-#include <sys/time.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -71,6 +70,11 @@ typedef void (*coro_callback_fn_t)(void *);
 static coro_callback_fn_t orig_on_yield  = NULL;
 static coro_callback_fn_t orig_on_resume = NULL;
 static coro_callback_fn_t orig_on_close  = NULL;
+
+/* True once our on_yield/on_resume/on_close wrappers have been installed
+ * (and chained to OpenSwoole's originals). Guards the single install path
+ * shared by all three isolation features. */
+static bool zealphp_coro_wrappers_installed = false;
 
 static const char *sg_names[] = {"_GET","_POST","_COOKIE","_SERVER","_FILES","_REQUEST","_SESSION", NULL};
 
@@ -238,7 +242,10 @@ static void zealphp_constants_snapshot_restore(long cid)
             ZVAL_DUP(&c.value, val);
             c.name = zend_string_copy(name);
             ZEND_CONSTANT_SET_FLAGS(&c, 0, PHP_USER_CONSTANT);
-            zend_register_constant(&c);
+            /* On failure (e.g. a constant of this name appeared between the
+             * exists() check above and now), zend_register_constant releases
+             * both c.name and c.value itself — nothing to clean up here (M5). */
+            (void) zend_register_constant(&c);
         }
     } ZEND_HASH_FOREACH_END();
 
@@ -982,6 +989,73 @@ static void zealphp_on_close(void *arg)
     }
 }
 
+/* Resolve OpenSwoole's current Coroutine::on_yield/on_resume/on_close
+ * callbacks via dlsym and chain our wrappers in front of them. These
+ * originals (PHPCoroutine::on_*) perform the PHP executor context switch
+ * (EG/CG swap) on every coroutine switch — we MUST chain to them.
+ *
+ * C2 (security review): if we cannot capture all three originals we REFUSE
+ * to install. Calling os_set_on_*() with our wrappers but a NULL original
+ * chain would skip OpenSwoole's executor context switching entirely and
+ * silently corrupt every coroutine switch — far worse than the feature
+ * being unavailable. Better to fail loudly (E_WARNING + return false) and
+ * let the caller surface "isolation unavailable".
+ *
+ * Idempotent: once installed, later calls are a no-op returning true. The
+ * single shared install path also de-duplicates what were four identical
+ * dlsym blocks (M4). */
+static bool zealphp_install_coro_hooks(void)
+{
+    if (zealphp_coro_wrappers_installed) {
+        return true;
+    }
+
+    void *handle = dlopen(NULL, RTLD_LAZY);
+    if (handle) {
+        static const char *yield_var_names[] = {
+            "_ZN10openswoole9Coroutine8on_yieldE",
+            "_ZN6swoole9Coroutine8on_yieldE", NULL
+        };
+        static const char *resume_var_names[] = {
+            "_ZN10openswoole9Coroutine9on_resumeE",
+            "_ZN6swoole9Coroutine9on_resumeE", NULL
+        };
+        static const char *close_var_names[] = {
+            "_ZN10openswoole9Coroutine8on_closeE",
+            "_ZN6swoole9Coroutine8on_closeE", NULL
+        };
+        for (const char **n = yield_var_names; *n && !orig_on_yield; n++) {
+            coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+            if (p) orig_on_yield = *p;
+        }
+        for (const char **n = resume_var_names; *n && !orig_on_resume; n++) {
+            coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+            if (p) orig_on_resume = *p;
+        }
+        for (const char **n = close_var_names; *n && !orig_on_close; n++) {
+            coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
+            if (p) orig_on_close = *p;
+        }
+        dlclose(handle);
+    }
+
+    if (!orig_on_yield || !orig_on_resume || !orig_on_close) {
+        php_error_docref(NULL, E_WARNING,
+            "ext-zealphp: could not resolve OpenSwoole's coroutine "
+            "on_yield/on_resume/on_close callbacks to chain through. "
+            "Refusing to install per-coroutine isolation hooks — replacing "
+            "OpenSwoole's callbacks without chaining would corrupt coroutine "
+            "context switching.");
+        return false;
+    }
+
+    os_set_on_yield(zealphp_on_yield);
+    os_set_on_resume(zealphp_on_resume);
+    os_set_on_close(zealphp_on_close);
+    zealphp_coro_wrappers_installed = true;
+    return true;
+}
+
 /* ── Allowlist ───────────────────────────────────────────────────────── */
 
 static const char *zealphp_allowed[] = {
@@ -1404,41 +1478,9 @@ PHP_FUNCTION(zealphp_coroutine_superglobals)
     }
 
     if (!zealphp_coro_hooks_active) {
-        /* Save existing OpenSwoole callbacks (PHPCoroutine::on_yield/resume/close)
-         * via the Coroutine::on_yield/on_resume global variables. These handle
-         * PHP executor context switching — we MUST chain to them, not replace. */
-        void *handle = dlopen(NULL, RTLD_LAZY);
-        if (handle) {
-            static const char *yield_var_names[] = {
-                "_ZN10openswoole9Coroutine8on_yieldE",
-                "_ZN6swoole9Coroutine8on_yieldE", NULL
-            };
-            static const char *resume_var_names[] = {
-                "_ZN10openswoole9Coroutine9on_resumeE",
-                "_ZN6swoole9Coroutine9on_resumeE", NULL
-            };
-            static const char *close_var_names[] = {
-                "_ZN10openswoole9Coroutine8on_closeE",
-                "_ZN6swoole9Coroutine8on_closeE", NULL
-            };
-            for (const char **n = yield_var_names; *n && !orig_on_yield; n++) {
-                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
-                if (p) orig_on_yield = *p;
-            }
-            for (const char **n = resume_var_names; *n && !orig_on_resume; n++) {
-                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
-                if (p) orig_on_resume = *p;
-            }
-            for (const char **n = close_var_names; *n && !orig_on_close; n++) {
-                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
-                if (p) orig_on_close = *p;
-            }
-            dlclose(handle);
+        if (!zealphp_install_coro_hooks()) {
+            RETURN_FALSE;
         }
-
-        os_set_on_yield(zealphp_on_yield);
-        os_set_on_resume(zealphp_on_resume);
-        os_set_on_close(zealphp_on_close);
         zealphp_coro_hooks_active = true;
     }
 
@@ -1481,42 +1523,11 @@ PHP_FUNCTION(zealphp_coroutine_globals)
     zealphp_globals_parent_snapshot();
 
     /* Ensure the scheduler callbacks chain through our on_yield/on_resume/
-     * on_close wrappers. Idempotent — if zealphp_coroutine_superglobals
-     * already installed them, this is a no-op (set_on_yield with the same
-     * function pointer is safe). */
-    if (!zealphp_coro_hooks_active && !zealphp_coro_globals_hooks_active) {
-        void *handle = dlopen(NULL, RTLD_LAZY);
-        if (handle) {
-            static const char *yield_var_names[] = {
-                "_ZN10openswoole9Coroutine8on_yieldE",
-                "_ZN6swoole9Coroutine8on_yieldE", NULL
-            };
-            static const char *resume_var_names[] = {
-                "_ZN10openswoole9Coroutine9on_resumeE",
-                "_ZN6swoole9Coroutine9on_resumeE", NULL
-            };
-            static const char *close_var_names[] = {
-                "_ZN10openswoole9Coroutine8on_closeE",
-                "_ZN6swoole9Coroutine8on_closeE", NULL
-            };
-            for (const char **n = yield_var_names; *n && !orig_on_yield; n++) {
-                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
-                if (p) orig_on_yield = *p;
-            }
-            for (const char **n = resume_var_names; *n && !orig_on_resume; n++) {
-                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
-                if (p) orig_on_resume = *p;
-            }
-            for (const char **n = close_var_names; *n && !orig_on_close; n++) {
-                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
-                if (p) orig_on_close = *p;
-            }
-            dlclose(handle);
-        }
-
-        os_set_on_yield(zealphp_on_yield);
-        os_set_on_resume(zealphp_on_resume);
-        os_set_on_close(zealphp_on_close);
+     * on_close wrappers. Idempotent — if another isolation feature already
+     * installed them this is a no-op; refuses (false) if the originals can't
+     * be chained (C2). */
+    if (!zealphp_install_coro_hooks()) {
+        RETURN_FALSE;
     }
 
     zealphp_coro_globals_hooks_active = true;
@@ -1562,44 +1573,11 @@ PHP_FUNCTION(zealphp_coroutine_statics)
         zealphp_bind_static_installed = true;
     }
 
-    if (!zealphp_coro_hooks_active && !zealphp_coro_globals_hooks_active && !zealphp_fn_statics_active) {
-        void *handle = dlopen(NULL, RTLD_LAZY);
-        if (handle) {
-            static const char *yield_var_names[] = {
-                "_ZN10openswoole9Coroutine8on_yieldE",
-                "_ZN6swoole9Coroutine8on_yieldE", NULL
-            };
-            static const char *resume_var_names[] = {
-                "_ZN10openswoole9Coroutine9on_resumeE",
-                "_ZN6swoole9Coroutine9on_resumeE", NULL
-            };
-            static const char *close_var_names[] = {
-                "_ZN10openswoole9Coroutine8on_closeE",
-                "_ZN6swoole9Coroutine8on_closeE", NULL
-            };
-            for (const char **n = yield_var_names; *n && !orig_on_yield; n++) {
-                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
-                if (p) orig_on_yield = *p;
-            }
-            for (const char **n = resume_var_names; *n && !orig_on_resume; n++) {
-                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
-                if (p) orig_on_resume = *p;
-            }
-            for (const char **n = close_var_names; *n && !orig_on_close; n++) {
-                coro_callback_fn_t *p = (coro_callback_fn_t *)dlsym(handle, *n);
-                if (p) orig_on_close = *p;
-            }
-            dlclose(handle);
-        }
-
-        os_set_on_yield(zealphp_on_yield);
-        os_set_on_resume(zealphp_on_resume);
-        os_set_on_close(zealphp_on_close);
+    if (!zealphp_install_coro_hooks()) {
+        RETURN_FALSE;
     }
 
-    /* Flag ON (after the scheduler-hook condition above, which checks
-     * !zealphp_fn_statics_active to decide whether to install on_yield/resume/
-     * close), then seed the registry with everything already instantiated. */
+    /* Flag ON, then seed the registry with everything already instantiated. */
     zealphp_fn_statics_active = true;
     zealphp_walk_fn_statics(zealphp_fn_static_seed_cb, NULL);
     RETURN_TRUE;
@@ -1730,6 +1708,29 @@ skip_files:
         if (key && !zend_hash_exists(&zealphp_snapshot_classes, key)) {
             zend_class_entry *ce = Z_PTR_P(val);
             if (ce && ce->type == ZEND_USER_CLASS) {
+                /* H4: actually implement the safety the comment above promises.
+                 * A class whose runtime static-members table is allocated
+                 * (CE_STATIC_MEMBERS non-NULL) must NOT be hash_del'd — that
+                 * leaves a zombie (class_exists() true, statics inaccessible →
+                 * segfault, ext-zealphp#1). Skip it; it leaks one entry until
+                 * worker recycle, which is bounded. */
+                if (ce->default_static_members_count > 0 &&
+                    CE_STATIC_MEMBERS(ce) != NULL) {
+                    continue;
+                }
+                /* H3: purge Stage-5 registry entries for this class's methods
+                 * before the class (and its method op_arrays) are freed.
+                 * No-op when the registry is empty (Stage 5 inactive). */
+                if (zend_hash_num_elements(&zealphp_fn_static_registry) > 0) {
+                    zend_function *m;
+                    ZEND_HASH_FOREACH_PTR(&ce->function_table, m) {
+                        if (m && m->type == ZEND_USER_FUNCTION &&
+                            m->op_array.static_variables) {
+                            zend_hash_index_del(&zealphp_fn_static_registry,
+                                (zend_ulong)(uintptr_t)m->op_array.static_variables);
+                        }
+                    } ZEND_HASH_FOREACH_END();
+                }
                 if (dc_count >= dc_cap) { dc_cap *= 2; del_cls = erealloc(del_cls, sizeof(zend_string *) * dc_cap); }
                 del_cls[dc_count++] = key;
             }
@@ -1754,6 +1755,16 @@ skip_classes:
         if (key && !zend_hash_exists(&zealphp_snapshot_functions, key)) {
             zend_function *func = Z_PTR_P(val);
             if (func && func->type == ZEND_USER_FUNCTION) {
+                /* H3: this op_array may be referenced by the Stage 5 fn-static
+                 * registry (keyed by op_array->static_variables). Purge it
+                 * before the function is freed so a later yield-time walk can't
+                 * deref freed memory. No-op when Stage 5 is inactive (registry
+                 * empty) — the modes are mutually exclusive, this is defense in
+                 * depth. */
+                if (func->op_array.static_variables) {
+                    zend_hash_index_del(&zealphp_fn_static_registry,
+                        (zend_ulong)(uintptr_t)func->op_array.static_variables);
+                }
                 if (dfn_count >= dfn_cap) { dfn_cap *= 2; del_fn = erealloc(del_fn, sizeof(zend_string *) * dfn_cap); }
                 del_fn[dfn_count++] = key;
             }
@@ -2240,29 +2251,6 @@ static zend_string *zealphp_file_handle_path(zend_file_handle *file_handle)
     return NULL;
 }
 
-/* Stage 6 debug instrumentation — flush per-worker trace lines to a
- * per-pid log file. Lets us see WHICH worker hangs where in the
- * compile_file_hook flow. Enabled when ZEALPHP_TRACE_COMPILE env var
- * is set. */
-static void zealphp_compile_trace(const char *step, const char *path)
-{
-    static int trace_enabled = -1;
-    if (trace_enabled == -1) {
-        trace_enabled = getenv("ZEALPHP_TRACE_COMPILE") ? 1 : 0;
-    }
-    if (!trace_enabled) return;
-    char fname[64];
-    snprintf(fname, sizeof(fname), "/tmp/zealphp-compile-pid%d.log", getpid());
-    FILE *f = fopen(fname, "a");
-    if (!f) return;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    fprintf(f, "%ld.%06ld pid=%d step=%s path=%s\n",
-            (long)tv.tv_sec, (long)tv.tv_usec, getpid(), step,
-            path ? path : "(null)");
-    fclose(f);
-}
-
 static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, int type)
 {
     if (!zealphp_silent_redeclare_enabled || !zealphp_original_compile_file) {
@@ -2270,9 +2258,6 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
             ? zealphp_original_compile_file(file_handle, type)
             : NULL;
     }
-    const char *trace_path = (file_handle && file_handle->filename)
-        ? ZSTR_VAL(file_handle->filename) : NULL;
-    zealphp_compile_trace("enter", trace_path);
 
     /* Lazy-init the per-file decl tracker. */
     if (!zealphp_file_decls_initialized) {
@@ -2342,13 +2327,11 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
      * Closes MEDIUM M1 from the v0.3.9 security review. */
     zend_op_array *result = NULL;
     bool bailed_out = false;
-    zealphp_compile_trace("pre_orig", trace_path);
     zend_try {
         result = zealphp_original_compile_file(file_handle, type);
     } zend_catch {
         bailed_out = true;
     } zend_end_try();
-    zealphp_compile_trace(bailed_out ? "post_orig_bailout" : "post_orig_ok", trace_path);
 
     /* Restore BEFORE anything else — must hold even on the bailout path. */
     CG(function_table) = real_cg_fn;
