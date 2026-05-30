@@ -1,5 +1,10 @@
 # ext-zealphp
 
+[![CI](https://github.com/sibidharan/ext-zealphp/actions/workflows/ci.yml/badge.svg)](https://github.com/sibidharan/ext-zealphp/actions/workflows/ci.yml)
+[![PHP 8.3 | 8.4 | 8.5](https://img.shields.io/badge/PHP-8.3%20%7C%208.4%20%7C%208.5-777BB4?logo=php&logoColor=white)](https://www.php.net/)
+[![Memory safety: ASAN + Valgrind](https://img.shields.io/badge/memory--safety-ASAN%20%2B%20Valgrind-2ea44f)](.github/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
 Per-request function overrides for long-running PHP servers.
 
 A 250-line C extension that intercepts 53 PHP built-in functions (`header()`, `session_start()`, `setcookie()`, etc.) and routes them to user-supplied callbacks. Purpose-built for [ZealPHP](https://php.zeal.ninja) — each coroutine/request gets its own response/session state while legacy PHP code calls the same built-in functions unchanged.
