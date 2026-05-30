@@ -17,10 +17,10 @@ concurrency:
 # coroutine runtime, so it MUST be exercised with OpenSwoole loaded — but only
 # build-test can do that cleanly:
 #
-#   build-test : BUILDS OpenSwoole from source → the coroutine-runtime phpt
-#                (027 Stage-7 include isolation, and any other coroutine test)
-#                RUN here, exactly like the framework's tests.yml. This is the
-#                job that gates coroutine behaviour.
+#   build-test : setup-php installs OpenSwoole (`extensions: openswoole`,
+#                exactly like the framework's tests.yml) → the coroutine-runtime
+#                phpt (027 Stage-7 include isolation, and any other coroutine
+#                test) RUN here. This is the job that gates coroutine behaviour.
 #   valgrind   : function-level C only, NO OpenSwoole — intentional. OpenSwoole's
 #                coroutine context-switch (makecontext/swapcontext) trips
 #                memcheck's uninitialised-value detector with false positives
@@ -51,31 +51,16 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
+          # setup-php provides OpenSwoole (it PECL-builds it under the hood),
+          # exactly like the framework's tests.yml (`extensions: openswoole`).
+          # With it loaded the coroutine-runtime phpt (027 Stage-7 isolation)
+          # RUN here — this is the job that gates coroutine behaviour. On a PHP
+          # where setup-php can't provide it (e.g. 8.5 before upstream support),
+          # the install is a non-fatal warning, 027 SKIPIFs cleanly, and the
+          # rest still gate (8.5 is continue-on-error regardless).
+          extensions: openswoole
           tools: none
           coverage: none
-
-      - name: Ensure OpenSwoole is available (build from source if needed)
-        # The ext's headline feature is per-coroutine isolation, which lives on
-        # the OpenSwoole coroutine runtime — so the coroutine-runtime phpt (027)
-        # must run WITH OpenSwoole, exactly like the framework's tests.yml does.
-        # setup-php can't install OpenSwoole, so build it from source. On PHP 8.5
-        # (experimental) this may fail to build — then 027 SKIPIFs and the rest
-        # still gate (the job is continue-on-error for 8.5).
-        run: |
-          if php -m | grep -q openswoole; then echo "openswoole already loaded"; exit 0; fi
-          echo "openswoole missing — building from source"
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libssl-dev libc-ares-dev
-          tmpdir=$(mktemp -d)
-          git clone --depth 1 https://github.com/openswoole/openswoole.git "$tmpdir"
-          cd "$tmpdir"
-          phpize
-          ./configure --enable-openssl --enable-hook-curl --enable-http2 --enable-mysqlnd --enable-sockets
-          make -j"$(nproc)"
-          sudo make install
-          ini_dir=$(php -i | awk -F'=> ' '/Scan this dir for additional .ini files/ {print $2}' | head -1 | tr -d ' ')
-          echo "extension=openswoole.so" | sudo tee "${ini_dir}/30-openswoole.ini"
-          php -m | grep openswoole
 
       - name: Build extension
         run: |
