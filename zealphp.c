@@ -2584,7 +2584,8 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
              * gone with opcache off). Immutable losers are owned by OPcache —
              * just drop our scratch reference and let it be. */
             zend_function *lf = (zend_function *)ptr;
-            if (!(lf->common.fn_flags & ZEND_ACC_IMMUTABLE)) {
+            if (!(lf->common.fn_flags & ZEND_ACC_IMMUTABLE)
+                && !(EG(in_autoload) && zend_hash_num_elements(EG(in_autoload)) > 0)) {
                 destroy_zend_function(lf);
             }
         }
@@ -2595,9 +2596,24 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
             zend_hash_add_ptr(real_cg_cl, key, ptr);
         } else if (ptr) {
             /* Same immutable-SHM guard as functions above: never destroy an
-             * OPcache-owned (immutable) class entry. */
+             * OPcache-owned (immutable) class entry.
+             *
+             * HAZARD-2 fix (Valgrind-confirmed UAF): ALSO never destroy a loser
+             * while we are inside an autoload. zend_lookup_class_ex returns the
+             * class THIS compile just produced (our scratch dup), and the caller
+             * (`new` -> object_properties_init) is about to use it. If a CONCURRENT
+             * coroutine already registered the winner for this key, destroying the
+             * dup here frees its inheritance-allocated default_properties_table out
+             * from under the live engine -> "Invalid read of size 8 in
+             * _object_properties_init" (Valgrind: freed by destroy_zend_class <-
+             * compile_file_hook, used by php_*_create_object). ASAN can't see it
+             * (Zend-MM efree). Orphan the dup instead (bounded; reclaimed at
+             * request/worker teardown) rather than corrupt. Non-autoload
+             * re-includes resolve the class by name to the winner at runtime, so
+             * their losers remain safe to destroy. */
             zend_class_entry *lce = (zend_class_entry *)ptr;
-            if (!(lce->ce_flags & ZEND_ACC_IMMUTABLE)) {
+            if (!(lce->ce_flags & ZEND_ACC_IMMUTABLE)
+                && !(EG(in_autoload) && zend_hash_num_elements(EG(in_autoload)) > 0)) {
                 zval cl_zv;
                 ZVAL_PTR(&cl_zv, lce);
                 destroy_zend_class(&cl_zv);
