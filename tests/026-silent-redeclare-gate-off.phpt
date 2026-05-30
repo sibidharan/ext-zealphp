@@ -34,11 +34,16 @@ echo (new ZGateChild)->who(), "\n";
 
 zgate_decl(2); // gate off => native fatal, script halts here
 echo "should NOT reach here\n";
+// NOTE: the fatal's wording is PHP-version-specific, so the expectation below
+// is --EXPECTREGEX-- (not --EXPECTF--) covering BOTH forms — do not "simplify":
+//   PHP <= 8.3 : "Cannot declare class X, because the name is already in use"
+//   PHP >= 8.4 : "Cannot redeclare class X (previously declared in FILE:LINE)"
+// (8.4 reworded zend's duplicate-class fatal + added the prior-decl location.)
 ?>
---EXPECTF--
-bool(false)
-bool(true)
-bool(false)
+--EXPECTREGEX--
+bool\(false\)
+bool\(true\)
+bool\(false\)
 first
 
-Fatal error: Cannot declare class ZGateChild, because the name is already in use in %s on line %d
+Fatal error: Cannot (declare class ZGateChild, because the name is already in use|redeclare class ZGateChild \(previously declared in [^\r\n]+:\d+\)) in [^\r\n]+ on line \d+

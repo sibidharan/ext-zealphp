@@ -12,6 +12,24 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# ── OpenSwoole coverage strategy across the three jobs ─────────────────────────
+# The ext's headline feature (per-coroutine isolation) lives on the OpenSwoole
+# coroutine runtime, so it MUST be exercised with OpenSwoole loaded — but only
+# build-test can do that cleanly:
+#
+#   build-test : BUILDS OpenSwoole from source → the coroutine-runtime phpt
+#                (027 Stage-7 include isolation, and any other coroutine test)
+#                RUN here, exactly like the framework's tests.yml. This is the
+#                job that gates coroutine behaviour.
+#   valgrind   : function-level C only, NO OpenSwoole — intentional. OpenSwoole's
+#                coroutine context-switch (makecontext/swapcontext) trips
+#                memcheck's uninitialised-value detector with false positives
+#                (verified on the dev-host sweep: noise only, zero real UAF), and
+#                REPORT_EXIT_STATUS=1 would turn that noise RED. So memcheck here
+#                gates the pure-C primitives; the live coroutine path's memory
+#                safety is validated on the dev host's Valgrind+OpenSwoole run.
+#   asan       : same rationale as valgrind — source-built PHP+ext under ASAN,
+#                no OpenSwoole; gates heap UAF/overflow in the C functions.
 jobs:
   # ── Build + run the .phpt suite across supported PHP versions ──────────────
   build-test:
@@ -33,13 +51,31 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          # OpenSwoole is best-effort: when present, the coroutine-runtime phpt
-          # (e.g. 027 Stage-7 include isolation, which needs the OpenSwoole
-          # coroutine runtime) RUN; when setup-php can't provide it (e.g. PHP
-          # 8.5), those tests SKIPIF cleanly and the rest still gate.
-          extensions: openswoole
           tools: none
           coverage: none
+
+      - name: Ensure OpenSwoole is available (build from source if needed)
+        # The ext's headline feature is per-coroutine isolation, which lives on
+        # the OpenSwoole coroutine runtime — so the coroutine-runtime phpt (027)
+        # must run WITH OpenSwoole, exactly like the framework's tests.yml does.
+        # setup-php can't install OpenSwoole, so build it from source. On PHP 8.5
+        # (experimental) this may fail to build — then 027 SKIPIFs and the rest
+        # still gate (the job is continue-on-error for 8.5).
+        run: |
+          if php -m | grep -q openswoole; then echo "openswoole already loaded"; exit 0; fi
+          echo "openswoole missing — building from source"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libssl-dev libc-ares-dev
+          tmpdir=$(mktemp -d)
+          git clone --depth 1 https://github.com/openswoole/openswoole.git "$tmpdir"
+          cd "$tmpdir"
+          phpize
+          ./configure --enable-openssl --enable-hook-curl --enable-http2 --enable-mysqlnd --enable-sockets
+          make -j"$(nproc)"
+          sudo make install
+          ini_dir=$(php -i | awk -F'=> ' '/Scan this dir for additional .ini files/ {print $2}' | head -1 | tr -d ' ')
+          echo "extension=openswoole.so" | sudo tee "${ini_dir}/30-openswoole.ini"
+          php -m | grep openswoole
 
       - name: Build extension
         run: |
@@ -84,8 +120,10 @@ jobs:
           make -j"$(nproc)"
 
       - name: Run phpt under Valgrind
-        # `make test TESTS="-m"` runs every .phpt under valgrind memcheck;
+        # `make test TESTS="-m"` runs the .phpt suite under valgrind memcheck;
         # USE_ZEND_ALLOC=0 exposes Zend allocations so UAF/invalid-free are seen.
+        # No OpenSwoole here (see the strategy note at the top): the coroutine
+        # phpt (027) SKIPIFs cleanly, so this gates the pure-C primitives only.
         # run-tests.php reports a valgrind LEAK/error as a test FAIL, and
         # REPORT_EXIT_STATUS=1 turns that into a non-zero job exit.
         run: USE_ZEND_ALLOC=0 NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS="-m"
