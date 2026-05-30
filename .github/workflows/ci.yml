@@ -119,10 +119,27 @@ jobs:
 
   # ── AddressSanitizer: PHP + ext built with -fsanitize=address ──────────────
   asan:
-    name: ASAN (source-built PHP + ext)
+    name: ASAN (PHP ${{ matrix.php }})
     runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The coroutine-legacy isolation work targets 8.3 AND 8.4, and the manual
+        # ASAN sweep (object-global UAF check) was run on 8.4.21 — so CI mirrors
+        # both stable lines for trust. Each version caches its source-built PHP
+        # separately.
+        php: ['8.3.21', '8.4.21']
+        experimental: [false]
+        include:
+          # 8.5 ASAN too — best-effort: a still-moving release line may not build
+          # cleanly from source under -fsanitize=address, so it's experimental
+          # (continue-on-error) — a 8.5-only break stays visible but non-blocking,
+          # mirroring build-test's 8.5 handling.
+          - php: '8.5.0'
+            experimental: true
     env:
-      PHP_VERSION: '8.3.21'
+      PHP_VERSION: ${{ matrix.php }}
       ASAN_CFLAGS: '-fsanitize=address -fno-omit-frame-pointer -g -O0'
     steps:
       - uses: actions/checkout@v4
@@ -138,7 +155,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/php-asan
-          key: php-asan-${{ env.PHP_VERSION }}-v1
+          key: php-asan-${{ matrix.php }}-v1
 
       - name: Build PHP ${{ env.PHP_VERSION }} with ASAN
         if: steps.cache-php.outputs.cache-hit != 'true'
