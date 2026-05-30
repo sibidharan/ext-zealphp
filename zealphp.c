@@ -107,6 +107,11 @@ static bool zealphp_fn_statics_active = false;
 static HashTable zealphp_fn_static_registry;
 typedef int (*zealphp_user_opcode_t)(zend_execute_data *);
 static zealphp_user_opcode_t zealphp_prev_bind_static = NULL;
+/* PHP 8.4 emits ZEND_BIND_INIT_STATIC_OR_JMP (203) for an INITIALIZED static
+ * (`static $x = <expr>;`) and JMPs past ZEND_BIND_STATIC (183) on every call, so
+ * 183 NEVER fires for such functions and they were silently never registered →
+ * never isolated (8.3 passed, 8.4 leaked). We hook 203 too. */
+static zealphp_user_opcode_t zealphp_prev_bind_init_static = NULL;
 static bool zealphp_bind_static_installed = false;
 static int zealphp_bind_static_handler(zend_execute_data *execute_data); /* fwd */
 
@@ -395,6 +400,14 @@ static void zealphp_ini_snapshot_delete(long cid)
 /* Save static properties of user classes that have been accessed.
  * Only snapshots classes where CE_STATIC_MEMBERS(ce) is non-NULL
  * (lazy — unaccessed classes are skipped). */
+/* Forward decl — the shared isolatable filter (defined with the $GLOBALS stage
+ * below). A zval is isolatable iff it is NOT an object/resource (those stay
+ * process-shared: a DB connection etc. cannot be per-coroutine deep-copied, and
+ * dtoring one during snapshot/restore could fire __destruct inside the C
+ * on_resume callback). Class- and function-static snapshots reuse this so they
+ * match the $GLOBALS discipline exactly — see SECURITY-FIX (objects-in-statics).*/
+static bool zealphp_globals_isolatable(zval *v);
+
 static void zealphp_statics_snapshot_save(long cid)
 {
     zval snapshot;
@@ -425,11 +438,23 @@ static void zealphp_statics_snapshot_save(long cid)
         /* Snapshot each static property value */
         zval class_snapshot;
         array_init_size(&class_snapshot, ce->default_static_members_count);
+        bool any = false;
         for (int i = 0; i < ce->default_static_members_count; i++) {
+            /* SECURITY-FIX (objects-in-statics): leave object/resource statics
+             * process-shared, exactly like the $GLOBALS path. Snapshotting them
+             * would ZVAL_DUP (incref) on save and zval_ptr_dtor on restore — and
+             * if the displaced object's last ref is dropped here, its __destruct
+             * fires INSIDE zealphp_on_resume (a C scheduler callback where
+             * os_get_cid()==-1), which can re-enter the executor / yield mid-
+             * resume and corrupt the scheduler. Scalars/arrays are deep-copied
+             * and safe; objects/resources are not isolatable by value. */
+            if (!zealphp_globals_isolatable(&statics[i])) continue;
             zval copy;
             ZVAL_DUP(&copy, &statics[i]);
             zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
+            any = true;
         }
+        if (!any) { zval_ptr_dtor(&class_snapshot); continue; }
         zend_hash_update(Z_ARRVAL(snapshot), class_name, &class_snapshot);
         has_statics = true;
     } ZEND_HASH_FOREACH_END();
@@ -581,6 +606,10 @@ static void zealphp_fn_statics_save_cb(zend_op_array *opa, HashTable *live, void
     ZEND_HASH_FOREACH_STR_KEY_VAL(live, vn, val) {
         if (!vn) continue;
         zval *src = Z_ISREF_P(val) ? Z_REFVAL_P(val) : val;
+        /* SECURITY-FIX (objects-in-statics): skip object/resource function-locals
+         * — same rationale as the class-static path. Leaving them process-shared
+         * avoids a __destruct firing inside zealphp_on_resume. */
+        if (!zealphp_globals_isolatable(src)) continue;
         zval copy;
         ZVAL_DUP(&copy, src);
         zend_hash_update(Z_ARRVAL(inner), vn, &copy);
@@ -1565,6 +1594,40 @@ PHP_FUNCTION(zealphp_superglobals_set)
     zealphp_set_superglobal("_SESSION", sizeof("_SESSION")-1, session);
 }
 
+/* zealphp_request_input_set(array $get,$post,$cookie,$server,$files,$request): void
+ * Re-establishes ONLY the 6 request-INPUT superglobals (NOT $_SESSION) via the
+ * same dual-write (EG(symbol_table) + PG(http_globals)) as zealphp_set_superglobal,
+ * so the auto-global JIT resolves function-scope $_GET correctly. Deliberately
+ * excludes $_SESSION so the session manager's `$_SESSION = &$g->session` live
+ * reference is never clobbered.
+ *
+ * HAZARD-3 fix (request-input coroutine leak): the request-input populate at
+ * request start writes process-global $GLOBALS BEFORE the handler coroutine's
+ * isolation baseline, so a concurrent overlapping request can overwrite it and
+ * the handler reads the wrong request's input. ZealPHP calls this in the HANDLER
+ * coroutine, right before dispatch (no intervening yield), from the per-coroutine
+ * OpenSwoole request — guaranteeing the handler sees its OWN input. */
+PHP_FUNCTION(zealphp_request_input_set)
+{
+    zval *get, *post, *cookie, *server, *files, *request;
+
+    ZEND_PARSE_PARAMETERS_START(6, 6)
+        Z_PARAM_ARRAY(get)
+        Z_PARAM_ARRAY(post)
+        Z_PARAM_ARRAY(cookie)
+        Z_PARAM_ARRAY(server)
+        Z_PARAM_ARRAY(files)
+        Z_PARAM_ARRAY(request)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zealphp_set_superglobal("_GET",     sizeof("_GET")-1,     get);
+    zealphp_set_superglobal("_POST",    sizeof("_POST")-1,    post);
+    zealphp_set_superglobal("_COOKIE",  sizeof("_COOKIE")-1,  cookie);
+    zealphp_set_superglobal("_SERVER",  sizeof("_SERVER")-1,  server);
+    zealphp_set_superglobal("_FILES",   sizeof("_FILES")-1,   files);
+    zealphp_set_superglobal("_REQUEST", sizeof("_REQUEST")-1, request);
+}
+
 /* zealphp_superglobals_clear(): void
  * Resets all superglobals to empty arrays. Called at request end
  * to prevent cross-request leakage in coroutine mode. */
@@ -1725,17 +1788,10 @@ PHP_FUNCTION(zealphp_coroutine_statics)
         RETURN_FALSE;
     }
 
-    /* Install the ZEND_BIND_STATIC opcode hook ONCE (chain-aware vs uopz),
-     * then seed the registry with everything already instantiated. Installing
-     * at activation (runtime, after all extension MINITs) means we capture
-     * whatever handler is already there and never get clobbered by load order;
-     * BIND_STATIC stays completely untouched for apps that don't use Stage 5. */
-    if (!zealphp_bind_static_installed) {
-        zealphp_prev_bind_static = zend_get_user_opcode_handler(ZEND_BIND_STATIC);
-        zend_set_user_opcode_handler(ZEND_BIND_STATIC, zealphp_bind_static_handler);
-        zealphp_bind_static_installed = true;
-    }
-
+    /* The ZEND_BIND_STATIC / ZEND_BIND_INIT_STATIC_OR_JMP opcode hooks are
+     * installed in MINIT (before any user code is compiled) — see the comment
+     * there. Installing at runtime missed every function compiled before this
+     * point. The handler is flag-gated, so it was a no-op until now anyway. */
     if (!zealphp_install_coro_hooks()) {
         RETURN_FALSE;
     }
@@ -2253,14 +2309,20 @@ static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data
  * later yield). This is the exact population the full-table walk covers — pure
  * semantic parity, not a regression (closure statics were never isolated).
  *
- * We deliberately do NOT hook opcode 203 (ZEND_BIND_INIT_STATIC_OR_JMP): the
- * very first call to any static-using function always reaches 183 (203 only
- * JMPs past 183 once the live table exists), so 183 alone catches every
- * function exactly once. The activation-time seed walk covers anything bound
- * before this hook went live.
+ * We hook opcode 203 (ZEND_BIND_INIT_STATIC_OR_JMP) TOO. The earlier assumption
+ * "the first call always reaches 183, so 183 alone is enough" is FALSE on PHP
+ * 8.4+: an INITIALIZED static (`static $x = <expr>;`, e.g. `static $s = null;`)
+ * compiles to 203, which initializes the live table AND jumps past 183 on the
+ * very first call — so 183 never fires and the function was never registered →
+ * never isolated. That was the 8.3-passes / 8.4-leaks regression in the
+ * function-static trust-bar contract. This same handler is installed for both
+ * opcodes; the registration is identical and the chaining is opcode-aware (see
+ * the tail of this function). The activation-time seed walk still covers
+ * anything bound before the hooks went live.
  *
  * Chain-aware: if another extension (e.g. uopz's uopz_set_static) already
- * installed a BIND_STATIC handler, we invoke it rather than clobber it. */
+ * installed a BIND_STATIC / BIND_INIT_STATIC_OR_JMP handler, we invoke it rather
+ * than clobber it. */
 static int zealphp_bind_static_handler(zend_execute_data *execute_data)
 {
     if (zealphp_fn_statics_active) {
@@ -2276,6 +2338,18 @@ static int zealphp_bind_static_handler(zend_execute_data *execute_data)
             }
         }
     }
+    /* Opcode-aware chaining: this one handler is installed for BOTH
+     * ZEND_BIND_STATIC (183) and ZEND_BIND_INIT_STATIC_OR_JMP (203); each opcode
+     * has its OWN previous handler (another extension may have hooked one but not
+     * the other), so chain to the correct one or fall through to DISPATCH. */
+#ifdef ZEND_BIND_INIT_STATIC_OR_JMP
+    if (EX(opline)->opcode == ZEND_BIND_INIT_STATIC_OR_JMP) {
+        if (zealphp_prev_bind_init_static) {
+            return zealphp_prev_bind_init_static(execute_data);
+        }
+        return ZEND_USER_OPCODE_DISPATCH;
+    }
+#endif
     if (zealphp_prev_bind_static) {
         return zealphp_prev_bind_static(execute_data);
     }
@@ -2834,6 +2908,27 @@ PHP_MINIT_FUNCTION(zealphp)
     zealphp_prev_declare_class_delayed = zend_get_user_opcode_handler(ZEND_DECLARE_CLASS_DELAYED);
     zend_set_user_opcode_handler(ZEND_DECLARE_CLASS_DELAYED,  zealphp_declare_class_delayed_handler);
 
+    /* Stage 5: function-static touched-set hooks. MUST be installed in MINIT,
+     * NOT at runtime activation. PHP binds each opline->handler at COMPILE time
+     * from zend_user_opcodes[], so a handler installed after user code is already
+     * compiled NEVER fires for that code. The fixture's tb_static (and ALL
+     * app-level functions compiled before App::run) were silently missed when
+     * this was installed at runtime — they never registered, so their
+     * function-statics were never isolated (8.3 happened to pass; 8.4 leaked
+     * because initialized statics route through opcode 203). Installing here, in
+     * MINIT, before any user code compiles, fixes the timing. The handler itself
+     * is gated by zealphp_fn_statics_active, so it is a cheap flag-check + chain
+     * for apps that don't use Stage 5 — same zero-overhead-when-off contract as
+     * the DECLARE/INCLUDE handlers above. Both BIND opcodes (183 and 8.4's 203)
+     * are hooked; the handler chains opcode-aware. */
+    zealphp_prev_bind_static = zend_get_user_opcode_handler(ZEND_BIND_STATIC);
+    zend_set_user_opcode_handler(ZEND_BIND_STATIC,           zealphp_bind_static_handler);
+#ifdef ZEND_BIND_INIT_STATIC_OR_JMP
+    zealphp_prev_bind_init_static = zend_get_user_opcode_handler(ZEND_BIND_INIT_STATIC_OR_JMP);
+    zend_set_user_opcode_handler(ZEND_BIND_INIT_STATIC_OR_JMP, zealphp_bind_static_handler);
+#endif
+    zealphp_bind_static_installed = true;
+
     /* Stage 7: smart require_once. Same zero-overhead-when-off pattern as
      * Stage 3 — the handler checks zealphp_include_isolation_enabled and
      * chains/DISPATCHes immediately when disabled. */
@@ -2977,6 +3072,15 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_superglobals_set, 0, 7, 
     ZEND_ARG_TYPE_INFO(0, session, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_request_input_set, 0, 6, IS_VOID, 0)
+    ZEND_ARG_TYPE_INFO(0, get, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO(0, post, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO(0, cookie, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO(0, server, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO(0, files, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO(0, request, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_superglobals_clear, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
@@ -3030,6 +3134,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
     PHP_FE(zealphp_restore_all,            arginfo_zealphp_restore_all)
     PHP_FE(zealphp_superglobals_set,       arginfo_zealphp_superglobals_set)
+    PHP_FE(zealphp_request_input_set,      arginfo_zealphp_request_input_set)
     PHP_FE(zealphp_superglobals_clear,     arginfo_zealphp_superglobals_clear)
     PHP_FE(zealphp_superglobals_save,      arginfo_zealphp_superglobals_save)
     PHP_FE(zealphp_superglobals_restore,   arginfo_zealphp_superglobals_restore)
