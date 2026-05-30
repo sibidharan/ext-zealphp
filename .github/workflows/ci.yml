@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Build + run the .phpt suite across supported PHP versions ──────────────
+  build-test:
+    name: build + phpt (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ matrix.experimental == true }}
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.3', '8.4']
+        experimental: [false]
+        include:
+          - php: '8.5'
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          # OpenSwoole is best-effort: when present, the coroutine-runtime phpt
+          # (e.g. 027 Stage-7 include isolation, which needs the OpenSwoole
+          # coroutine runtime) RUN; when setup-php can't provide it (e.g. PHP
+          # 8.5), those tests SKIPIF cleanly and the rest still gate.
+          extensions: openswoole
+          tools: none
+          coverage: none
+
+      - name: Build extension
+        run: |
+          phpize
+          ./configure --enable-zealphp
+          make -j"$(nproc)"
+          php -dextension="$(pwd)/modules/zealphp.so" --ri zealphp
+
+      - name: Run phpt suite (run-tests.php inherits the INI, so OpenSwoole loads)
+        # `php run-tests.php` (not `make test`, which uses php -n) keeps the
+        # OpenSwoole INI active so coroutine-context tests execute; REPORT_EXIT_STATUS
+        # fails the job on any FAIL.
+        run: |
+          NO_INTERACTION=1 REPORT_EXIT_STATUS=1 \
+            php run-tests.php -d extension="$(pwd)/modules/zealphp.so" -q --show-diff tests/
+
+      - name: Dump diffs on failure
+        if: failure()
+        run: for f in tests/*.diff tests/*.out tests/*.exp tests/*.log; do [ -f "$f" ] && { echo "=== $f ==="; cat "$f"; }; done
+
+  # ── Valgrind memcheck over the .phpt suite (Zend-MM UAF/leaks) ─────────────
+  valgrind:
+    name: valgrind memcheck (phpt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: none
+          coverage: none
+
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+
+      - name: Build extension
+        run: |
+          phpize
+          ./configure --enable-zealphp
+          make -j"$(nproc)"
+
+      - name: Run phpt under Valgrind
+        # `make test TESTS="-m"` runs every .phpt under valgrind memcheck;
+        # USE_ZEND_ALLOC=0 exposes Zend allocations so UAF/invalid-free are seen.
+        # run-tests.php reports a valgrind LEAK/error as a test FAIL, and
+        # REPORT_EXIT_STATUS=1 turns that into a non-zero job exit.
+        run: USE_ZEND_ALLOC=0 NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test TESTS="-m"
+
+      - name: Dump valgrind output on failure
+        if: failure()
+        run: for f in tests/*.mem tests/*.diff tests/*.log; do [ -f "$f" ] && { echo "=== $f ==="; cat "$f"; }; done
+
+  # ── AddressSanitizer: PHP + ext built with -fsanitize=address ──────────────
+  asan:
+    name: ASAN (source-built PHP + ext)
+    runs-on: ubuntu-latest
+    env:
+      PHP_VERSION: '8.3.21'
+      ASAN_CFLAGS: '-fsanitize=address -fno-omit-frame-pointer -g -O0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf bison re2c pkg-config \
+            libxml2-dev libsqlite3-dev libonig-dev
+
+      - name: Cache ASAN PHP build
+        id: cache-php
+        uses: actions/cache@v4
+        with:
+          path: ~/php-asan
+          key: php-asan-${{ env.PHP_VERSION }}-v1
+
+      - name: Build PHP ${{ env.PHP_VERSION }} with ASAN
+        if: steps.cache-php.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL "https://www.php.net/distributions/php-${PHP_VERSION}.tar.gz" | tar xz
+          cd "php-${PHP_VERSION}"
+          ./configure --prefix="$HOME/php-asan" \
+            --disable-all --enable-cli \
+            --enable-tokenizer --enable-filter --enable-session --enable-ctype \
+            --enable-mbstring --with-sqlite3 \
+            CFLAGS="${ASAN_CFLAGS}" LDFLAGS="-fsanitize=address"
+          make -j"$(nproc)"
+          make install
+
+      - name: Build ext with ASAN
+        run: |
+          export PATH="$HOME/php-asan/bin:$PATH"
+          phpize
+          CFLAGS="${ASAN_CFLAGS} -D_GNU_SOURCE" LDFLAGS="-fsanitize=address" ./configure --enable-zealphp
+          make -j"$(nproc)"
+
+      - name: Run phpt under ASAN
+        # halt_on_error aborts the worker on any UAF/heap-overflow/double-free →
+        # the test FAILs → REPORT_EXIT_STATUS=1 fails the job. detect_leaks=0:
+        # long-tail engine shutdown allocations are not the target here.
+        run: |
+          export PATH="$HOME/php-asan/bin:$PATH"
+          ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1 USE_ZEND_ALLOC=0 \
+            NO_INTERACTION=1 REPORT_EXIT_STATUS=1 make test
+
+      - name: Dump ASAN output on failure
+        if: failure()
+        run: for f in tests/*.diff tests/*.out tests/*.log; do [ -f "$f" ] && { echo "=== $f ==="; cat "$f"; }; done

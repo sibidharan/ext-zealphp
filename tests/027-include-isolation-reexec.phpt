@@ -2,6 +2,19 @@
 Stage 7: per-request file is idempotent WITHIN a request, re-executes ACROSS requests (reset boundary)
 --EXTENSIONS--
 zealphp
+--SKIPIF--
+<?php
+// Stage 7's per-request reincluded tracking is inherently coroutine-scoped: it
+// lives entirely on OpenSwoole's coroutine runtime (the per-coroutine reincluded
+// set, populated in the include opcode handler and torn down in on_close). With
+// no OpenSwoole loaded there is NO coroutine runtime at all — no scheduler, no
+// per-coroutine identity — so the once-per-request boundary can't exist. That is
+// a test-only condition (a real ZealPHP server always runs on OpenSwoole). Skip
+// cleanly so `make test` (php -n, no OpenSwoole) and the ASAN job don't FAIL it.
+if (!extension_loaded('openswoole')) {
+    die("skip Stage 7 per-request isolation requires the OpenSwoole coroutine runtime");
+}
+?>
 --FILE--
 <?php
 // Stage 7 smart require_once. PHP's require_once cache (EG(included_files))
