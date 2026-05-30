@@ -155,9 +155,17 @@ static zend_always_inline int zealphp_chain_or_dispatch(
  *   - On resume: reset EG → parent, apply delta overrides, delete tombstones.
  *
  * Memory: parent (1×) + N × O(delta_keys) instead of N × O(all_keys). */
-static HashTable zealphp_coro_globals_deltas;      /* cid → zval-array (live overrides) */
-static HashTable zealphp_coro_globals_tombstones;  /* cid → zval-array (set of deleted keys) */
+static HashTable zealphp_coro_globals_deltas;      /* coro-ptr → zval-array (live overrides) */
+static HashTable zealphp_coro_globals_tombstones;  /* coro-ptr → zval-array (set of deleted keys) */
 static bool zealphp_coro_globals_hooks_active = false;
+
+/* os_get_cid() (integer) → Coroutine* (the pointer the deltas above are keyed by).
+ * The scheduler callbacks key everything by the coroutine POINTER (arg), which is
+ * NOT available in PHP execution context — but os_get_cid() IS reliable there. So
+ * on_yield (where BOTH are reliable) records cid→ptr here, letting the PHP-context
+ * request-end drain (zealphp_coroutine_globals_request_end) find and free THIS
+ * coroutine's pointer-keyed delta so object globals destruct in-coroutine. */
+static HashTable zealphp_coro_cid_to_ptr;
 
 /* Shared parent snapshot. */
 static HashTable zealphp_coro_globals_parent;
@@ -766,6 +774,32 @@ static bool zealphp_globals_isolatable(zval *v)
     }
 }
 
+/* $GLOBALS-only variant that ALSO isolates OBJECTS (resources still excluded).
+ * Used by the $GLOBALS delta/reset paths (snapshot_save + reset_to_parent) so
+ * object-valued globals — the `global $wpdb; $wpdb = new wpdb()` pattern — are
+ * isolated per coroutine instead of leaking across yields (scalars were already
+ * isolated; objects were not — empirically 22/24 cross-coroutine leak).
+ *
+ * SAFETY: an isolated object's refcount is held by the per-coroutine delta while
+ * the request runs, so the per-yield reset NEVER drops it to zero mid-switch
+ * (the __destruct-in-scheduler-callback UAF the v0.3.12 review guarded against).
+ * Its FINAL reference is released by zealphp_coroutine_globals_request_end(),
+ * which the framework calls at request-end IN COROUTINE CONTEXT — so an I/O
+ * __destruct (e.g. $wpdb closing MySQL under HOOK_ALL) can yield safely. Resources
+ * stay excluded (a resource handle's lifecycle can't be snapshot/restored).
+ *
+ * Deliberately NOT used for class/function statics (451, 612) or the parent
+ * baseline (784): those have no request-end drain, so an object there would fall
+ * back to on_close destruction (outside a coroutine). Object request-state belongs
+ * in $GLOBALS (drained here) or $g — not class/fn statics. */
+static bool zealphp_globals_isolatable_obj(zval *v)
+{
+    if (Z_TYPE_P(v) == IS_REFERENCE) {
+        v = Z_REFVAL_P(v);
+    }
+    return Z_TYPE_P(v) != IS_RESOURCE;   /* objects YES, resources NO */
+}
+
 /* Take the shared parent snapshot from current EG(symbol_table). Called
  * once when zealphp_coroutine_globals(true) flips on. Deep-copies every
  * non-superglobal user var so the parent owns its storage. */
@@ -821,7 +855,7 @@ static void zealphp_globals_reset_to_parent(void)
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, rv) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
-        if (!zealphp_globals_isolatable(rv)) continue;   /* objects/resources stay shared */
+        if (!zealphp_globals_isolatable_obj(rv)) continue;   /* resources stay shared; objects isolated + drained at request-end */
         if (Z_ISREF_P(rv)) {
             /* LIVE `global $x` binding: an executing (possibly-suspended) frame's
              * CV shares this IS_REFERENCE wrapper. Deleting the symbol-table slot
@@ -907,7 +941,7 @@ static void zealphp_globals_snapshot_save(long cid)
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, val) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
-        if (!zealphp_globals_isolatable(val)) continue;  /* objects/resources stay shared */
+        if (!zealphp_globals_isolatable_obj(val)) continue;  /* resources stay shared; objects isolated + drained at request-end */
         zval *uv = Z_ISREF_P(val) ? Z_REFVAL_P(val) : val;  /* deref global-keyword refs */
         if (zealphp_coro_globals_parent_set) {
             zval *pv = zend_hash_find(&zealphp_coro_globals_parent, key);
@@ -1134,6 +1168,11 @@ static void zealphp_on_yield(void *arg)
      * 7 SG slots — those are owned by zealphp_snapshot_save above. */
     if (zealphp_coro_globals_hooks_active) {
         zealphp_globals_snapshot_save((zend_long)(uintptr_t)arg);
+        /* Bridge cid→ptr so the PHP-context request-end drain can free this
+         * coroutine's (pointer-keyed) delta. os_get_cid() is reliable in on_yield. */
+        if (os_get_cid) {
+            zend_hash_index_update_ptr(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid(), arg);
+        }
     }
     /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap */
     if (orig_on_yield) orig_on_yield(arg);
@@ -1208,6 +1247,9 @@ static void zealphp_on_close(void *arg)
      * across the worker's lifetime (cids are monotonic). */
     if (os_get_cid) {
         zend_hash_index_del(&zealphp_coro_reincluded, (zend_ulong)os_get_cid());
+        /* Drop the cid→ptr bridge entry (request-end drain usually removed it
+         * already; this covers coroutines closed without a request-end drain). */
+        zend_hash_index_del(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid());
     }
 }
 
@@ -2110,6 +2152,42 @@ PHP_FUNCTION(zealphp_globals_clean)
     efree(to_delete);
 }
 
+/* zealphp_coroutine_globals_request_end(): void
+ *
+ * Request-end drain for per-coroutine $GLOBALS isolation. The framework calls
+ * this from the request coroutine's PHP context (CoSessionManager /
+ * SessionManager `finally`, AFTER the handler + response). It releases the LAST
+ * reference to every isolated OBJECT global HERE — in coroutine context — so an
+ * object's __destruct may yield (e.g. `$wpdb` closing its MySQL socket under
+ * HOOK_ALL). Without it the final ref falls to on_close (a C scheduler callback
+ * OUTSIDE any coroutine), where an I/O __destruct throws "API must be called in
+ * the coroutine" and the connection never closes cleanly.
+ *
+ * Two references can pin an isolated object: (1) this coroutine's per-yield delta
+ * (pointer-keyed — found via the cid→ptr bridge), and (2) the live EG slot. We
+ * drop the delta first, then reset EG to the parent baseline; whichever held the
+ * object's final ref, that ref is released in THIS coroutine and __destruct runs
+ * here. No-op unless per-coroutine $GLOBALS isolation is active. Idempotent:
+ * on_close's snapshot_delete then finds an already-freed delta. */
+PHP_FUNCTION(zealphp_coroutine_globals_request_end)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    if (!zealphp_coro_globals_hooks_active) return;
+    if (!EG(symbol_table).nTableMask) return;
+    if (os_get_cid) {
+        zend_ulong cid = (zend_ulong) os_get_cid();
+        void *ptr = zend_hash_index_find_ptr(&zealphp_coro_cid_to_ptr, cid);
+        if (ptr) {
+            /* Free this coroutine's pointer-keyed delta (drops its object refs). */
+            zealphp_globals_snapshot_delete((zend_long)(uintptr_t)ptr);
+            zend_hash_index_del(&zealphp_coro_cid_to_ptr, cid);
+        }
+    }
+    /* Clear the live EG user globals to the parent baseline — drops the EG slot's
+     * ref to any object global, firing __destruct HERE (coroutine context). */
+    zealphp_globals_reset_to_parent();
+}
+
 /* ── define() interception ───────────────────────────────────────── */
 
 /* Intercept define() to track per-request constants. The real define()
@@ -2855,6 +2933,8 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_fn_static_registry, 256, NULL, NULL, 0);
     zend_hash_init(&zealphp_coro_globals_deltas,     256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_globals_tombstones, 256, NULL, ZVAL_PTR_DTOR, 0);
+    /* cid→Coroutine* bridge (raw pointers, NULL dtor — the deltas own the zvals). */
+    zend_hash_init(&zealphp_coro_cid_to_ptr, 64, NULL, NULL, 0);
     /* persistent=0 — parent snapshot contents come from the per-request heap.
      * Cleared explicitly via zealphp_globals_parent_clear() on disable. */
     zend_hash_init(&zealphp_coro_globals_parent, 128, NULL, ZVAL_PTR_DTOR, 0);
@@ -3145,6 +3225,9 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_globals_clean, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_coroutine_globals_request_end, 0, 0, IS_VOID, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_process_state_snapshot, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
@@ -3176,6 +3259,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
     PHP_FE(zealphp_globals_snapshot,       arginfo_zealphp_globals_snapshot)
     PHP_FE(zealphp_globals_clean,          arginfo_zealphp_globals_clean)
+    PHP_FE(zealphp_coroutine_globals_request_end, arginfo_zealphp_coroutine_globals_request_end)
     PHP_FE(zealphp_process_state_snapshot, arginfo_zealphp_process_state_snapshot)
     PHP_FE(zealphp_process_state_clean,    arginfo_zealphp_process_state_clean)
     PHP_FE(zealphp_protect_classes,        arginfo_zealphp_protect_classes)
