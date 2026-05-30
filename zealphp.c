@@ -819,15 +819,42 @@ static void zealphp_globals_reset_to_parent(void)
     zend_string *key;
     zval *rv;
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, rv) {
-        if (key && !zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))
-            && zealphp_globals_isolatable(rv)) {   /* objects/resources skipped; ref-of-scalar/array now isolated (deleted + reinstalled from parent) */
-            if (delete_count >= delete_cap) {
-                delete_cap *= 2;
-                to_delete = erealloc(to_delete, sizeof(zend_string *) * delete_cap);
+        if (!key) continue;
+        if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
+        if (!zealphp_globals_isolatable(rv)) continue;   /* objects/resources stay shared */
+        if (Z_ISREF_P(rv)) {
+            /* LIVE `global $x` binding: an executing (possibly-suspended) frame's
+             * CV shares this IS_REFERENCE wrapper. Deleting the symbol-table slot
+             * would DETACH that CV — so a write the coroutine performs AFTER it
+             * resumes (the canonical case: `global $wpdb; $wpdb = new wpdb()` whose
+             * constructor YIELDED mid-assignment on the DB connect) lands in the
+             * orphaned ref and is invisible to every later `global $x` read →
+             * "Class not found"/null (WordPress wp_set_wpdb_vars). Instead reset
+             * the ref's VALUE in place (through Z_REFVAL) to the parent baseline
+             * (or NULL when the parent has no such key), keeping the binding live.
+             * Cooperative coroutine scheduling means the shared wrapper's value is
+             * swapped per-coroutine on each save/restore, so this stays isolation-
+             * correct — exactly how the Stage-1 superglobal restore writes through
+             * its refs. */
+            zval *target = Z_REFVAL_P(rv);
+            zval *pv = zealphp_coro_globals_parent_set
+                ? zend_hash_find(&zealphp_coro_globals_parent, key) : NULL;
+            zval old;
+            ZVAL_COPY_VALUE(&old, target);
+            if (pv) {
+                ZVAL_COPY(target, Z_ISREF_P(pv) ? Z_REFVAL_P(pv) : pv);
+            } else {
+                ZVAL_NULL(target);
             }
-            zend_string_addref(key);
-            to_delete[delete_count++] = key;
+            zval_ptr_dtor(&old);
+            continue;   /* keep the slot — do NOT delete */
         }
+        if (delete_count >= delete_cap) {
+            delete_cap *= 2;
+            to_delete = erealloc(to_delete, sizeof(zend_string *) * delete_cap);
+        }
+        zend_string_addref(key);
+        to_delete[delete_count++] = key;
     } ZEND_HASH_FOREACH_END();
 
     for (uint32_t i = 0; i < delete_count; i++) {
@@ -836,11 +863,14 @@ static void zealphp_globals_reset_to_parent(void)
     }
     efree(to_delete);
 
-    /* Pass 2: reinstall parent baseline. */
+    /* Pass 2: reinstall parent baseline for keys NOT already present. A kept
+     * IS_REFERENCE slot (above) is already present and value-reset to parent, so
+     * skip it — re-adding would either dup-assert (add_new) or leak. */
     if (zealphp_coro_globals_parent_set) {
         zval *val;
         ZEND_HASH_FOREACH_STR_KEY_VAL(&zealphp_coro_globals_parent, key, val) {
             if (!key) continue;
+            if (zend_hash_exists(&EG(symbol_table), key)) continue;
             zval copy;
             ZVAL_COPY(&copy, val);
             zend_hash_add_new(&EG(symbol_table), key, &copy);
