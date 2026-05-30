@@ -2792,10 +2792,30 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
              * (Zend-MM efree). Orphan the dup instead (bounded; reclaimed at
              * request/worker teardown) rather than corrupt. Non-autoload
              * re-includes resolve the class by name to the winner at runtime, so
-             * their losers remain safe to destroy. */
+             * their losers remain safe to destroy — EXCEPT inherited ones (below). */
             zend_class_entry *lce = (zend_class_entry *)ptr;
+            /* Stage-7 re-execution crash fix (v0.3.24, 2026-05-30): the "non-autoload
+             * losers are safe to destroy" assumption above is FALSE for a loser class
+             * WITH A PARENT / interfaces / traits. Stage 4 swaps CG only, never EG, so
+             * when this compile linked the loser it resolved parent/interfaces against
+             * the LIVE WINNER hierarchy in EG(class_table). The loser's inherited
+             * method / property-info / default-property slots therefore reference
+             * winner-owned structures; destroy_zend_class() on it frees/decrefs them
+             * out from under the live winner -> the winner's default_properties_table
+             * is corrupted -> SEGV in _object_properties_init (WRITE to a near-null
+             * counted pointer in zend_gc_addref) on the next `new`. THIS is the crash
+             * that takes down WordPress and any require_once-bootstrap inherited class
+             * under coroutine-legacy (ASAN-pinned PHP 8.4: 300 `class X extends Y`
+             * re-executed via Stage 7 crash -> clean with this guard; 300 FLAT classes
+             * unaffected either way; 33/33 phpt green; RSS flat over a 120-req burst ->
+             * orphaning is bounded, reclaimed at request-end). A FLAT loser (no parent/
+             * iface/trait) is self-contained, so it stays safe to destroy. */
+            bool zealphp_inherited_loser =
+                (lce->parent != NULL) || (lce->parent_name != NULL)
+                || lce->num_interfaces > 0 || lce->num_traits > 0;
             if (!(lce->ce_flags & ZEND_ACC_IMMUTABLE)
-                && !(EG(in_autoload) && zend_hash_num_elements(EG(in_autoload)) > 0)) {
+                && !(EG(in_autoload) && zend_hash_num_elements(EG(in_autoload)) > 0)
+                && !zealphp_inherited_loser) {
                 zval cl_zv;
                 ZVAL_PTR(&cl_zv, lce);
                 destroy_zend_class(&cl_zv);
