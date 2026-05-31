@@ -3382,6 +3382,105 @@ PHP_FUNCTION(zealphp_reset_request_rtcaches)
     RETURN_LONG(count);
 }
 
+/* ── zealphp_reset_request_statics(): int ────────────────────────────────
+ *
+ * Per-request FUNCTION-STATIC reset — the PHP-FPM "fresh process per request"
+ * contract for coroutine-legacy. PHP's shutdown_executor() (Zend/zend_execute_API.c)
+ * destroys every user function/method's live static_variables table at request
+ * shutdown, so `static $x = INIT;` re-initialises to INIT on the NEXT request. In
+ * a long-lived OpenSwoole worker that per-request shutdown never runs, so a
+ * function-local static keeps its last value ACROSS requests.
+ *
+ * The canonical failure: WordPress's wp_start_object_cache() has
+ * `static $first_init = true;` and sets it false at the end of request 1. On
+ * request 2 the stale `false` makes WP take the "already initialised" branch
+ * (wp_cache_switch_to_blog) instead of calling wp_cache_init(), so $wp_object_cache
+ * is never created -> "Call to a member function switch_to_blog() on null" -> 500,
+ * then a worker crash on request 3 building on that half-initialised state. ANY
+ * legacy "init-once" guard (`static $done = false;`) has the same failure mode —
+ * this is general, not WP-specific.
+ *
+ * Mirrors shutdown_executor() EXACTLY: zend_array_destroy(live) +
+ * ZEND_MAP_PTR_SET(static_variables_ptr, NULL) for each instantiated per-request
+ * user function and class method, so the next ZEND_BIND_STATIC re-dups the
+ * immutable template (op_array->static_variables) and the initial values are
+ * restored. The `live != static_variables` guard never destroys the shared
+ * template itself (matches the Stage-5 walk).
+ *
+ * Crash-safe under coroutine concurrency: a static bound to a still-suspended
+ * frame's CV is an IS_REFERENCE shared (refcount >= 2) between the table slot and
+ * that CV. zend_array_destroy drops only the table's reference, so the
+ * zend_reference (and the live CV) survive; nulling the map_ptr only makes the
+ * NEXT call re-dup the template. Boot/snapshot symbols are skipped so per-worker
+ * framework statics (e.g. one-time handler registration in src/) persist as
+ * intended. Gated by the framework on silent_redeclare (the legacy-persistent
+ * marker) and by the ZEALPHP_FN_STATICS_RESET_DISABLE env kill-switch. */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_statics, 0, 0, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+PHP_FUNCTION(zealphp_reset_request_statics)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    /* env kill-switch — read once per worker. */
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char *e = getenv("ZEALPHP_FN_STATICS_RESET_DISABLE");
+        disabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (disabled) {
+        RETURN_LONG(0);
+    }
+
+    zend_long count = 0;
+    bool snap = zealphp_state_snapshotted;
+
+    /* Global user functions. */
+    zend_string *fname;
+    zend_function *fn;
+    ZEND_HASH_FOREACH_STR_KEY_PTR(EG(function_table), fname, fn) {
+        if (fname && fn && fn->type == ZEND_USER_FUNCTION
+            && (!snap || !zend_hash_exists(&zealphp_snapshot_functions, fname))) {
+            zend_op_array *opa = &fn->op_array;
+            if (!opa->static_variables) continue;
+            if (!ZEND_MAP_PTR(opa->static_variables_ptr)) continue;
+            HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+            if (live && live != opa->static_variables) {
+                zend_array_destroy(live);
+                ZEND_MAP_PTR_SET(opa->static_variables_ptr, NULL);
+                count++;
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    /* Methods of user classes. No ZEND_HAS_STATIC_IN_METHODS gate — the per-method
+     * static_variables NULL check is a cheap filter and skipping the flag matches
+     * the Stage-5 walk, so a re-compiled class can't slip a method static past us. */
+    zend_string *cname;
+    zend_class_entry *ce;
+    ZEND_HASH_FOREACH_STR_KEY_PTR(EG(class_table), cname, ce) {
+        if (cname && ce && ce->type == ZEND_USER_CLASS
+            && (!snap || !zend_hash_exists(&zealphp_snapshot_classes, cname))) {
+            zend_function *m;
+            ZEND_HASH_FOREACH_PTR(&ce->function_table, m) {
+                if (m && m->type == ZEND_USER_FUNCTION) {
+                    zend_op_array *opa = &m->op_array;
+                    if (!opa->static_variables) continue;
+                    if (!ZEND_MAP_PTR(opa->static_variables_ptr)) continue;
+                    HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+                    if (live && live != opa->static_variables) {
+                        zend_array_destroy(live);
+                        ZEND_MAP_PTR_SET(opa->static_variables_ptr, NULL);
+                        count++;
+                    }
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    RETURN_LONG(count);
+}
+
 static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_override,               arginfo_zealphp_override)
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
@@ -3407,6 +3506,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_include_isolation,     arginfo_zealphp_include_isolation)
     PHP_FE(zealphp_include_isolation_reset, arginfo_zealphp_include_isolation_reset)
     PHP_FE(zealphp_reset_request_rtcaches, arginfo_zealphp_reset_request_rtcaches)
+    PHP_FE(zealphp_reset_request_statics,  arginfo_zealphp_reset_request_statics)
     PHP_FE_END
 };
 
