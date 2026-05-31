@@ -3262,6 +3262,55 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_protect_classes, 0, 1, I
     ZEND_ARG_TYPE_INFO(0, names, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
+/* ── Per-request run_time_cache reset (coroutine-legacy) ──────────────────────
+ *
+ * Persisted user functions (kept across requests by silent-redeclare) cache
+ * resolved constant/symbol pointers in an op_array run_time_cache allocated from
+ * CG(arena). The compiler arena's per-request region is reused across requests,
+ * so a persisted op_array's map_ptr is left pointing at a reused slot and the
+ * next request reads a STALE resolution. The classic symptom in a legacy
+ * bootstrap: `define('MB_IN_BYTES', 1024 * KB_IN_BYTES)` throws
+ * "Unsupported operand types: string * int" on the SECOND+ request, while
+ * constant('KB_IN_BYTES') (a direct, uncached table lookup) stays correct.
+ *
+ * zealphp_reset_request_rtcaches() nulls the run_time_cache map_ptr of
+ * PER-REQUEST user functions — those declared AFTER the worker-start boot
+ * snapshot, i.e. via runtime require/include (the legacy bootstrap pattern) — so
+ * the next call re-initialises and RE-RESOLVES against the live tables. The
+ * framework invokes it once per request from CoSessionManager/SessionManager.
+ *
+ * Boot/snapshot functions are SKIPPED: their caches live in the stable arena
+ * region; nulling them forces a re-init into the volatile region that dangles
+ * after the next reuse -> SEGV in zend_fetch_ce_from_cache_slot. Without a
+ * snapshot the two cannot be told apart, so this no-ops (coroutine-legacy always
+ * snapshots via Stage 7 includeIsolation, so the reset is live where needed).
+ *
+ * Concurrency-safe: running coroutine frames captured EX(run_time_cache) at
+ * entry, so only FUTURE calls re-resolve. Leak-free: the arena region is reused,
+ * not accumulated. Scoped to global functions — a method-safe variant (WP-style
+ * `global $wpdb` methods) is tracked separately. */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_rtcaches, 0, 0, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+PHP_FUNCTION(zealphp_reset_request_rtcaches)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    zend_long count = 0;
+    if (!zealphp_state_snapshotted) {
+        RETURN_LONG(0);
+    }
+    zend_string *fname;
+    zend_function *fn;
+    ZEND_HASH_FOREACH_STR_KEY_PTR(EG(function_table), fname, fn) {
+        if (fname && fn && fn->type == ZEND_USER_FUNCTION
+            && !zend_hash_exists(&zealphp_snapshot_functions, fname)) {
+            ZEND_MAP_PTR_SET(fn->op_array.run_time_cache, NULL);
+            count++;
+        }
+    } ZEND_HASH_FOREACH_END();
+    RETURN_LONG(count);
+}
+
 static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_override,               arginfo_zealphp_override)
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
@@ -3286,6 +3335,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_silent_redeclare,       arginfo_zealphp_silent_redeclare)
     PHP_FE(zealphp_include_isolation,     arginfo_zealphp_include_isolation)
     PHP_FE(zealphp_include_isolation_reset, arginfo_zealphp_include_isolation_reset)
+    PHP_FE(zealphp_reset_request_rtcaches, arginfo_zealphp_reset_request_rtcaches)
     PHP_FE_END
 };
 
