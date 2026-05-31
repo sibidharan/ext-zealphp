@@ -245,6 +245,34 @@ static bool zealphp_globals_snapshotted = false;
  * wrongly taking the multisite branch -> "Call to undefined function
  * get_network()". Orphaning keeps the address stable and still hides the
  * constant from peer coroutines while this one is suspended. */
+/* Free an ORPHANED request constant using only public ZEND_API symbols.
+ *
+ * The engine's own free_zend_constant() is a STATIC (non-exported) function in
+ * Zend/zend_constants.c, so referencing it from a dynamically-loaded extension
+ * leaves an undefined symbol: under lazy binding the .so loads fine, but the
+ * FIRST time this free path runs the dynamic linker fails to resolve it and
+ * aborts the whole worker with `symbol lookup error ... undefined symbol:
+ * free_zend_constant` -> exit 127. (Observed as periodic worker recycling on the
+ * WordPress render path and as a dropped in-flight request under concurrency.)
+ *
+ * Request constants come from runtime define() and are therefore always
+ * non-persistent; we mirror free_zend_constant's non-persistent branch and
+ * defensively refuse to free a persistent (engine/extension) constant. */
+static void zealphp_free_orphan_constant(zend_constant *c)
+{
+    if (!c) {
+        return;
+    }
+    if (ZEND_CONSTANT_FLAGS(c) & CONST_PERSISTENT) {
+        return;   /* never our orphan — leave engine/extension constants alone */
+    }
+    zval_ptr_dtor_nogc(&c->value);
+    if (c->name) {
+        zend_string_release_ex(c->name, 0);
+    }
+    efree(c);
+}
+
 static void zealphp_constants_snapshot_save(long cid)
 {
     if (!zealphp_define_hooked || zend_hash_num_elements(&zealphp_request_constants) == 0) {
@@ -316,9 +344,7 @@ static void zealphp_constants_snapshot_restore(long cid)
             } else {
                 /* A peer coroutine re-declared this name while we were suspended,
                  * so our orphan is now unreachable — free it (avoids a leak). */
-                zval zv;
-                ZVAL_PTR(&zv, c);
-                free_zend_constant(&zv);
+                zealphp_free_orphan_constant(c);
             }
         }
     } ZEND_HASH_FOREACH_END();
@@ -355,9 +381,7 @@ static void zealphp_constants_snapshot_delete(long cid)
             ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ptrs), val) {
                 zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(val);
                 if (c) {
-                    zval zv;
-                    ZVAL_PTR(&zv, c);
-                    free_zend_constant(&zv);
+                    zealphp_free_orphan_constant(c);
                 }
             } ZEND_HASH_FOREACH_END();
         }
