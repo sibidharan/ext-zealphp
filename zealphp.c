@@ -3505,6 +3505,81 @@ PHP_FUNCTION(zealphp_reset_request_statics)
     RETURN_LONG(count);
 }
 
+/* ── zealphp_reset_request_class_statics(): int ──────────────────────────
+ *
+ * Per-request CLASS-STATIC-PROPERTY reset — the class-property analog of
+ * zealphp_reset_request_statics(). PHP's shutdown_executor() also resets static
+ * PROPERTIES per request, via zend_cleanup_internal_class_data() for every user
+ * class with static members (Zend/zend_execute_API.c). A long-lived OpenSwoole
+ * worker never runs that, so a class static property keeps its value ACROSS
+ * requests — and the per-coroutine class-static isolation deliberately leaves
+ * OBJECT/resource statics process-shared (scalars/arrays only), so an object
+ * static (a DI container, a connection registry) persists across requests.
+ *
+ * Canonical break: Drupal's static service container + `Database` connection
+ * registry (class static properties). Request 1 builds them; on request 2 the
+ * mix of "globals/scalars reset but the object container persisted" makes Drupal
+ * throw "The specified database connection is not defined" -> 500.
+ *
+ * zend_cleanup_internal_class_data(ce) is ZEND_API (exported — unlike the static
+ * free_zend_constant): it nulls ce->static_members_table's map_ptr and frees the
+ * live table (correctly releasing typed-property reference sources); the next
+ * static-property access re-initialises from ce->default_static_members_table via
+ * zend_class_init_statics() (Zend/zend_object_handlers.c). Object static
+ * __destructors run HERE, in the request coroutine's context (an I/O __destruct
+ * may yield), same as the object-global drain. Boot/snapshot classes are skipped
+ * so framework class statics (App::$routes, the middleware stack, Store/Counter
+ * backends) persist for the worker's lifetime.
+ *
+ * COUPLING: freeing the live table invalidates cached ZEND_FETCH_STATIC_PROP slots
+ * in run_time_cache (a later fetch would read a dangling slot -> SEGV), so this
+ * MUST be paired with zealphp_reset_request_rtcaches(), which clears those slots.
+ * The framework runs both every request under the same silent_redeclare gate, so a
+ * cleared cache always re-resolves against the re-init'd table on the next access.
+ *
+ * Gated by the framework on silent_redeclare and by the
+ * ZEALPHP_CLASS_STATICS_RESET_DISABLE env kill-switch. */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_class_statics, 0, 0, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+PHP_FUNCTION(zealphp_reset_request_class_statics)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    /* env kill-switch — read once per worker. */
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char *e = getenv("ZEALPHP_CLASS_STATICS_RESET_DISABLE");
+        disabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (disabled) {
+        RETURN_LONG(0);
+    }
+
+    zend_long count = 0;
+    bool snap = zealphp_state_snapshotted;
+
+    zend_string *cname;
+    zend_class_entry *ce;
+    ZEND_HASH_FOREACH_STR_KEY_PTR(EG(class_table), cname, ce) {
+        if (cname && ce && ce->type == ZEND_USER_CLASS
+            && ce->default_static_members_count > 0
+            && (!snap || !zend_hash_exists(&zealphp_snapshot_classes, cname))) {
+            /* Only touch classes whose live static table is actually instantiated.
+             * zend_cleanup_internal_class_data nulls the map_ptr + frees the table,
+             * so the next access re-dups the template via zend_class_init_statics().
+             * (It re-checks this guard internally; the outer check keeps the count
+             * accurate and skips the call for never-accessed classes.) */
+            if (ZEND_MAP_PTR(ce->static_members_table) && CE_STATIC_MEMBERS(ce)) {
+                zend_cleanup_internal_class_data(ce);
+                count++;
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    RETURN_LONG(count);
+}
+
 static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_override,               arginfo_zealphp_override)
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
@@ -3531,6 +3606,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_include_isolation_reset, arginfo_zealphp_include_isolation_reset)
     PHP_FE(zealphp_reset_request_rtcaches, arginfo_zealphp_reset_request_rtcaches)
     PHP_FE(zealphp_reset_request_statics,  arginfo_zealphp_reset_request_statics)
+    PHP_FE(zealphp_reset_request_class_statics, arginfo_zealphp_reset_request_class_statics)
     PHP_FE_END
 };
 
