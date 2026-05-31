@@ -10,11 +10,11 @@
   <email>sibi@selfmade.ninja</email>
   <active>yes</active>
  </lead>
- <date>2026-05-30</date>
- <time>07:45:00</time>
+ <date>2026-05-31</date>
+ <time>12:00:00</time>
  <version>
-  <release>0.3.24</release>
-  <api>0.3.23</api>
+  <release>0.3.25</release>
+  <api>0.3.25</api>
  </version>
  <stability>
   <release>alpha</release>
@@ -22,14 +22,16 @@
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
  <notes>
-Initial release:
-- zealphp_override(string $name, callable $callback): bool
-- zealphp_restore(string $name): bool
-- zealphp_restore_all(): void
-- Allowlist of 53 PHP built-in functions
-- Handler-swapping on CG(function_table)
-- MSHUTDOWN auto-restores all originals
-- Tested on PHP 8.3, 8.4
+0.3.25 — coroutine-legacy per-request state reset (completes the PHP-FPM
+"fresh process per request" contract for the require_once-legacy class):
+- zealphp_reset_request_statics(): re-initialise function-local static $x to its
+  template each request (mirrors shutdown_executor's static_variables loop)
+- zealphp_reset_request_class_statics(): re-initialise class static properties to
+  their template each request via zend_cleanup_internal_class_data (incl.
+  object/DI-container statics; unlocks the static-container tier, e.g. Drupal)
+- fix: replace the non-exported free_zend_constant() with public ZEND_API calls
+  (was aborting the worker with "undefined symbol: free_zend_constant", exit 127)
+Mirrors PHP's shutdown_executor(). phpt 38/38. Tested PHP 8.3, 8.4 (ASAN).
  </notes>
  <contents>
   <dir name="/">
