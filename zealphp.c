@@ -228,47 +228,61 @@ static zif_handler zealphp_orig_define_handler = NULL;
 static HashTable zealphp_globals_snapshot;
 static bool zealphp_globals_snapshotted = false;
 
-/* Save request-scoped constants for this coroutine. Copies the constant
- * values from EG(zend_constants) and removes them so the next coroutine
- * starts with a clean constant table (only boot-time constants remain). */
+/* Save request-scoped constants for this coroutine on yield.
+ *
+ * PRESERVE-ADDRESSES isolation: ORPHAN each of this coroutine's request
+ * constants — remove it from EG(zend_constants) WITHOUT freeing the
+ * zend_constant struct — and stash the struct POINTER so the SAME struct is
+ * re-inserted (at the same address) on resume. The struct address therefore
+ * survives the yield, so a cached ZEND_FETCH_CONSTANT resolution (the
+ * run_time_cache holds the resolved zend_constant*) stays valid across the
+ * coroutine switch.
+ *
+ * The previous design DUP'd the value and zend_hash_del()'d (FREED) the
+ * constant, then re-registered a NEW struct on resume. That MOVED the constant,
+ * so a cached pointer read whatever constant had since reused the freed address
+ * — e.g. WordPress is_multisite() reading DAY_IN_SECONDS (86400) for MULTISITE,
+ * wrongly taking the multisite branch -> "Call to undefined function
+ * get_network()". Orphaning keeps the address stable and still hides the
+ * constant from peer coroutines while this one is suspended. */
 static void zealphp_constants_snapshot_save(long cid)
 {
     if (!zealphp_define_hooked || zend_hash_num_elements(&zealphp_request_constants) == 0) {
         return;
     }
 
-    zval snapshot;
-    array_init(&snapshot);
+    zval ptrs;            /* name -> (zend_long)(uintptr_t) zend_constant* (orphaned) */
+    array_init(&ptrs);
+    zval names_snapshot;  /* name -> 1 (the request-constant tracker) */
+    array_init(&names_snapshot);
+
+    /* Suppress the constant destructor so zend_hash_del() REMOVES the bucket
+     * without freeing the zend_constant — i.e. orphan it, address intact. */
+    dtor_func_t orig_dtor = EG(zend_constants)->pDestructor;
+    EG(zend_constants)->pDestructor = NULL;
 
     zend_string *name;
     ZEND_HASH_FOREACH_STR_KEY(&zealphp_request_constants, name) {
         if (name) {
             zend_constant *c = zend_hash_find_ptr(EG(zend_constants), name);
             if (c) {
-                zval val_copy;
-                ZVAL_DUP(&val_copy, &c->value);
-                zend_hash_update(Z_ARRVAL(snapshot), name, &val_copy);
-                /* Remove from EG so next coroutine doesn't see it */
-                zend_hash_del(EG(zend_constants), name);
+                zval p;
+                ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
+                zend_hash_update(Z_ARRVAL(ptrs), name, &p);
+                zend_hash_del(EG(zend_constants), name);   /* orphan (no free) */
+                zval one;
+                ZVAL_LONG(&one, 1);
+                zend_hash_update(Z_ARRVAL(names_snapshot), name, &one);
             }
         }
     } ZEND_HASH_FOREACH_END();
 
-    /* Also save the tracked names set so we know which to restore */
-    zval names_snapshot;
-    array_init(&names_snapshot);
-    ZEND_HASH_FOREACH_STR_KEY(&zealphp_request_constants, name) {
-        if (name) {
-            zval one;
-            ZVAL_LONG(&one, 1);
-            zend_hash_update(Z_ARRVAL(names_snapshot), name, &one);
-        }
-    } ZEND_HASH_FOREACH_END();
+    EG(zend_constants)->pDestructor = orig_dtor;
 
-    /* Store both under this coroutine's ID */
+    /* Store the orphan pointers + tracker under this coroutine's ID */
     zval pair;
     array_init(&pair);
-    zend_hash_str_update(Z_ARRVAL(pair), "values", sizeof("values") - 1, &snapshot);
+    zend_hash_str_update(Z_ARRVAL(pair), "ptrs", sizeof("ptrs") - 1, &ptrs);
     zend_hash_str_update(Z_ARRVAL(pair), "names", sizeof("names") - 1, &names_snapshot);
     zend_hash_index_update(&zealphp_coro_constant_snapshots, (zend_ulong)cid, &pair);
 
@@ -276,31 +290,42 @@ static void zealphp_constants_snapshot_save(long cid)
     zend_hash_clean(&zealphp_request_constants);
 }
 
-/* Restore this coroutine's request-scoped constants into EG(zend_constants). */
+/* Restore this coroutine's request-scoped constants into EG(zend_constants) on
+ * resume — re-inserting the SAME orphaned zend_constant structs (addresses
+ * preserved), so cached fetches that resolved them before the yield stay valid. */
 static void zealphp_constants_snapshot_restore(long cid)
 {
     zval *pair = zend_hash_index_find(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
     if (!pair || Z_TYPE_P(pair) != IS_ARRAY) return;
 
-    zval *values = zend_hash_str_find(Z_ARRVAL_P(pair), "values", sizeof("values") - 1);
+    zval *ptrs = zend_hash_str_find(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1);
     zval *names = zend_hash_str_find(Z_ARRVAL_P(pair), "names", sizeof("names") - 1);
-    if (!values || Z_TYPE_P(values) != IS_ARRAY) return;
+    if (!ptrs || Z_TYPE_P(ptrs) != IS_ARRAY) return;
 
-    /* Re-register each constant in EG(zend_constants) */
     zend_string *name;
     zval *val;
-    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(values), name, val) {
-        if (name && !zend_hash_exists(EG(zend_constants), name)) {
-            zend_constant c;
-            ZVAL_DUP(&c.value, val);
-            c.name = zend_string_copy(name);
-            ZEND_CONSTANT_SET_FLAGS(&c, 0, PHP_USER_CONSTANT);
-            /* On failure (e.g. a constant of this name appeared between the
-             * exists() check above and now), zend_register_constant releases
-             * both c.name and c.value itself — nothing to clean up here (M5). */
-            (void) zend_register_constant(&c);
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(ptrs), name, val) {
+        if (name) {
+            zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(val);
+            if (!c) {
+                continue;
+            }
+            if (!zend_hash_exists(EG(zend_constants), name)) {
+                /* Re-insert the SAME struct — address preserved. */
+                zend_hash_add_ptr(EG(zend_constants), name, c);
+            } else {
+                /* A peer coroutine re-declared this name while we were suspended,
+                 * so our orphan is now unreachable — free it (avoids a leak). */
+                zval zv;
+                ZVAL_PTR(&zv, c);
+                free_zend_constant(&zv);
+            }
         }
     } ZEND_HASH_FOREACH_END();
+
+    /* Orphans are now back in EG (or freed); drop the saved pointer set so a
+     * later snapshot_delete (coroutine close) does not double-free them. */
+    zend_hash_str_del(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1);
 
     /* Restore the tracked names into the process-wide tracker */
     if (names && Z_TYPE_P(names) == IS_ARRAY) {
@@ -315,9 +340,28 @@ static void zealphp_constants_snapshot_restore(long cid)
     }
 }
 
-/* Clean up this coroutine's constant snapshot (on close). */
+/* Clean up this coroutine's constant snapshot (on close). If the coroutine
+ * closed while SUSPENDED (its constants were orphaned by snapshot_save but never
+ * re-inserted by a resume), the orphaned structs are not in EG(zend_constants)
+ * and would leak — free them here. (Normal path: restore already re-inserted
+ * them and deleted "ptrs", so this is a no-op.) */
 static void zealphp_constants_snapshot_delete(long cid)
 {
+    zval *pair = zend_hash_index_find(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
+    if (pair && Z_TYPE_P(pair) == IS_ARRAY) {
+        zval *ptrs = zend_hash_str_find(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1);
+        if (ptrs && Z_TYPE_P(ptrs) == IS_ARRAY) {
+            zval *val;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ptrs), val) {
+                zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(val);
+                if (c) {
+                    zval zv;
+                    ZVAL_PTR(&zv, c);
+                    free_zend_constant(&zv);
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+    }
     zend_hash_index_del(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
 }
 
