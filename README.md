@@ -48,8 +48,12 @@ Under `coroutine-legacy`, ZealPHP fires concurrent interleaved requests and asse
 
 **Not isolated (by design):** **resources** in globals (a handle's lifecycle can't be
 snapshot/restored — use a per-coroutine pool), closure `static $x`, and process-global
-handlers (`set_error_handler`, raw `ob_*`, `pcntl_fork`). Object request-state belongs in
-`$GLOBALS` (now isolated) or ZealPHP's `$g` — not class/function statics.
+handlers (`set_error_handler`, raw `ob_*`, `pcntl_fork`).
+
+Class and function `static $x` are now **reset to their initial value per request** (0.3.25,
+see below) — mirroring PHP-FPM, so an init-once guard or a static registry starts each
+request clean. For state shared *concurrently* across coroutines mid-request, still prefer
+`$GLOBALS` (isolated) or ZealPHP's `$g` over object-valued statics.
 
 ### Object globals (0.3.23)
 
@@ -60,6 +64,48 @@ per-coroutine delta during the request (so the per-yield reset never drops it to
 mid-switch), and releases its final reference at request-end via
 `zealphp_coroutine_globals_request_end()` — called by the framework **in coroutine
 context**, so an I/O `__destruct` (e.g. `$wpdb` closing MySQL under `HOOK_ALL`) can yield.
+
+### Per-request state reset (0.3.24–0.3.25) — completing the SAPI "fresh state per request" contract
+
+Per-coroutine *isolation* (above) stops concurrent coroutines racing shared state across a
+yield. That is **not** the same as *resetting* state per request. PHP-FPM hands every request a
+fresh process, so function-local `static $x`, class `static` properties, and resolved op-array
+caches all start clean. A long-lived OpenSwoole worker never runs PHP's per-request
+`shutdown_executor()`, so persisted user symbols keep their **last** request's state — which
+breaks any `require_once`-bootstrap app with an init-once guard or a static registry (a general
+correctness gap in the PHP-FPM mental model, not one app). 0.3.25 mirrors `shutdown_executor()`
+with three per-request resets, run at request end and gated on silent-redeclare:
+
+| Reset | Function | Re-initialises per request |
+|-------|----------|----------------------------|
+| run-time cache | `zealphp_reset_request_rtcaches()` | each per-request op-array's `run_time_cache` (cached constant / fn / method / static-prop slots) re-resolves cold |
+| function statics | `zealphp_reset_request_statics()` | function-local `static $x` → its template (mirrors `shutdown_executor`'s `EG(function_table)` loop) |
+| class statics | `zealphp_reset_request_class_statics()` | class `static` properties — incl. object / DI-container statics → template (mirrors the `EG(class_table)` loop) |
+
+Boot/snapshot symbols are skipped (`zealphp_process_state_snapshot()`), so framework state that
+*should* persist per worker — routes, the middleware stack, configured backends — is untouched.
+The class-static reset frees the live `static_members_table`, invalidating cached
+`ZEND_FETCH_STATIC_PROP` slots, so it **must** be paired with the run-time-cache reset (the
+framework runs all three together). The constant snapshot was also corrected to release orphans
+via public ZEND_API calls instead of the non-exported `free_zend_constant` (which aborted the
+worker with `exit 127`).
+
+**0.3.24 — inherited-class re-declaration safety.** Under per-request `require_once`
+re-execution (Stage 7), re-declaring a class *with inheritance* (`extends`/`implements`) used to
+over-free entries shared with the original class's `default_properties_table`, corrupting it → a
+hard `SIGSEGV` at the next `new`. The Stage 4 first-wins merge now **orphans** an inherited loser
+instead of destroying it (reclaimed at request end — RSS stays flat). This — not the DB
+connection — is the actual reason classic `require_once`-bootstrap apps crashed in
+`coroutine-legacy`; fixed and pinned by `035-silent-redeclare-inherited-no-corruption.phpt`.
+
+> **Scope, honestly.** These resets make request-style PHP behave as if each request had a fresh
+> process **for the `require_once`-bootstrap + static-container class of apps, run sequentially**
+> — validated across a 12-app sweep (Adminer, FreshRSS, YOURLS, Grav, phpBB, MyBB, Piwigo,
+> Drupal, …) on PHP 8.4 + ASAN. True *concurrency* of unmodified pure-`require_once` apps (no
+> autoloader — classic WordPress) is a separate frontier (cold-concurrent class linking +
+> process-shared resource handles); those run race-free in ZealPHP's `legacy-cgi` mode.
+> Composer/PSR-4 apps autoload once per worker and are never re-executed by Stage 7, so they are
+> safe to run concurrently in `coroutine-legacy`.
 
 ## Install
 
@@ -122,6 +168,9 @@ zealphp_process_state_snapshot();              // capture the boot baseline
 zealphp_request_input_set($get, $post, …);     // pin request-input superglobals to this coroutine
 zealphp_coroutine_globals_request_end();       // drain object globals in-coroutine at request end
 zealphp_process_state_clean($flags);           // reset per-request state
+zealphp_reset_request_rtcaches();              // re-resolve op-array run-time caches cold (0.3.25)
+zealphp_reset_request_statics();               // reset function-local static $x per request (0.3.25)
+zealphp_reset_request_class_statics();         // reset class static properties per request (0.3.25)
 ```
 
 ## Design
@@ -137,9 +186,10 @@ zealphp_process_state_clean($flags);           // reset per-request state
   arbitrary function replacement. **No class manipulation** (unlike uopz). Handler-swapping
   preserves `arg_info`. All originals auto-restored at `MSHUTDOWN`.
 - **Memory-safe**: the snapshot/restore paths are validated under **AddressSanitizer** (PHP
-  8.3/8.4/8.5, source-built) and **Valgrind memcheck** in CI, plus a 33-test `.phpt` suite
+  8.3/8.4/8.5, source-built) and **Valgrind memcheck** in CI, plus a 37-test `.phpt` suite
   (PARANOID cross-coroutine-leak tests, silent-redeclare, include-isolation, object-global
-  isolation under real coroutine concurrency).
+  isolation, inherited-class re-declaration safety, and per-request state reset under real
+  coroutine concurrency).
 
 ## Allowed functions (override allowlist)
 
