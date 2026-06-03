@@ -330,6 +330,19 @@ static void zealphp_constants_snapshot_restore(long cid)
     zval *names = zend_hash_str_find(Z_ARRVAL_P(pair), "names", sizeof("names") - 1);
     if (!ptrs || Z_TYPE_P(ptrs) != IS_ARRAY) return;
 
+    /* Re-insert each orphaned request-constant. If a PEER coroutine re-declared
+     * the same name while we were suspended, our orphan is unreachable -- BUT a
+     * cached op_array's run_time_cache FETCH_CONSTANT slot (shared across
+     * coroutines under opcache) may still point at it. Freeing it HERE (mid-
+     * request, in on_resume) dangles that cache -> ZEND_FETCH_CONSTANT
+     * use-after-free: the long-standing coroutine-legacy WordPress crash,
+     * root-caused by ASAN (free was here; the read at ZEND_FETCH_CONSTANT; the
+     * "mysqlnd teardown" zend_mm_heap corruption is just a downstream detection).
+     * So DEFER such frees to coroutine close (snapshot_delete), after the request
+     * has ended and its run_time_cache has been reset, where no fetch can read
+     * the freed constant. */
+    zval kept;
+    array_init(&kept);
     zend_string *name;
     zval *val;
     ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(ptrs), name, val) {
@@ -339,19 +352,23 @@ static void zealphp_constants_snapshot_restore(long cid)
                 continue;
             }
             if (!zend_hash_exists(EG(zend_constants), name)) {
-                /* Re-insert the SAME struct — address preserved. */
-                zend_hash_add_ptr(EG(zend_constants), name, c);
+                zend_hash_add_ptr(EG(zend_constants), name, c);   /* re-insert; address preserved */
             } else {
-                /* A peer coroutine re-declared this name while we were suspended,
-                 * so our orphan is now unreachable — free it (avoids a leak). */
-                zealphp_free_orphan_constant(c);
+                zval p;
+                ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
+                zend_hash_next_index_insert(Z_ARRVAL(kept), &p);  /* defer free to coroutine close */
             }
         }
     } ZEND_HASH_FOREACH_END();
 
-    /* Orphans are now back in EG (or freed); drop the saved pointer set so a
-     * later snapshot_delete (coroutine close) does not double-free them. */
-    zend_hash_str_del(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1);
+    /* Keep "ptrs" holding ONLY the deferred-free orphans (re-inserted ones are now
+     * owned by EG). snapshot_delete frees whatever remains here at coroutine close. */
+    if (zend_hash_num_elements(Z_ARRVAL(kept)) > 0) {
+        zend_hash_str_update(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1, &kept);
+    } else {
+        zval_ptr_dtor(&kept);
+        zend_hash_str_del(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1);
+    }
 
     /* Restore the tracked names into the process-wide tracker */
     if (names && Z_TYPE_P(names) == IS_ARRAY) {
