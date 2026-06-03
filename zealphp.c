@@ -911,63 +911,35 @@ static void zealphp_globals_reset_to_parent(void)
 {
     if (!EG(symbol_table).nTableMask) return;
 
-    /* Pass 1: collect & remove non-SG keys. We cannot mutate while
-     * iterating the hash table. */
-    zend_string **to_delete = NULL;
-    uint32_t delete_count = 0;
-    uint32_t delete_cap = 32;
-    to_delete = emalloc(sizeof(zend_string *) * delete_cap);
-
+    /* Value-in-place reset (Stage-8 safe): NEVER zend_hash_del a slot. A live
+     * global-scope include frame holds an INDIRECT CV into the bucket; deleting it
+     * frees the bucket the CV points at -> UAF -> heap corruption on resume.
+     * Reset each slot's VALUE in place to the parent baseline (or NULL when the
+     * parent has no such key) -- through Z_REFVAL for a live `global $x` binding
+     * (unchanged from the proven IS_REF path: keeps `global $wpdb; $wpdb = new
+     * wpdb()` whose ctor yields), directly for a plain slot. Bucket addresses stay
+     * stable across save/reset/restore; the next coroutine sees NULL (isset=false),
+     * and the owning coroutine's value is re-applied from its delta on resume. */
     zend_string *key;
     zval *rv;
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, rv) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
-        if (!zealphp_globals_isolatable_obj(rv)) continue;   /* resources stay shared; objects isolated + drained at request-end */
-        if (Z_ISREF_P(rv)) {
-            /* LIVE `global $x` binding: an executing (possibly-suspended) frame's
-             * CV shares this IS_REFERENCE wrapper. Deleting the symbol-table slot
-             * would DETACH that CV — so a write the coroutine performs AFTER it
-             * resumes (the canonical case: `global $wpdb; $wpdb = new wpdb()` whose
-             * constructor YIELDED mid-assignment on the DB connect) lands in the
-             * orphaned ref and is invisible to every later `global $x` read →
-             * "Class not found"/null (WordPress wp_set_wpdb_vars). Instead reset
-             * the ref's VALUE in place (through Z_REFVAL) to the parent baseline
-             * (or NULL when the parent has no such key), keeping the binding live.
-             * Cooperative coroutine scheduling means the shared wrapper's value is
-             * swapped per-coroutine on each save/restore, so this stays isolation-
-             * correct — exactly how the Stage-1 superglobal restore writes through
-             * its refs. */
-            zval *target = Z_REFVAL_P(rv);
-            zval *pv = zealphp_coro_globals_parent_set
-                ? zend_hash_find(&zealphp_coro_globals_parent, key) : NULL;
-            zval old;
-            ZVAL_COPY_VALUE(&old, target);
-            if (pv) {
-                ZVAL_COPY(target, Z_ISREF_P(pv) ? Z_REFVAL_P(pv) : pv);
-            } else {
-                ZVAL_NULL(target);
-            }
-            zval_ptr_dtor(&old);
-            continue;   /* keep the slot — do NOT delete */
+        if (!zealphp_globals_isolatable_obj(rv)) continue;
+        zval *target = Z_ISREF_P(rv) ? Z_REFVAL_P(rv) : rv;
+        zval *pv = zealphp_coro_globals_parent_set
+            ? zend_hash_find(&zealphp_coro_globals_parent, key) : NULL;
+        zval old;
+        ZVAL_COPY_VALUE(&old, target);
+        if (pv) {
+            ZVAL_COPY(target, Z_ISREF_P(pv) ? Z_REFVAL_P(pv) : pv);
+        } else {
+            ZVAL_NULL(target);
         }
-        if (delete_count >= delete_cap) {
-            delete_cap *= 2;
-            to_delete = erealloc(to_delete, sizeof(zend_string *) * delete_cap);
-        }
-        zend_string_addref(key);
-        to_delete[delete_count++] = key;
+        zval_ptr_dtor(&old);
     } ZEND_HASH_FOREACH_END();
 
-    for (uint32_t i = 0; i < delete_count; i++) {
-        zend_hash_del(&EG(symbol_table), to_delete[i]);
-        zend_string_release(to_delete[i]);
-    }
-    efree(to_delete);
-
-    /* Pass 2: reinstall parent baseline for keys NOT already present. A kept
-     * IS_REFERENCE slot (above) is already present and value-reset to parent, so
-     * skip it — re-adding would either dup-assert (add_new) or leak. */
+    /* Reinstall parent keys not present (e.g. userland unset() removed one). */
     if (zealphp_coro_globals_parent_set) {
         zval *val;
         ZEND_HASH_FOREACH_STR_KEY_VAL(&zealphp_coro_globals_parent, key, val) {
@@ -3580,6 +3552,66 @@ PHP_FUNCTION(zealphp_reset_request_class_statics)
     RETURN_LONG(count);
 }
 
+
+/* -- Stage 8: true-global-scope request include ----------------------
+ * Run a file's top-level code against EG(symbol_table) (real globals)
+ * even when called from deep inside a coroutine call stack, so bare
+ * file-scope vars ($menu/$submenu/$_wp_submenu_nopriv in WordPress) --
+ * and every transitive require_once -- bind to $GLOBALS instead of the
+ * caller's frame. Mirrors zend_execute()'s top-frame path but FORCES the
+ * global symbol table. See docs/architecture/2026-06-02-stage8-*.
+ */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_require_global, 0, 1, IS_MIXED, 0)
+    ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+PHP_FUNCTION(zealphp_require_global)
+{
+    zend_string *path;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STR(path)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (EG(exception)) { RETURN_THROWS(); }
+
+    zend_file_handle fh;
+    zend_stream_init_filename(&fh, ZSTR_VAL(path));
+
+    zend_op_array *op_array = zend_compile_file(&fh, ZEND_REQUIRE);
+    zend_destroy_file_handle(&fh);
+
+    if (!op_array) { RETURN_FALSE; }
+    if (EG(exception)) {
+        destroy_op_array(op_array);
+        efree_size(op_array, sizeof(zend_op_array));
+        RETURN_THROWS();
+    }
+
+    zend_execute_data *call = zend_vm_stack_push_call_frame(
+        ZEND_CALL_TOP_CODE | ZEND_CALL_HAS_SYMBOL_TABLE,
+        (zend_function *) op_array, 0, NULL);
+    call->symbol_table = &EG(symbol_table);   /* FORCE global scope */
+
+    zval result;
+    ZVAL_UNDEF(&result);
+
+    zend_init_code_execute_data(call, op_array, &result);
+    zend_execute_ex(call);
+    zend_vm_stack_free_call_frame(call);
+
+    destroy_op_array(op_array);
+    efree_size(op_array, sizeof(zend_op_array));
+
+    if (EG(exception)) {
+        zval_ptr_dtor(&result);
+        RETURN_THROWS();
+    }
+    if (Z_TYPE(result) != IS_UNDEF) {
+        RETURN_COPY_VALUE(&result);
+    }
+    RETURN_NULL();
+}
+
 static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_override,               arginfo_zealphp_override)
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
@@ -3595,6 +3627,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_constants_clear,        arginfo_zealphp_constants_clear)
     PHP_FE(zealphp_ini_restore,           arginfo_zealphp_ini_restore)
     PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
+    PHP_FE(zealphp_require_global,         arginfo_zealphp_require_global)
     PHP_FE(zealphp_globals_snapshot,       arginfo_zealphp_globals_snapshot)
     PHP_FE(zealphp_globals_clean,          arginfo_zealphp_globals_clean)
     PHP_FE(zealphp_coroutine_globals_request_end, arginfo_zealphp_coroutine_globals_request_end)

@@ -10,11 +10,11 @@
   <email>sibi@selfmade.ninja</email>
   <active>yes</active>
  </lead>
- <date>2026-05-31</date>
+ <date>2026-06-03</date>
  <time>12:00:00</time>
  <version>
-  <release>0.3.25</release>
-  <api>0.3.25</api>
+  <release>0.3.26</release>
+  <api>0.3.26</api>
  </version>
  <stability>
   <release>alpha</release>
@@ -22,6 +22,18 @@
  </stability>
  <license uri="https://opensource.org/licenses/MIT">MIT</license>
  <notes>
+0.3.26 — Stage 8: true-global-scope request include + bucket-stable globals reset:
+- zealphp_require_global(string $path): mixed — run a file's top-level code against
+  EG(symbol_table) (real globals) even from deep in a coroutine call stack, so bare
+  file-scope vars (and every transitive require_once) bind to $GLOBALS. Lets
+  unmodified require_once apps (WordPress $menu/$submenu/$_wp_submenu_nopriv) render
+  in coroutine-legacy in-process mode. Mirrors zend_execute()'s top-frame path,
+  forcing the global symbol table; Valgrind-clean.
+- reset_to_parent() is now bucket-stable: value-in-place reset (NEVER zend_hash_del),
+  so a live global-scope frame's INDIRECT CVs into EG(symbol_table) can't dangle
+  across a yield. The proven IS_REF write-through (global $wpdb survives its connect
+  yield) is unchanged. phpt 039 covers the primitive.
+
 0.3.25 — coroutine-legacy per-request state reset (completes the PHP-FPM
 "fresh process per request" contract for the require_once-legacy class):
 - zealphp_reset_request_statics(): re-initialise function-local static $x to its
