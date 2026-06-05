@@ -3546,6 +3546,58 @@ PHP_FUNCTION(zealphp_reset_request_statics)
  *
  * Gated by the framework on silent_redeclare and by the
  * ZEALPHP_CLASS_STATICS_RESET_DISABLE env kill-switch. */
+/* Reset a class's static properties IN PLACE — dtor each OWN static's live
+ * value and re-copy its declared default from default_static_members_table,
+ * WITHOUT freeing/reallocating the static_members_table array.
+ *
+ * Why in-place rather than zend_cleanup_internal_class_data (free + null map_ptr
+ * + lazy re-init at a NEW address): a cached ZEND_FETCH_STATIC_PROP slot in some
+ * op_array's run_time_cache holds a raw pointer INTO this table. The paired
+ * zealphp_reset_request_rtcaches() clears those slots — but it deliberately
+ * SKIPS snapshot functions/methods (treating their cached targets as
+ * process-stable). A snapshot function that reads a NON-snapshot class's static
+ * property has exactly such a slot, and freeing the table leaves it dangling ->
+ * the next read is a use-after-free (stale value at best; a wild Z_STRLEN -> a
+ * multi-TB alloc / SEGV under heap reuse at worst). Keeping the table at a
+ * STABLE address makes every cached slot — snapshot or not — keep pointing at a
+ * valid table holding the reset value, so the reset is self-sufficient and no
+ * longer coupled to rtcache-clearing completeness.
+ *
+ * Value semantics mirror zend_class_init_statics (a plain ZVAL_COPY from the
+ * template): scalars/arrays/typed-with-default reset to their default; a
+ * no-default typed static resets to UNDEF (correct "uninitialised" PHP-FPM
+ * parity — read-before-write throws, exactly as a fresh process would). Object
+ * statics run their __destruct here in the request coroutine's context (an I/O
+ * __destruct may yield), same as before. Inherited (IS_INDIRECT) slots are
+ * skipped — they point at the parent's live slot, which the parent's own
+ * in-place reset restores; the indirect pointer stays valid because the parent
+ * table's address is likewise stable. */
+static void zealphp_reset_class_statics_inplace(zend_class_entry *ce)
+{
+    zval *live = CE_STATIC_MEMBERS(ce);
+    if (!live) {
+        return;
+    }
+    int n = ce->default_static_members_count;
+    for (int i = 0; i < n; i++) {
+        zval *dst = &live[i];
+        /* Inherited static: live slot indirects to the parent's slot. Leave it;
+         * the parent's own reset owns the value, and the address is stable. */
+        if (Z_TYPE_P(dst) == IS_INDIRECT) {
+            continue;
+        }
+        zval *tmpl = &ce->default_static_members_table[i];
+        if (Z_TYPE_P(tmpl) == IS_INDIRECT) {
+            continue; /* defensive — template marks it inherited */
+        }
+        zval fresh;
+        ZVAL_COPY(&fresh, tmpl);   /* default copy (refcount-correct; UNDEF ok) */
+        zval old = *dst;
+        ZVAL_COPY_VALUE(dst, &fresh);
+        zval_ptr_dtor(&old);       /* release prior value (runs object __destruct) */
+    }
+}
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_class_statics, 0, 0, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
@@ -3573,12 +3625,12 @@ PHP_FUNCTION(zealphp_reset_request_class_statics)
             && ce->default_static_members_count > 0
             && (!snap || !zend_hash_exists(&zealphp_snapshot_classes, cname))) {
             /* Only touch classes whose live static table is actually instantiated.
-             * zend_cleanup_internal_class_data nulls the map_ptr + frees the table,
-             * so the next access re-dups the template via zend_class_init_statics().
-             * (It re-checks this guard internally; the outer check keeps the count
-             * accurate and skips the call for never-accessed classes.) */
+             * Reset the values IN PLACE (keeping the table allocation + address)
+             * rather than zend_cleanup_internal_class_data's free + lazy re-init,
+             * so a cached ZEND_FETCH_STATIC_PROP slot (incl. a snapshot function's,
+             * which the rtcache reset skips) can't dangle into freed memory. */
             if (ZEND_MAP_PTR(ce->static_members_table) && CE_STATIC_MEMBERS(ce)) {
-                zend_cleanup_internal_class_data(ce);
+                zealphp_reset_class_statics_inplace(ce);
                 count++;
             }
         }
