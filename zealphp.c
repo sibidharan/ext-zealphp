@@ -1984,6 +1984,30 @@ PHP_FUNCTION(zealphp_coroutine_globals)
     RETURN_TRUE;
 }
 
+/* ── zealphp_globals_baseline_refresh(): bool ──────────────────────────
+ * Re-capture the parent $GLOBALS baseline from the CURRENT symbol table.
+ *
+ * The baseline is snapshotted once, at zealphp_coroutine_globals(true) activation
+ * time. Boot-time writes to $GLOBALS that land AFTER activation — e.g. an app
+ * bootstrap include (load.php) at worker start — are therefore NOT in the
+ * baseline. They survive for the first request coroutine (which still sees the
+ * live symbol table) but vanish for every subsequent one the moment a yield
+ * resets $GLOBALS to that stale baseline (#26: only 1/N concurrent requests saw
+ * the boot global). Calling this once after boot completes folds those writes
+ * into the baseline, so every request coroutine sees them.
+ *
+ * No-op (returns false) when the globals-isolation feature isn't active. */
+PHP_FUNCTION(zealphp_globals_baseline_refresh)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    if (!zealphp_coro_globals_hooks_active) {
+        RETURN_FALSE;
+    }
+    zealphp_globals_parent_clear();
+    zealphp_globals_parent_snapshot();
+    RETURN_TRUE;
+}
+
 /* Stage 5 — per-coroutine function-local static isolation (opt-in).
  * Sets the flag the on_yield/on_resume hooks check. The scheduler callbacks
  * are normally already chained (coroutine-legacy enables superglobals/globals
@@ -3460,6 +3484,9 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_coroutine_globals_request_end, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_globals_baseline_refresh, 0, 0, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_process_state_snapshot, 0, 0, IS_VOID, 0)
 ZEND_END_ARG_INFO()
 
@@ -3880,6 +3907,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_globals_snapshot,       arginfo_zealphp_globals_snapshot)
     PHP_FE(zealphp_globals_clean,          arginfo_zealphp_globals_clean)
     PHP_FE(zealphp_coroutine_globals_request_end, arginfo_zealphp_coroutine_globals_request_end)
+    PHP_FE(zealphp_globals_baseline_refresh, arginfo_zealphp_globals_baseline_refresh)
     PHP_FE(zealphp_process_state_snapshot, arginfo_zealphp_process_state_snapshot)
     PHP_FE(zealphp_process_state_clean,    arginfo_zealphp_process_state_clean)
     PHP_FE(zealphp_protect_classes,        arginfo_zealphp_protect_classes)
