@@ -221,6 +221,15 @@ static HashTable zealphp_request_constants;
 static bool zealphp_define_hooked = false;
 static zif_handler zealphp_orig_define_handler = NULL;
 
+/* #9: request constants removed by zealphp_constants_clear() in COROUTINE mode are
+ * ORPHANED (removed from EG without freeing) and parked here per coroutine id, then
+ * freed at coroutine close — an immediate free mid-request dangles a cached
+ * FETCH_CONSTANT run_time_cache slot (process-shared under opcache) that still
+ * points at the struct → use-after-free. Mirrors the deferral
+ * zealphp_constants_snapshot_restore() already uses on the on_resume path. Value =
+ * array of (zend_long)(uintptr_t) zend_constant*. */
+static HashTable zealphp_coro_constant_deferred;
+
 /* ── Per-request $GLOBALS isolation ─────────────────────────────────── */
 
 /* Snapshot of EG(symbol_table) keys at boot. Keys added after the snapshot
@@ -1294,6 +1303,22 @@ static void zealphp_on_close(void *arg)
     zend_hash_index_del(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
+    /* #9: free the request constants that zealphp_constants_clear() ORPHANED on
+     * this coroutine — now safe, the request has ended and its run_time_cache is
+     * gone, so no FETCH_CONSTANT can read the freed struct. */
+    {
+        zval *cdef = zend_hash_index_find(&zealphp_coro_constant_deferred, (zend_ulong)(uintptr_t)arg);
+        if (cdef && Z_TYPE_P(cdef) == IS_ARRAY) {
+            zval *cv;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(cdef), cv) {
+                zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(cv);
+                if (c) {
+                    zealphp_free_orphan_constant(c);
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+        zend_hash_index_del(&zealphp_coro_constant_deferred, (zend_ulong)(uintptr_t)arg);
+    }
     zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_fn_statics_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -2288,13 +2313,54 @@ static ZEND_NAMED_FUNCTION(zealphp_define_intercept)
 PHP_FUNCTION(zealphp_constants_clear)
 {
     zend_string *name;
+    long cid = os_get_cid ? os_get_cid() : -1;
+
+    if (cid < 0) {
+        /* Sync / non-coroutine mode: no coroutine close to defer to, and no
+         * cross-coroutine run_time_cache sharing — free immediately (unchanged). */
+        ZEND_HASH_FOREACH_STR_KEY(&zealphp_request_constants, name) {
+            if (name) {
+                /* zend_hash_del on EG(zend_constants) removes AND frees the
+                 * constant. Case-sensitive constants use the exact name as key. */
+                zend_hash_del(EG(zend_constants), name);
+            }
+        } ZEND_HASH_FOREACH_END();
+        zend_hash_clean(&zealphp_request_constants);
+        return;
+    }
+
+    /* #9: coroutine mode — ORPHAN each request constant (remove from
+     * EG(zend_constants) WITHOUT freeing) and park its pointer for deferral, so
+     * the actual free happens at coroutine close (zealphp_on_close), after the
+     * request's run_time_cache is gone. An immediate free here would dangle a
+     * cached FETCH_CONSTANT slot (process-shared under opcache) that still points
+     * at the struct → use-after-free. Mirrors zealphp_constants_snapshot_restore. */
+    zval *slot = zend_hash_index_find(&zealphp_coro_constant_deferred, (zend_ulong)cid);
+    if (!slot) {
+        zval arr;
+        array_init(&arr);
+        slot = zend_hash_index_update(&zealphp_coro_constant_deferred, (zend_ulong)cid, &arr);
+    }
+    HashTable *deferred = Z_ARRVAL_P(slot);
+
+    /* Suppress the destructor so zend_hash_del REMOVES the bucket without freeing
+     * the zend_constant — i.e. orphan it, address intact (same trick as
+     * zealphp_constants_snapshot_save). */
+    dtor_func_t orig_dtor = EG(zend_constants)->pDestructor;
+    EG(zend_constants)->pDestructor = NULL;
     ZEND_HASH_FOREACH_STR_KEY(&zealphp_request_constants, name) {
         if (name) {
-            /* zend_hash_del on EG(zend_constants) removes the constant.
-             * Case-sensitive constants use the exact name as key. */
-            zend_hash_del(EG(zend_constants), name);
+            zend_constant *c = zend_hash_find_ptr(EG(zend_constants), name);
+            if (c) {
+                zend_hash_del(EG(zend_constants), name);   /* orphan (no free) */
+                zval p;
+                ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
+                zend_hash_next_index_insert(deferred, &p);
+            }
         }
     } ZEND_HASH_FOREACH_END();
+    EG(zend_constants)->pDestructor = orig_dtor;
+
     zend_hash_clean(&zealphp_request_constants);
 }
 
@@ -3017,6 +3083,7 @@ PHP_MINIT_FUNCTION(zealphp)
 
     zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
