@@ -1110,6 +1110,10 @@ static void zealphp_globals_snapshot_delete(long cid)
     zend_hash_index_del(&zealphp_coro_globals_tombstones, (zend_ulong)cid);
 }
 
+/* Defined below (~1713); forward-declared so snapshot_save()/snapshot_restore()
+ * can reuse the CV-cache-safe in-place superglobal write for the #15 reset/clear. */
+static void zealphp_set_superglobal(const char *name, size_t name_len, zval *value);
+
 static void zealphp_snapshot_save(long cid)
 {
     /* Guard: EG(symbol_table) may be invalid during coroutine teardown.
@@ -1138,6 +1142,24 @@ static void zealphp_snapshot_save(long cid)
         }
     }
     zend_hash_index_update(&zealphp_coro_snapshots, (zend_ulong)cid, &snapshot);
+
+    /* #15: AFTER snapshotting this coroutine's superglobals, reset the live EG
+     * slots to empty — the same post-save reset $GLOBALS isolation does via
+     * reset_to_parent. Without this, a value this coroutine left in the
+     * process-shared symbol table (e.g. $_SESSION) stays live while it is
+     * suspended, so the NEXT coroutine's snapshot_save captures it as ITS OWN →
+     * cross-coroutine session leak. This coroutine's values are re-applied from
+     * the snapshot on its resume, so the round-trip is preserved; peers running
+     * in between start from a clean slate. Superglobals are per-request, so the
+     * clean baseline is "empty" (each request repopulates its own). */
+    for (const char **n = sg_names; *n; n++) {
+        if (zend_hash_str_find(&EG(symbol_table), *n, strlen(*n))) {
+            zval empty;
+            array_init(&empty);
+            zealphp_set_superglobal(*n, strlen(*n), &empty);
+            zval_ptr_dtor(&empty);
+        }
+    }
 }
 
 static void zealphp_snapshot_restore(long cid)
@@ -1168,6 +1190,15 @@ static void zealphp_snapshot_restore(long cid)
                 ZVAL_DUP(&copy, val);
                 zend_hash_str_add_new(&EG(symbol_table), *n, strlen(*n), &copy);
             }
+        } else if (zend_hash_str_find(&EG(symbol_table), *n, strlen(*n))) {
+            /* #15 safety net: this superglobal is NOT in our snapshot but a value
+             * is live in EG — a peer set it and finished without yielding (so the
+             * post-save reset never ran for it). Clear it so we don't inherit the
+             * peer's value (the set-and-finish-without-yield leak window). */
+            zval empty;
+            array_init(&empty);
+            zealphp_set_superglobal(*n, strlen(*n), &empty);
+            zval_ptr_dtor(&empty);
         }
     }
 }
