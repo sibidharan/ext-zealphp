@@ -3022,8 +3022,9 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
              * from under the live engine -> "Invalid read of size 8 in
              * _object_properties_init" (Valgrind: freed by destroy_zend_class <-
              * compile_file_hook, used by php_*_create_object). ASAN can't see it
-             * (Zend-MM efree). Orphan the dup instead (bounded; reclaimed at
-             * request/worker teardown) rather than corrupt. Non-autoload
+             * (Zend-MM efree). Orphan the dup instead -- it then LEAKS until the
+             * worker recycles (NOT reclaimed at request-end; #12 +
+             * docs/issue-12-oparray-cache-design.md) rather than corrupt. Non-autoload
              * re-includes resolve the class by name to the winner at runtime, so
              * their losers remain safe to destroy — EXCEPT inherited ones (below). */
             zend_class_entry *lce = (zend_class_entry *)ptr;
@@ -3040,8 +3041,12 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
              * that takes down WordPress and any require_once-bootstrap inherited class
              * under coroutine-legacy (ASAN-pinned PHP 8.4: 300 `class X extends Y`
              * re-executed via Stage 7 crash -> clean with this guard; 300 FLAT classes
-             * unaffected either way; 33/33 phpt green; RSS flat over a 120-req burst ->
-             * orphaning is bounded, reclaimed at request-end). A FLAT loser (no parent/
+             * unaffected either way; 33/33 phpt green). The orphaned INHERITED loser
+             * is NOT reclaimed: it leaks ~4-7 KB per re-exec until the worker recycles
+             * (#12 -- proven unfixable in-place across 5 ASAN iterations; the loser is
+             * always early-bound against the live winner via EG, so any free corrupts
+             * the winner. Real fix scoped in docs/issue-12-oparray-cache-design.md).
+             * Bounded by max_requests, NOT by request boundary. A FLAT loser (no parent/
              * iface/trait) is self-contained, so it stays safe to destroy. */
             bool zealphp_inherited_loser =
                 (lce->parent != NULL) || (lce->parent_name != NULL)
