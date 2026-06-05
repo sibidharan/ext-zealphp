@@ -909,8 +909,16 @@ static void zealphp_globals_parent_snapshot(void)
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) {
             continue;
         }
-        if (!zealphp_globals_isolatable(val)) continue;  /* leave objects/resources shared */
-        zval *uv = Z_ISREF_P(val) ? Z_REFVAL_P(val) : val;  /* deref global-keyword refs */
+        /* #10/#14: a materialised CV / Stage-8 global-scope var is an IS_INDIRECT
+         * bucket pointing at a live frame CV slot — capture the pointed-to VALUE,
+         * not the indirection wrapper (DUP-ing the wrapper stores a dangling frame
+         * pointer and never the real baseline, so reset_to_parent later can't
+         * restore it). */
+        zval *uv = val;
+        if (Z_TYPE_P(uv) == IS_INDIRECT) uv = Z_INDIRECT_P(uv);
+        if (Z_ISREF_P(uv)) uv = Z_REFVAL_P(uv);             /* deref global-keyword refs */
+        if (Z_TYPE_P(uv) == IS_UNDEF) continue;             /* indirect to an unset CV */
+        if (!zealphp_globals_isolatable(uv)) continue;      /* leave objects/resources shared */
         zval copy;
         ZVAL_DUP(&copy, uv);
         zend_hash_add_new(&zealphp_coro_globals_parent, key, &copy);
@@ -951,10 +959,25 @@ static void zealphp_globals_reset_to_parent(void)
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, rv) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
-        if (!zealphp_globals_isolatable_obj(rv)) continue;
-        zval *target = Z_ISREF_P(rv) ? Z_REFVAL_P(rv) : rv;
+        /* #10/#14: deref an IS_INDIRECT bucket to the real CV slot so we reset the
+         * VALUE in place, never the indirection wrapper. Leaving the wrapper
+         * untouched left a `global $x = <scalar>` write unreset → the cross-coroutine
+         * and cross-request leak. */
+        bool indirect = (Z_TYPE_P(rv) == IS_INDIRECT);
+        zval *target = rv;
+        if (indirect) target = Z_INDIRECT_P(target);
+        if (Z_ISREF_P(target)) target = Z_REFVAL_P(target);
+        if (!zealphp_globals_isolatable_obj(target)) continue;
         zval *pv = zealphp_coro_globals_parent_set
             ? zend_hash_find(&zealphp_coro_globals_parent, key) : NULL;
+        /* #10/033: an IS_INDIRECT slot points at a MASTER-frame CV. If it is NOT in
+         * the parent baseline it is the master's own variable (created after
+         * isolation was enabled, or a boot-loop local) — NOT a request global — so
+         * leave it untouched; NULL-ing it would wipe master state mid-run. A request
+         * global (`global $x` / $GLOBALS[]) is a plain / IS_REFERENCE slot and still
+         * resets to NULL below; an IS_INDIRECT that IS in the baseline (a master
+         * global a request overwrote) still resets to the baseline value. */
+        if (!pv && indirect) continue;
         zval old;
         ZVAL_COPY_VALUE(&old, target);
         if (pv) {
@@ -1007,12 +1030,23 @@ static void zealphp_globals_snapshot_save(long cid)
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, val) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
-        if (!zealphp_globals_isolatable_obj(val)) continue;  /* resources stay shared; objects isolated + drained at request-end */
-        zval *uv = Z_ISREF_P(val) ? Z_REFVAL_P(val) : val;  /* deref global-keyword refs */
-        if (zealphp_coro_globals_parent_set) {
-            zval *pv = zend_hash_find(&zealphp_coro_globals_parent, key);
-            if (pv && zealphp_globals_zval_identical(uv, pv)) continue;
-        }
+        /* #10/#14: deref an IS_INDIRECT bucket (materialised CV / Stage-8 global) to
+         * its real value BEFORE comparing/capturing — DUP-ing the indirection wrapper
+         * into the delta stores a dangling frame pointer that severs/corrupts the CV
+         * on restore. */
+        bool indirect = (Z_TYPE_P(val) == IS_INDIRECT);
+        zval *uv = val;
+        if (indirect) uv = Z_INDIRECT_P(uv);
+        if (Z_ISREF_P(uv)) uv = Z_REFVAL_P(uv);  /* deref global-keyword refs */
+        if (Z_TYPE_P(uv) == IS_UNDEF) continue;  /* indirect to an unset CV — nothing to capture */
+        if (!zealphp_globals_isolatable_obj(uv)) continue;  /* resources stay shared; objects isolated + drained at request-end */
+        zval *pv = zealphp_coro_globals_parent_set
+            ? zend_hash_find(&zealphp_coro_globals_parent, key) : NULL;
+        /* #10/033: a master-frame CV (IS_INDIRECT) not in the baseline is the
+         * master's own variable, not a request global — don't capture it into this
+         * coroutine's delta (it would be re-applied on resume and reset on yield). */
+        if (!pv && indirect) continue;
+        if (pv && zealphp_globals_zval_identical(uv, pv)) continue;
         zval copy;
         ZVAL_DUP(&copy, uv);  /* deep-copy: no COW alias shared across coroutines (esp. arrays) */
         zend_hash_add_new(Z_ARRVAL(delta), key, &copy);
@@ -1077,7 +1111,12 @@ static void zealphp_globals_snapshot_restore(long cid)
                  * coroutine's CV alias from the symbol table and dangle/free the
                  * wrapper it still holds — a crash under concurrency. Mirrors the
                  * Stage-1 superglobal restore. */
-                zval *slot = Z_ISREF_P(existing) ? Z_REFVAL_P(existing) : existing;
+                /* #10/#14: also deref an IS_INDIRECT bucket (materialised CV /
+                 * Stage-8 global) to its real slot — ZVAL_DUP over the indirection
+                 * wrapper would sever the live frame CV from the symbol table. */
+                zval *slot = existing;
+                if (Z_TYPE_P(slot) == IS_INDIRECT) slot = Z_INDIRECT_P(slot);
+                if (Z_ISREF_P(slot)) slot = Z_REFVAL_P(slot);
                 zval old;
                 ZVAL_COPY_VALUE(&old, slot);
                 ZVAL_DUP(slot, val);
