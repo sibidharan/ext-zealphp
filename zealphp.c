@@ -2561,6 +2561,13 @@ static int zealphp_include_eval_handler(zend_execute_data *execute_data)
                || opline->op1_type == IS_VAR) {
         inc_filename = EX_VAR(opline->op1.var);
     }
+    /* #13: a CV/VAR operand can be IS_REFERENCE (`$ref = 'f.php'; require_once $ref;`).
+     * Deref before the IS_STRING gate — otherwise the reference fails the gate,
+     * the file is dispatched to the standard cached no-op, and Stage-7 never
+     * re-executes it (its per-request init code silently runs once). */
+    if (inc_filename) {
+        ZVAL_DEREF(inc_filename);
+    }
     if (!inc_filename || Z_TYPE_P(inc_filename) != IS_STRING) {
         return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
     }
@@ -2585,13 +2592,22 @@ static int zealphp_include_eval_handler(zend_execute_data *execute_data)
      * set of files already force-re-included this request, keyed by coroutine
      * id; if we've already re-included this file this request, leave it cached
      * (standard require_once no-op) to preserve within-request idempotency. */
-    if (os_get_cid) {
-        zend_long cid = os_get_cid();
-        zval *seen = zend_hash_index_find(&zealphp_coro_reincluded, (zend_ulong)cid);
+    /* #11: run the re-include guard in BOTH coroutine and sync (non-OpenSwoole)
+     * modes. The eviction below recurses unbounded on a self-/circular
+     * require_once if unguarded; the guard used to be gated on os_get_cid, so
+     * sync mode (os_get_cid == NULL) got the eviction with NO protection → a
+     * file that require_once's itself recursed until the heap exhausted (OOM).
+     * Coroutine buckets stay keyed by cid (cleared on coroutine close); sync mode
+     * uses a single bucket (key 0). Include isolation otherwise needs the
+     * coroutine scheduler, so a sync context is one logical request per process
+     * (CLI / test), where key 0 gives correct once-per-request idempotency. */
+    {
+        zend_ulong reinc_key = os_get_cid ? (zend_ulong) os_get_cid() : 0;
+        zval *seen = zend_hash_index_find(&zealphp_coro_reincluded, reinc_key);
         if (!seen) {
             zval z;
             array_init(&z);
-            seen = zend_hash_index_update(&zealphp_coro_reincluded, (zend_ulong)cid, &z);
+            seen = zend_hash_index_update(&zealphp_coro_reincluded, reinc_key, &z);
         }
         HashTable *seen_ht = Z_ARRVAL_P(seen);
         if (zend_hash_exists(seen_ht, resolved)) {
@@ -2970,9 +2986,11 @@ PHP_FUNCTION(zealphp_include_isolation)
 PHP_FUNCTION(zealphp_include_isolation_reset)
 {
     ZEND_PARSE_PARAMETERS_NONE();
-    if (os_get_cid) {
-        zend_hash_index_del(&zealphp_coro_reincluded, (zend_ulong)os_get_cid());
-    }
+    /* Clear the current request's force-re-included set. Mirror the #11 keying:
+     * coroutine bucket via os_get_cid(), sync (non-OpenSwoole) bucket via key 0,
+     * so the sync re-include guard is reset at the request boundary too (without
+     * this, sync mode would re-include a file at most once per worker lifetime). */
+    zend_hash_index_del(&zealphp_coro_reincluded, (zend_ulong)(os_get_cid ? os_get_cid() : 0));
     RETURN_TRUE;
 }
 
@@ -3649,7 +3667,14 @@ PHP_FUNCTION(zealphp_require_global)
     zend_op_array *op_array = zend_compile_file(&fh, ZEND_REQUIRE);
     zend_destroy_file_handle(&fh);
 
-    if (!op_array) { RETURN_FALSE; }
+    if (!op_array) {
+        /* #18: a parse error returns a NULL op_array AND sets an exception.
+         * RETURN_FALSE while EG(exception) is live returns a value with a
+         * pending exception (a latent ZEND_ASSERT in a debug build). Propagate
+         * the exception instead of masking it with a false return. */
+        if (EG(exception)) { RETURN_THROWS(); }
+        RETURN_FALSE;
+    }
     if (EG(exception)) {
         destroy_op_array(op_array);
         efree_size(op_array, sizeof(zend_op_array));
@@ -3665,7 +3690,25 @@ PHP_FUNCTION(zealphp_require_global)
     ZVAL_UNDEF(&result);
 
     zend_init_code_execute_data(call, op_array, &result);
-    zend_execute_ex(call);
+
+    /* #17: guard the execute against a zend_bailout (E_ERROR / OOM / exit())
+     * inside the required file. A bare longjmp would skip the cleanup below and
+     * leak the op_array + call frame. On bailout free the op_array we own and
+     * re-raise; let the engine's bailout unwind reclaim the VM-stack frame
+     * (manually freeing it against the bailout's stack state could double-free). */
+    volatile int zealphp_bailed = 0;
+    zend_try {
+        zend_execute_ex(call);
+    } zend_catch {
+        zealphp_bailed = 1;
+    } zend_end_try();
+
+    if (zealphp_bailed) {
+        destroy_op_array(op_array);
+        efree_size(op_array, sizeof(zend_op_array));
+        zend_bailout();
+    }
+
     zend_vm_stack_free_call_frame(call);
 
     destroy_op_array(op_array);
