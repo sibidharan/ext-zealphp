@@ -1,0 +1,161 @@
+# Issue #12 — Safe op_array cache: design scoping
+
+**Status:** design / not implemented · **Owner:** TBD · **Date:** 2026-06-05
+**Tracks:** [#12 — Orphaned inherited "loser" classes are never reclaimed](https://github.com/sibidharan/ext-zealphp/issues/12)
+
+This document scopes the **only genuinely viable fix** for the #12 leak and records
+the full investigation so the dead ends are not re-tread. It is a design task, not
+an implementation — the recommended route is a major engine-integration effort and
+should be costed before it is started.
+
+---
+
+## 1. Problem
+
+Under `coroutine-legacy` (Stage 7 `includeIsolation` + silent-redeclare), a
+`require_once`/`include`'d file that declares an **inherited** class (`extends` /
+`implements` / `use`) is **re-compiled every request**. The Stage-4 first-wins merge
+keeps the first definition (the "winner") and discards the re-compiled duplicate (the
+"loser"). For an inherited loser, destroying it corrupts the live winner, so v0.3.24
+**orphans** it instead — and the orphan is **never freed**.
+
+- **Leak rate:** ~4–7 KB per inherited-class re-exec (measured on PHP 8.4 + ASAN).
+- **Bound:** worker lifetime — RSS climbs until the worker recycles at `max_requests`.
+- **Who hits it:** `require_once`-bootstrap apps with inherited classes on a hot path
+  (WordPress, Drupal 7, MediaWiki, phpBB).
+
+## 2. Root cause (proven — do not re-litigate)
+
+The re-compiled inherited loser is **always early-bound against the live winner**.
+At compile-end, `zend_try_early_binding` (`Zend/zend_compile.c`) resolves the parent
+via **`EG(class_table)`** — where the winner lives — regardless of silent-redeclare's
+CG-table swap. So the loser's resolved inheritance (method op_arrays, default-property
+slots, property_info) **points into the winner's structures**. `destroy_zend_class`
+(or any sub-free) on the loser frees structures the winner still uses →
+`SEGV in zend_gc_addref / _object_properties_init` on the next `new` (the v0.3.24 crash).
+
+**The orphan-and-leak is the forced, correct tradeoff** — not a shortcut.
+
+### 2.1 Investigation log (5 ASAN iterations, all dead ends)
+
+| # | Approach | Result |
+|---|----------|--------|
+| 1 | Track loser → null `parent` → `destroy_zend_class` at request-end | **SEGV** (property table) |
+| 2 | + UNDEF the inherited default-property slots first | **SEGV** |
+| 3 | Free only the loser's *own* method op_arrays (`scope == lce`) | **SEGV** — even "own" methods share opcodes with the winner |
+| 4 | Force `ZEND_COMPILE_DELAYED_BINDING` during the compile | **No-op** — `zend_try_early_binding` still binds against EG; loser stays `linked=1` |
+| 5 | Separate `require_once` files (the real scenario), DELAYED_BINDING on | **Still `linked=1`** |
+
+The crash pointer in attempts 1–3 decoded to reused heap bytes (`"text/htm…"`),
+confirming a use-after-free of winner-shared structures. Attempt 4/5 instrumentation
+printed `loser linked=1 parent=<winner>` at merge time in every case.
+
+### 2.2 Why the obvious mitigations don't apply
+
+- **opcache:** measured only ~16% reduction (4366 → 3654 B/re-exec). opcache caches the
+  *op_array compile* but the bind into the scratch CG still creates the loser.
+- **Swapping `EG(class_table)` during compile** (so early-bind can't find the winner →
+  loser stays unlinked → safely destroyable): **forbidden** by the silent-redeclare
+  design invariant — "Stage 4 swaps CG only, NEVER EG; swapping EG corrupts coroutine
+  state" (load-bearing comment at the swap site). Off the table.
+
+## 3. The one genuine fix: don't re-compile
+
+If the file is **not re-compiled** on re-include, **no new loser CE is created** → no
+leak. This is exactly what opcache does (cache the op_array, reuse on hit). The
+challenge is doing it safely — the **removed Stage-6 cache** attempted it and caused a
+UAF.
+
+### 3.1 Why the naive cache (removed Stage-6) was a UAF
+
+> Stage-6 cached the compiled op_array and, on a later compile of the same file,
+> returned a `memcpy`'d shell with `(*shell->refcount)++`. **The engine destroys the
+> include op_array after executing it**, so the cached `refcount` pointer dangles — the
+> `++` is a use-after-free → worker SIGSEGV under load (phpMyAdmin, 50-app sweep).
+
+The lesson: an include op_array is **request-allocated and freed after execution**. A
+cache must make it **persistent** (engine won't free it) — a shallow copy can't.
+
+## 4. Design options
+
+### A. Persistent op_array cache (opcache-style) — **recommended, HIGH effort**
+On first compile of a redeclaration-prone file, deep-copy the op_array into a
+per-worker **persistent** allocation, mark it `ZEND_ACC_IMMUTABLE` (so the engine skips
+freeing it), and store it keyed by absolute path. On re-include, return the persistent
+op_array — **no re-compile, no loser, no leak**.
+- **Pros:** the proven mechanism — opcache's `zend_persist` does exactly this.
+- **Cons:** `zend_persist` is large + PHP-version-specific (deep-copies op_array,
+  literals, CVs, run-time cache, classes, functions). Replicating a correct scoped
+  subset is a real project; immutable op_arrays have strict requirements (interned
+  strings, no per-request run-time cache, etc.). Get it wrong → corruption.
+- **Open question:** how much of `zend_persist` must be replicated vs. can engine
+  helpers be reused? Can we persist only the **classes** the file declares (the leak
+  source) and leave the rest request-bound?
+
+### B. Defer to opcache — **MEDIUM-HIGH effort, conditional**
+When opcache is loaded, let it own the cache; make silent-redeclare **skip the bind
+into the scratch CG on a cache hit** (the file's classes already exist as winners in
+EG, so there is nothing to first-wins-merge → no loser).
+- **Pros:** reuses opcache's proven persistence; no in-extension persist.
+- **Cons:** opcache's bind is internal to its compile hook — intercepting "this was a
+  cache hit, don't create losers" cleanly is non-trivial. Requires opcache present
+  (+ `dups_fix`, + the patched function-dups for the function case). Today opcache +
+  silent-redeclare still leaks because the scratch bind runs regardless.
+- **Open question:** can the hook detect a warm opcache hit (e.g. op_array flagged
+  `ZEND_ACC_IMMUTABLE` / from SHM) and short-circuit the Stage-4 merge for it?
+
+### C. Per-class persistence — folds into A
+Mark the re-compiled CEs immutable so the engine won't free them and reuse on
+re-include. Request-compiled CEs are **not** immutable-safe (request-allocated
+strings/tables), so this needs the same persist work as A. **Not separately viable.**
+
+### D. Skip the include for pure class-declaration files — **MEDIUM effort, narrow**
+If a file's only top-level effect is class declarations **and** all its classes already
+exist in EG, skip the re-include entirely (return a no-op op_array).
+- **Cons:** unsafe for **mixed** files (require_once-bootstrap interleaves code +
+  classes — the exact #12 population). Reliable "pure class file" detection is itself
+  a static-analysis problem. Limited applicability; high false-negative risk.
+
+## 5. Recommendation
+
+1. **Short term (ship now):** accept the bounded leak. Document it honestly (correct
+   the "reclaimed at request-end" comments to "bounded by worker lifetime"), recommend
+   tuning `max_requests` for `require_once`-legacy workloads, and note the EG-swap
+   constraint. Ship 0.3.33 with the other fixes (#26 etc.).
+2. **Real fix (scoped here):** pursue **Option A** (persistent op_array cache) as a
+   dedicated project, with **Option B** evaluated first as a cheaper conditional win
+   for opcache deployments. Both are behind an **opt-in flag, default off**, until
+   proven on the full validation matrix.
+
+## 6. Implementation + validation plan (for whichever option)
+
+- Land behind a fluent/env flag (`App::oparrayCache(bool)` / `ZEALPHP_OPARRAY_CACHE`),
+  **default off**.
+- **Correctness gates (all required):**
+  - Leak repro: RSS **flat** over ≥500 inherited-class re-execs (both same-file and
+    separate-`require_once` shapes).
+  - **ASAN + Valgrind clean** on a 120-request burst.
+  - Full ext `phpt` suite green; no regression in the silent-redeclare / Stage-4 /
+    Stage-7 tests.
+  - The **50-app sweep** + WordPress public/login/comment paths under `coroutine-legacy`
+    — no new crashes, RSS bounded.
+  - Bidirectional: confirm the cache is **HIT** (no re-compile — instrument the compile
+    hook) **and** that the winner + all its instances behave identically.
+- **Rollback:** the flag default-off means zero behaviour change for existing apps; the
+  orphan-leak path remains the fallback.
+
+## 7. Risks / open questions
+
+- A: scope of `zend_persist` replication; immutable-op_array invariants on 8.3/8.4/8.5;
+  per-worker persistent allocation lifetime + teardown.
+- B: detecting a warm opcache hit from the hook; opcache version coupling; behaviour
+  without `dups_fix` / the function-dups patch.
+- Both: interaction with the existing **Stage-4 merge** and the **Stage-3
+  `DECLARE_CLASS` / `DECLARE_CLASS_DELAYED` handlers**; coroutine-safety of any new
+  per-worker cache (must not be crossed by a coroutine switch mid-compile, same
+  invariant that governs the CG swap).
+
+---
+
+*Companion analysis: the leak, the entanglement proof, and the 5-iteration log are
+also summarised on issue #12.*
