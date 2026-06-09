@@ -44,6 +44,11 @@ Co::run(function () use ($realA, $realB, $base, $wrongA, $wrongB, $leaked, $yiel
     $wg = new Channel(3);
     go(function () use ($realA, $wrongA, $yield, $wg) {
         chdir($realA);
+        zealphp_superglobals_owner(); // the request-root claim the framework makes
+        // #31-family pin: a fire-and-forget child's yield must not steal the
+        // owner's cwd (pre-0.3.39 it re-parked the parent to the baseline).
+        go(function () use ($yield) { $yield(); });
+        if (getcwd() !== $realA) { $wrongA->add(1); }
         for ($i = 0; $i < 3; $i++) {
             $yield();
             if (getcwd() !== $realA) { $wrongA->add(1); }

@@ -40,7 +40,12 @@ $done = new Channel(2);
 
 Co::run(function () use (&$results, $done, $alt) {
     go(function () use (&$results, $done, $alt) {
+        zealphp_superglobals_owner(); // the request-root claim the framework makes
         setlocale(LC_ALL, $alt);
+        // #31-family pin: a fire-and-forget child's yield must not steal the
+        // owner's locale (pre-0.3.39 it re-parked the parent to the baseline).
+        go(function () { zp055_yield(2); });
+        if (setlocale(LC_ALL, '0') !== $alt) { $results['wrong'] = ($results['wrong'] ?? 0) + 1; }
         for ($i = 0; $i < 3; $i++) {
             zp055_yield(5);
             if (setlocale(LC_ALL, '0') !== $alt) { $results['wrong'] = ($results['wrong'] ?? 0) + 1; }
