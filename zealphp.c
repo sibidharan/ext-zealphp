@@ -528,7 +528,7 @@ static void zealphp_cwd_snapshot_save(zend_long cid)
     zend_hash_index_update(&zealphp_coro_cwd_snapshots, (zend_ulong)cid, &z);
     /* Re-park the process at the baseline so peers — and brand-new coroutines,
      * which never pass through on_resume with an entry — start clean. */
-    VCWD_CHDIR(zealphp_cwd_baseline);
+    if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do mid-switch */ }
 }
 
 static void zealphp_cwd_snapshot_restore(zend_long cid)
@@ -536,7 +536,7 @@ static void zealphp_cwd_snapshot_restore(zend_long cid)
     if (!zealphp_cwd_isolation_active) return;
     zval *z = zend_hash_index_find(&zealphp_coro_cwd_snapshots, (zend_ulong)cid);
     if (!z || Z_TYPE_P(z) != IS_STRING) return;
-    VCWD_CHDIR(Z_STRVAL_P(z));
+    if (VCWD_CHDIR(Z_STRVAL_P(z)) != 0) { /* dir gone — nothing to do mid-switch */ }
 }
 
 static void zealphp_cwd_snapshot_delete(zend_long cid)
@@ -547,7 +547,7 @@ static void zealphp_cwd_snapshot_delete(zend_long cid)
          * Re-park the process so the next request starts at the baseline. */
         char buf[MAXPATHLEN];
         if (VCWD_GETCWD(buf, sizeof(buf)) && strcmp(buf, zealphp_cwd_baseline) != 0) {
-            VCWD_CHDIR(zealphp_cwd_baseline);
+            if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do mid-switch */ }
         }
     }
 }
@@ -1208,11 +1208,38 @@ static void zealphp_globals_snapshot_delete(long cid)
  * can reuse the CV-cache-safe in-place superglobal write for the #15 reset/clear. */
 static void zealphp_set_superglobal(const char *name, size_t name_len, zval *value);
 
+/* Superglobal OWNERSHIP gating (the go()-child steal — zealphp#332 / #2
+ * residual): the live superglobals belong to ONE coroutine — the request
+ * root that populated them (zealphp_request_input_set /
+ * zealphp_superglobals_owner) or whose resume last restored them. A CHILD
+ * coroutine spawned mid-request (`go()` + first yield — the async-log /
+ * fire-and-forget pattern) must NOT snapshot-and-clear the live state on
+ * ITS yield: that strands the request's superglobals under the child's key
+ * and the parent — which never yielded, so nothing ever restores for it —
+ * continues with EMPTY superglobals (observed: $_SERVER 22→0 keys,
+ * REQUEST_METHOD gone → 501 dispatch, $_SESSION wiped → session-write loss).
+ * owner==0 keeps the legacy first-yielder-claims behaviour for callers that
+ * never declare ownership (raw phpt tests, non-framework use). os_get_cid()
+ * is reliable in on_yield/PHP context but NOT in on_resume, so the owner cid
+ * is stored alongside each snapshot and re-established on restore. */
+static long zealphp_sg_owner_cid = 0;
+/* snapshot key (coroutine ptr cast) → IS_LONG owner cid, written at save time. */
+static HashTable zealphp_coro_sg_owner_cids;
+
 static void zealphp_snapshot_save(long cid)
 {
     /* Guard: EG(symbol_table) may be invalid during coroutine teardown.
      * Check that the table has a valid nTableMask (non-zero when initialized). */
     if (!EG(symbol_table).nTableMask) return;
+
+    /* Owner gate: a non-owner coroutine (a go() child) yielding must leave
+     * the live superglobals alone — they belong to its parent request. */
+    if (zealphp_sg_owner_cid > 0 && os_get_cid) {
+        long zealphp_cur_cid = os_get_cid();
+        if (zealphp_cur_cid > 0 && zealphp_cur_cid != zealphp_sg_owner_cid) {
+            return;
+        }
+    }
 
     zval snapshot;
     array_init(&snapshot);
@@ -1254,12 +1281,34 @@ static void zealphp_snapshot_save(long cid)
             zval_ptr_dtor(&empty);
         }
     }
+
+    /* Record which cid owns this snapshot (restore can't ask os_get_cid —
+     * it returns -1 there) and release the live-state ownership: the slots
+     * are empty now, nobody owns them until a restore / explicit claim. */
+    if (os_get_cid) {
+        long zealphp_rc = os_get_cid();
+        if (zealphp_rc > 0) {
+            zval zc;
+            ZVAL_LONG(&zc, zealphp_rc);
+            zend_hash_index_update(&zealphp_coro_sg_owner_cids, (zend_ulong)cid, &zc);
+        }
+    }
+    zealphp_sg_owner_cid = 0;
 }
 
 static void zealphp_snapshot_restore(long cid)
 {
     zval *snapshot = zend_hash_index_find(&zealphp_coro_snapshots, (zend_ulong)cid);
     if (!snapshot || Z_TYPE_P(snapshot) != IS_ARRAY) return;
+
+    /* Re-establish live-state ownership for the resumed owner so its later
+     * yields save+clear and children's yields keep their hands off. */
+    {
+        zval *zealphp_oc = zend_hash_index_find(&zealphp_coro_sg_owner_cids, (zend_ulong)cid);
+        if (zealphp_oc && Z_TYPE_P(zealphp_oc) == IS_LONG) {
+            zealphp_sg_owner_cid = Z_LVAL_P(zealphp_oc);
+        }
+    }
 
     for (const char **n = sg_names; *n; n++) {
         zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
@@ -1429,6 +1478,7 @@ static void zealphp_on_close(void *arg)
     zend_hash_index_del(&zealphp_coro_cg_swap_cl, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
+    zend_hash_index_del(&zealphp_coro_sg_owner_cids, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
     /* #9: free the request constants that zealphp_constants_clear() ORPHANED on
      * this coroutine — now safe, the request has ended and its run_time_cache is
@@ -1908,6 +1958,33 @@ PHP_FUNCTION(zealphp_request_input_set)
     zealphp_set_superglobal("_SERVER",  sizeof("_SERVER")-1,  server);
     zealphp_set_superglobal("_FILES",   sizeof("_FILES")-1,   files);
     zealphp_set_superglobal("_REQUEST", sizeof("_REQUEST")-1, request);
+
+    /* The populating coroutine owns the live superglobals from here — its
+     * go() children's yields must not snapshot-and-steal them (#332). */
+    if (os_get_cid) {
+        long zealphp_oc = os_get_cid();
+        if (zealphp_oc > 0) zealphp_sg_owner_cid = zealphp_oc;
+    }
+}
+
+/* zealphp_superglobals_owner(): bool
+ * Claims live-superglobal OWNERSHIP for the current coroutine (#332 — see
+ * the zealphp_sg_owner_cid block). For frameworks that populate the
+ * superglobals via plain PHP writes (no zealphp_request_input_set call):
+ * after this, only THIS coroutine's yields snapshot-and-clear the live
+ * state; a go() child's yield leaves it alone. Returns false outside a
+ * coroutine. */
+PHP_FUNCTION(zealphp_superglobals_owner)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    if (os_get_cid) {
+        long zealphp_oc = os_get_cid();
+        if (zealphp_oc > 0) {
+            zealphp_sg_owner_cid = zealphp_oc;
+            RETURN_TRUE;
+        }
+    }
+    RETURN_FALSE;
 }
 
 /* zealphp_superglobals_clear(): void
@@ -3297,6 +3374,7 @@ PHP_MINIT_FUNCTION(zealphp)
      * further down in this file. */
 
     zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_sg_owner_cids, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
@@ -3567,6 +3645,9 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_request_input_set, 0, 6,
     ZEND_ARG_TYPE_INFO(0, server, IS_ARRAY, 0)
     ZEND_ARG_TYPE_INFO(0, files, IS_ARRAY, 0)
     ZEND_ARG_TYPE_INFO(0, request, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_superglobals_owner, 0, 0, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_superglobals_clear, 0, 0, IS_VOID, 0)
@@ -4017,6 +4098,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_superglobals_set,       arginfo_zealphp_superglobals_set)
     PHP_FE(zealphp_request_input_set,      arginfo_zealphp_request_input_set)
     PHP_FE(zealphp_superglobals_clear,     arginfo_zealphp_superglobals_clear)
+    PHP_FE(zealphp_superglobals_owner,     arginfo_zealphp_superglobals_owner)
     PHP_FE(zealphp_superglobals_save,      arginfo_zealphp_superglobals_save)
     PHP_FE(zealphp_superglobals_restore,   arginfo_zealphp_superglobals_restore)
     PHP_FE(zealphp_coroutine_superglobals, arginfo_zealphp_coroutine_superglobals)
