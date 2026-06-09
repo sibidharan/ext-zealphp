@@ -1898,6 +1898,18 @@ PHP_FUNCTION(zealphp_superglobals_restore)
         zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
         if (val) {
             zealphp_set_superglobal(*n, strlen(*n), val);
+        } else if (zend_hash_str_find(&EG(symbol_table), *n, strlen(*n))) {
+            /* #15: removing restore. A superglobal ABSENT from this snapshot but
+             * LIVE in EG was populated by a peer coroutine — leaving it would let
+             * this coroutine read the peer's value (e.g. a sensitive $_SESSION
+             * token/role). Empty it so the restore is isolating, mirroring the
+             * scheduler restore's safety net (zealphp_snapshot_restore). Without
+             * this the userland save/restore twin leaked while the scheduler path
+             * (fixed in 0.3.31) did not. */
+            zval empty;
+            array_init(&empty);
+            zealphp_set_superglobal(*n, strlen(*n), &empty);
+            zval_ptr_dtor(&empty);
         }
     }
 }
