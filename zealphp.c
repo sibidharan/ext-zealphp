@@ -84,6 +84,18 @@ static HashTable zealphp_coro_constant_snapshots;
 /* Per-coroutine ini_set snapshots: coro_id → HashTable(name → string value) */
 static HashTable zealphp_coro_ini_snapshots;
 
+/* Per-coroutine working-directory snapshots (framework #323): coro_ptr → cwd
+ * string. chdir() is a PROCESS-level syscall, so under coroutine concurrency
+ * one request's chdir() leaks into every concurrently-running peer (and the
+ * framework's own executeFile() chdir-to-script-dir races itself). When
+ * active: on_yield saves the coroutine's cwd and re-parks the process at the
+ * worker baseline (so peers and brand-new coroutines start clean); on_resume
+ * restores the coroutine's own cwd; on_close drops the entry and re-parks
+ * the baseline (a coroutine can end while chdir'd, with no further yield). */
+static HashTable zealphp_coro_cwd_snapshots;
+static bool zealphp_cwd_isolation_active = false;
+static char zealphp_cwd_baseline[MAXPATHLEN] = {0};
+
 /* Per-coroutine static property snapshots: coro_id → HashTable(class_name → zval[]) */
 static HashTable zealphp_coro_static_snapshots;
 
@@ -495,6 +507,49 @@ static void zealphp_ini_snapshot_restore(long cid)
 static void zealphp_ini_snapshot_delete(long cid)
 {
     zend_hash_index_del(&zealphp_coro_ini_snapshots, (zend_ulong)cid);
+}
+
+/* ── Per-coroutine CWD isolation (framework #323) ─────────────────── */
+
+static void zealphp_cwd_snapshot_save(zend_long cid)
+{
+    if (!zealphp_cwd_isolation_active || zealphp_cwd_baseline[0] == '\0') return;
+    char buf[MAXPATHLEN];
+    if (!VCWD_GETCWD(buf, sizeof(buf))) return;
+    if (strcmp(buf, zealphp_cwd_baseline) == 0) {
+        /* This coroutine sits at the baseline — nothing to isolate. Drop any
+         * stale entry so its next resume is a no-op (it may have chdir'd on a
+         * previous slice and since returned home). */
+        zend_hash_index_del(&zealphp_coro_cwd_snapshots, (zend_ulong)cid);
+        return;
+    }
+    zval z;
+    ZVAL_STRING(&z, buf);
+    zend_hash_index_update(&zealphp_coro_cwd_snapshots, (zend_ulong)cid, &z);
+    /* Re-park the process at the baseline so peers — and brand-new coroutines,
+     * which never pass through on_resume with an entry — start clean. */
+    VCWD_CHDIR(zealphp_cwd_baseline);
+}
+
+static void zealphp_cwd_snapshot_restore(zend_long cid)
+{
+    if (!zealphp_cwd_isolation_active) return;
+    zval *z = zend_hash_index_find(&zealphp_coro_cwd_snapshots, (zend_ulong)cid);
+    if (!z || Z_TYPE_P(z) != IS_STRING) return;
+    VCWD_CHDIR(Z_STRVAL_P(z));
+}
+
+static void zealphp_cwd_snapshot_delete(zend_long cid)
+{
+    zend_hash_index_del(&zealphp_coro_cwd_snapshots, (zend_ulong)cid);
+    if (zealphp_cwd_isolation_active && zealphp_cwd_baseline[0] != '\0') {
+        /* A coroutine can END while chdir'd (no further yield to re-park it).
+         * Re-park the process so the next request starts at the baseline. */
+        char buf[MAXPATHLEN];
+        if (VCWD_GETCWD(buf, sizeof(buf)) && strcmp(buf, zealphp_cwd_baseline) != 0) {
+            VCWD_CHDIR(zealphp_cwd_baseline);
+        }
+    }
 }
 
 /* ── Level 2: Per-coroutine static property isolation ─────────────── */
@@ -1294,6 +1349,7 @@ static void zealphp_on_yield(void *arg)
     zealphp_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
     if (zealphp_fn_statics_active) {
         zealphp_fn_statics_snapshot_save((zend_long)(uintptr_t)arg);
@@ -1356,6 +1412,7 @@ static void zealphp_on_resume(void *arg)
     zealphp_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_restore((zend_long)(uintptr_t)arg);
+    zealphp_cwd_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_restore((zend_long)(uintptr_t)arg);
     if (zealphp_fn_statics_active) {
         zealphp_fn_statics_snapshot_restore((zend_long)(uintptr_t)arg);
@@ -1390,6 +1447,7 @@ static void zealphp_on_close(void *arg)
         zend_hash_index_del(&zealphp_coro_constant_deferred, (zend_ulong)(uintptr_t)arg);
     }
     zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_cwd_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_fn_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_globals_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -3137,6 +3195,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_include_isolation, 0, 0,
     ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_cwd_isolation, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
 PHP_FUNCTION(zealphp_include_isolation)
 {
     zend_bool on = 1;
@@ -3149,6 +3211,48 @@ PHP_FUNCTION(zealphp_include_isolation)
     bool prev = zealphp_include_isolation_enabled;
     if (!on_is_null) {
         zealphp_include_isolation_enabled = (bool)on;
+    }
+    RETURN_BOOL(prev);
+}
+
+/* Per-coroutine CWD isolation knob (framework #323). No-arg call returns the
+ * current state; bool arg sets it and returns the PREVIOUS state. Enabling
+ * captures the CURRENT process cwd as the worker baseline — call it from
+ * worker start (after any boot-time chdir), not mid-request. If the baseline
+ * can't be read the stage stays off (fail-closed: never chdir blindly). */
+PHP_FUNCTION(zealphp_cwd_isolation)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = zealphp_cwd_isolation_active;
+    if (!on_is_null) {
+        if ((bool)on && !zealphp_cwd_isolation_active) {
+            /* The stage rides the shared scheduler wrappers — install them if
+             * no other stage has yet (same guard as the superglobal/globals/
+             * statics activations). */
+            if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+                php_error_docref(NULL, E_WARNING,
+                    "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+                    "Per-coroutine CWD isolation requires OpenSwoole.");
+                RETURN_BOOL(prev);
+            }
+            if (!zealphp_coro_wrappers_installed && !zealphp_install_coro_hooks()) {
+                RETURN_BOOL(prev);
+            }
+            if (!VCWD_GETCWD(zealphp_cwd_baseline, sizeof(zealphp_cwd_baseline))) {
+                zealphp_cwd_baseline[0] = '\0';
+                RETURN_BOOL(prev); /* no baseline → stay off */
+            }
+        }
+        zealphp_cwd_isolation_active = (bool)on;
+        if (!(bool)on) {
+            zend_hash_clean(&zealphp_coro_cwd_snapshots);
+        }
     }
     RETURN_BOOL(prev);
 }
@@ -3196,6 +3300,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_cwd_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_reincluded, 256, NULL, ZVAL_PTR_DTOR, 0);
@@ -3931,6 +4036,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_silent_redeclare,       arginfo_zealphp_silent_redeclare)
     PHP_FE(zealphp_include_isolation,     arginfo_zealphp_include_isolation)
     PHP_FE(zealphp_include_isolation_reset, arginfo_zealphp_include_isolation_reset)
+    PHP_FE(zealphp_cwd_isolation,         arginfo_zealphp_cwd_isolation)
     PHP_FE(zealphp_reset_request_rtcaches, arginfo_zealphp_reset_request_rtcaches)
     PHP_FE(zealphp_reset_request_statics,  arginfo_zealphp_reset_request_statics)
     PHP_FE(zealphp_reset_request_class_statics, arginfo_zealphp_reset_request_class_statics)
