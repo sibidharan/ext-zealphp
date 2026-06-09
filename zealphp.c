@@ -25,6 +25,8 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <locale.h>
+#include <sys/stat.h>
 
 /* ZTS refusal. The extension uses process-wide `static` storage for state
  * (zealphp_request_tables_live, zealphp_silent_redeclare_enabled, the
@@ -95,6 +97,28 @@ static HashTable zealphp_coro_ini_snapshots;
 static HashTable zealphp_coro_cwd_snapshots;
 static bool zealphp_cwd_isolation_active = false;
 static char zealphp_cwd_baseline[MAXPATHLEN] = {0};
+
+/* Per-coroutine setlocale() isolation (the chdir-class process-state family):
+ * setlocale() is PROCESS-global (and affects strtolower/number/date formatting
+ * everywhere), so one request's locale change leaks into every concurrently
+ * running peer. Same shape as the CWD stage: save the coroutine's locale on
+ * yield (re-parking the baseline captured at enable time), restore on resume.
+ * glibc's setlocale(LC_ALL, NULL) returns a composite string when categories
+ * differ ("LC_CTYPE=…;LC_NUMERIC=…") and round-trips through
+ * setlocale(LC_ALL, composite) — both forms are handled transparently. */
+static HashTable zealphp_coro_locale_snapshots;
+static bool zealphp_locale_isolation_active = false;
+static char *zealphp_locale_baseline = NULL; /* strdup'd at enable time */
+
+/* Per-coroutine umask() isolation: umask is process-global file-mode state;
+ * a request's umask(0077) changes every peer's file creation mid-request.
+ * umask() is also the only READ API and it WRITES — which the save side
+ * exploits: setting the baseline returns the previous value in one syscall,
+ * re-parking peers in the same step. */
+static HashTable zealphp_coro_umask_snapshots;
+static bool zealphp_umask_isolation_active = false;
+static mode_t zealphp_umask_baseline = 0;
+static bool zealphp_umask_baseline_set = false;
 
 /* Per-coroutine static property snapshots: coro_id → HashTable(class_name → zval[]) */
 static HashTable zealphp_coro_static_snapshots;
@@ -549,6 +573,79 @@ static void zealphp_cwd_snapshot_delete(zend_long cid)
         if (VCWD_GETCWD(buf, sizeof(buf)) && strcmp(buf, zealphp_cwd_baseline) != 0) {
             if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do mid-switch */ }
         }
+    }
+}
+
+/* ── Per-coroutine setlocale() isolation ───────────────────────────── */
+
+static void zealphp_locale_snapshot_save(zend_long cid)
+{
+    if (!zealphp_locale_isolation_active || !zealphp_locale_baseline) return;
+    const char *cur = setlocale(LC_ALL, NULL);
+    if (!cur) return;
+    if (strcmp(cur, zealphp_locale_baseline) == 0) {
+        /* At the baseline — nothing to isolate; drop any stale entry. */
+        zend_hash_index_del(&zealphp_coro_locale_snapshots, (zend_ulong)cid);
+        return;
+    }
+    zval z;
+    ZVAL_STRING(&z, cur);
+    zend_hash_index_update(&zealphp_coro_locale_snapshots, (zend_ulong)cid, &z);
+    /* Re-park peers (and brand-new coroutines) at the baseline. */
+    setlocale(LC_ALL, zealphp_locale_baseline);
+}
+
+static void zealphp_locale_snapshot_restore(zend_long cid)
+{
+    if (!zealphp_locale_isolation_active) return;
+    zval *z = zend_hash_index_find(&zealphp_coro_locale_snapshots, (zend_ulong)cid);
+    if (!z || Z_TYPE_P(z) != IS_STRING) return;
+    setlocale(LC_ALL, Z_STRVAL_P(z));
+}
+
+static void zealphp_locale_snapshot_delete(zend_long cid)
+{
+    zend_hash_index_del(&zealphp_coro_locale_snapshots, (zend_ulong)cid);
+    if (zealphp_locale_isolation_active && zealphp_locale_baseline) {
+        /* A coroutine can END with a changed locale (no further yield to
+         * re-park it) — re-park so the next request starts at the baseline. */
+        const char *cur = setlocale(LC_ALL, NULL);
+        if (cur && strcmp(cur, zealphp_locale_baseline) != 0) {
+            setlocale(LC_ALL, zealphp_locale_baseline);
+        }
+    }
+}
+
+/* ── Per-coroutine umask() isolation ───────────────────────────────── */
+
+static void zealphp_umask_snapshot_save(zend_long cid)
+{
+    if (!zealphp_umask_isolation_active || !zealphp_umask_baseline_set) return;
+    /* One syscall: set the baseline AND read the previous value. */
+    mode_t cur = umask(zealphp_umask_baseline);
+    if (cur == zealphp_umask_baseline) {
+        zend_hash_index_del(&zealphp_coro_umask_snapshots, (zend_ulong)cid);
+        return;
+    }
+    zval z;
+    ZVAL_LONG(&z, (zend_long)cur);
+    zend_hash_index_update(&zealphp_coro_umask_snapshots, (zend_ulong)cid, &z);
+}
+
+static void zealphp_umask_snapshot_restore(zend_long cid)
+{
+    if (!zealphp_umask_isolation_active) return;
+    zval *z = zend_hash_index_find(&zealphp_coro_umask_snapshots, (zend_ulong)cid);
+    if (!z || Z_TYPE_P(z) != IS_LONG) return;
+    umask((mode_t)Z_LVAL_P(z));
+}
+
+static void zealphp_umask_snapshot_delete(zend_long cid)
+{
+    zend_hash_index_del(&zealphp_coro_umask_snapshots, (zend_ulong)cid);
+    if (zealphp_umask_isolation_active && zealphp_umask_baseline_set) {
+        /* Re-park for the next request (a coroutine can end mid-umask). */
+        umask(zealphp_umask_baseline);
     }
 }
 
@@ -1438,6 +1535,8 @@ static void zealphp_on_yield(void *arg)
     zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_locale_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_umask_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
     if (zealphp_fn_statics_active) {
         zealphp_fn_statics_snapshot_save((zend_long)(uintptr_t)arg);
@@ -1501,6 +1600,8 @@ static void zealphp_on_resume(void *arg)
     zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_ini_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_cwd_snapshot_restore((zend_long)(uintptr_t)arg);
+    zealphp_locale_snapshot_restore((zend_long)(uintptr_t)arg);
+    zealphp_umask_snapshot_restore((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_restore((zend_long)(uintptr_t)arg);
     if (zealphp_fn_statics_active) {
         zealphp_fn_statics_snapshot_restore((zend_long)(uintptr_t)arg);
@@ -1547,6 +1648,8 @@ static void zealphp_on_close(void *arg)
     }
     zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_cwd_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_locale_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_umask_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_fn_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_globals_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -3329,6 +3432,14 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_cwd_isolation, 0, 0, _IS
     ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_locale_isolation, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_umask_isolation, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
 PHP_FUNCTION(zealphp_include_isolation)
 {
     zend_bool on = 1;
@@ -3387,6 +3498,86 @@ PHP_FUNCTION(zealphp_cwd_isolation)
     RETURN_BOOL(prev);
 }
 
+/* Per-coroutine setlocale() isolation knob — same get/set + baseline-at-enable
+ * semantics as zealphp_cwd_isolation(): enabling captures the CURRENT process
+ * locale as the worker baseline (call from boot, after any boot-time
+ * setlocale()), so a locale set BEFORE enabling is respected as home. */
+PHP_FUNCTION(zealphp_locale_isolation)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = zealphp_locale_isolation_active;
+    if (!on_is_null) {
+        if ((bool)on && !zealphp_locale_isolation_active) {
+            if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+                php_error_docref(NULL, E_WARNING,
+                    "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+                    "Per-coroutine locale isolation requires OpenSwoole.");
+                RETURN_BOOL(prev);
+            }
+            if (!zealphp_coro_wrappers_installed && !zealphp_install_coro_hooks()) {
+                RETURN_BOOL(prev);
+            }
+            const char *zealphp_loc_cur = setlocale(LC_ALL, NULL);
+            if (!zealphp_loc_cur) {
+                RETURN_BOOL(prev); /* no baseline -> stay off (fail-closed) */
+            }
+            if (zealphp_locale_baseline) free(zealphp_locale_baseline);
+            zealphp_locale_baseline = strdup(zealphp_loc_cur);
+            if (!zealphp_locale_baseline) {
+                RETURN_BOOL(prev);
+            }
+        }
+        zealphp_locale_isolation_active = (bool)on;
+        if (!(bool)on) {
+            zend_hash_clean(&zealphp_coro_locale_snapshots);
+        }
+    }
+    RETURN_BOOL(prev);
+}
+
+/* Per-coroutine umask() isolation knob — baseline captured at enable time
+ * (umask(0)+restore: the only read API writes, so a read is two back-to-back
+ * syscalls with no yield in between). */
+PHP_FUNCTION(zealphp_umask_isolation)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = zealphp_umask_isolation_active;
+    if (!on_is_null) {
+        if ((bool)on && !zealphp_umask_isolation_active) {
+            if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+                php_error_docref(NULL, E_WARNING,
+                    "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+                    "Per-coroutine umask isolation requires OpenSwoole.");
+                RETURN_BOOL(prev);
+            }
+            if (!zealphp_coro_wrappers_installed && !zealphp_install_coro_hooks()) {
+                RETURN_BOOL(prev);
+            }
+            mode_t zealphp_um_b = umask(0);
+            umask(zealphp_um_b);
+            zealphp_umask_baseline = zealphp_um_b;
+            zealphp_umask_baseline_set = true;
+        }
+        zealphp_umask_isolation_active = (bool)on;
+        if (!(bool)on) {
+            zend_hash_clean(&zealphp_coro_umask_snapshots);
+        }
+    }
+    RETURN_BOOL(prev);
+}
+
 /* Mark a request boundary for Stage 7: clears the current coroutine's
  * "force-re-included this request" set, so files re-execute on the NEXT
  * request while staying idempotent WITHIN a request. In real coroutine
@@ -3432,6 +3623,8 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_cwd_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_locale_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_umask_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_reincluded, 256, NULL, ZVAL_PTR_DTOR, 0);
@@ -4172,6 +4365,8 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_include_isolation,     arginfo_zealphp_include_isolation)
     PHP_FE(zealphp_include_isolation_reset, arginfo_zealphp_include_isolation_reset)
     PHP_FE(zealphp_cwd_isolation,         arginfo_zealphp_cwd_isolation)
+    PHP_FE(zealphp_locale_isolation,      arginfo_zealphp_locale_isolation)
+    PHP_FE(zealphp_umask_isolation,       arginfo_zealphp_umask_isolation)
     PHP_FE(zealphp_reset_request_rtcaches, arginfo_zealphp_reset_request_rtcaches)
     PHP_FE(zealphp_reset_request_statics,  arginfo_zealphp_reset_request_statics)
     PHP_FE(zealphp_reset_request_class_statics, arginfo_zealphp_reset_request_class_statics)
