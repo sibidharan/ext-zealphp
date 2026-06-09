@@ -1223,6 +1223,18 @@ static void zealphp_set_superglobal(const char *name, size_t name_len, zval *val
  * is reliable in on_yield/PHP context but NOT in on_resume, so the owner cid
  * is stored alongside each snapshot and re-established on restore. */
 static long zealphp_sg_owner_cid = 0;
+/* Debug knob (#32): ZEALPHP_SG_DEBUG=1 traces every superglobal
+ * save/skip/clear/restore decision (with coroutine keys, cids and the
+ * ownership state) to stderr. Invaluable for scheduler-interplay bugs —
+ * the #32 logger-restore wipe was pinned with exactly this trace. */
+static int zealphp_sg_debug = -1;
+static int zealphp_sg_dbg(void) {
+    if (zealphp_sg_debug == -1) {
+        const char *e = getenv("ZEALPHP_SG_DEBUG");
+        zealphp_sg_debug = (e && *e == '1') ? 1 : 0;
+    }
+    return zealphp_sg_debug;
+}
 /* snapshot key (coroutine ptr cast) → IS_LONG owner cid, written at save time. */
 static HashTable zealphp_coro_sg_owner_cids;
 
@@ -1237,8 +1249,16 @@ static void zealphp_snapshot_save(long cid)
     if (zealphp_sg_owner_cid > 0 && os_get_cid) {
         long zealphp_cur_cid = os_get_cid();
         if (zealphp_cur_cid > 0 && zealphp_cur_cid != zealphp_sg_owner_cid) {
+            if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] save SKIP key=%ld cur=%ld owner=%ld\n", cid, zealphp_cur_cid, zealphp_sg_owner_cid);
             return;
         }
+    }
+    if (zealphp_sg_dbg()) {
+        zval *sgd = zend_hash_str_find(&EG(symbol_table), "_SESSION", sizeof("_SESSION")-1);
+        zval *sgda = sgd && Z_ISREF_P(sgd) ? Z_REFVAL_P(sgd) : sgd;
+        fprintf(stderr, "[SGDBG] save+clear key=%ld cur=%ld owner=%ld sess_n=%d\n",
+            cid, os_get_cid ? os_get_cid() : -99, zealphp_sg_owner_cid,
+            (sgda && Z_TYPE_P(sgda) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(sgda)) : -1);
     }
 
     zval snapshot;
@@ -1299,14 +1319,33 @@ static void zealphp_snapshot_save(long cid)
 static void zealphp_snapshot_restore(long cid)
 {
     zval *snapshot = zend_hash_index_find(&zealphp_coro_snapshots, (zend_ulong)cid);
-    if (!snapshot || Z_TYPE_P(snapshot) != IS_ARRAY) return;
+    if (!snapshot || Z_TYPE_P(snapshot) != IS_ARRAY) {
+        if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] restore NOSNAP key=%ld owner=%ld\n", cid, zealphp_sg_owner_cid);
+        return;
+    }
+    if (zealphp_sg_dbg()) {
+        zval *sv = zend_hash_str_find(Z_ARRVAL_P(snapshot), "_SESSION", sizeof("_SESSION")-1);
+        fprintf(stderr, "[SGDBG] restore key=%ld owner_before=%ld snap_sess_n=%d\n",
+            cid, zealphp_sg_owner_cid,
+            (sv && Z_TYPE_P(sv) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(sv)) : -1);
+    }
 
-    /* Re-establish live-state ownership for the resumed owner so its later
-     * yields save+clear and children's yields keep their hands off. */
+    /* Ownership gate on the RESTORE side (#32): a long-lived service
+     * coroutine (the async-log runner) resuming MID-REQUEST — while the
+     * request owner still holds the live superglobals — must not write its
+     * (typically empty) snapshot over them. Only restore when nobody owns
+     * the live state (owner==0: the normal suspended-owner handoff) or when
+     * THIS snapshot's recorded owner is the current holder. The skipped
+     * snapshot is kept for a later legitimate resume. */
     {
         zval *zealphp_oc = zend_hash_index_find(&zealphp_coro_sg_owner_cids, (zend_ulong)cid);
-        if (zealphp_oc && Z_TYPE_P(zealphp_oc) == IS_LONG) {
-            zealphp_sg_owner_cid = Z_LVAL_P(zealphp_oc);
+        long zealphp_snap_cid = (zealphp_oc && Z_TYPE_P(zealphp_oc) == IS_LONG) ? Z_LVAL_P(zealphp_oc) : 0;
+        if (zealphp_sg_owner_cid > 0 && zealphp_snap_cid != zealphp_sg_owner_cid) {
+            if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] restore SKIP(owned) key=%ld snap_cid=%ld owner=%ld\n", cid, zealphp_snap_cid, zealphp_sg_owner_cid);
+            return;
+        }
+        if (zealphp_snap_cid > 0) {
+            zealphp_sg_owner_cid = zealphp_snap_cid;
         }
     }
 
@@ -1477,6 +1516,16 @@ static void zealphp_on_close(void *arg)
     zend_hash_index_del(&zealphp_coro_cg_swap_fn, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_cg_swap_cl, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg);
+    /* Release live-state ownership held by the closing coroutine (#32):
+     * a request that ends while owning (e.g. finished without a final
+     * yield) must not leave a stale owner that gates peers' restores. */
+    {
+        zval *zealphp_oc = zend_hash_index_find(&zealphp_coro_sg_owner_cids, (zend_ulong)(uintptr_t)arg);
+        if (zealphp_oc && Z_TYPE_P(zealphp_oc) == IS_LONG
+            && Z_LVAL_P(zealphp_oc) == zealphp_sg_owner_cid) {
+            zealphp_sg_owner_cid = 0;
+        }
+    }
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_sg_owner_cids, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -1964,6 +2013,7 @@ PHP_FUNCTION(zealphp_request_input_set)
     if (os_get_cid) {
         long zealphp_oc = os_get_cid();
         if (zealphp_oc > 0) zealphp_sg_owner_cid = zealphp_oc;
+        if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] claim(input_set) cid=%ld\n", zealphp_oc);
     }
 }
 
@@ -1992,6 +2042,9 @@ PHP_FUNCTION(zealphp_superglobals_owner)
  * to prevent cross-request leakage in coroutine mode. */
 PHP_FUNCTION(zealphp_superglobals_clear)
 {
+    /* Request end — the live state is being torn down; release ownership so
+     * the next holder starts clean (#32). */
+    zealphp_sg_owner_cid = 0;
     ZEND_PARSE_PARAMETERS_NONE();
 
     for (const char **n = sg_names; *n; n++) {
