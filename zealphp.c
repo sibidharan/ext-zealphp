@@ -533,11 +533,36 @@ static void zealphp_ini_snapshot_delete(long cid)
     zend_hash_index_del(&zealphp_coro_ini_snapshots, (zend_ulong)cid);
 }
 
+/* Superglobal/process-state OWNER — defined with the superglobal snapshot
+ * machinery below; forward-declared here because the process-state stages
+ * (cwd/locale/umask) share the same gate: a non-owner coroutine (a go()
+ * child, a service coroutine) yielding must NOT save-and-re-park state that
+ * belongs to the request root. */
+static long zealphp_sg_owner_cid;
+
+/* Shared save-side owner gate for the process-state stages: returns 1 when
+ * the CURRENT coroutine may snapshot+re-park process-global state (it is the
+ * owner, or nobody owns — the legacy first-yielder behaviour). */
+static int zealphp_process_state_owner_ok(void)
+{
+    if (zealphp_sg_owner_cid > 0 && os_get_cid) {
+        long cur = os_get_cid();
+        if (cur > 0 && cur != zealphp_sg_owner_cid) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* ── Per-coroutine CWD isolation (framework #323) ─────────────────── */
 
 static void zealphp_cwd_snapshot_save(zend_long cid)
 {
     if (!zealphp_cwd_isolation_active || zealphp_cwd_baseline[0] == '\0') return;
+    /* Owner gate (#31/#32 family): a go() child's (or service coroutine's)
+     * yield must not steal the request root's process state — only the owner
+     * saves + re-parks; with no owner, legacy first-yielder behaviour. */
+    if (!zealphp_process_state_owner_ok()) return;
     char buf[MAXPATHLEN];
     if (!VCWD_GETCWD(buf, sizeof(buf))) return;
     if (strcmp(buf, zealphp_cwd_baseline) == 0) {
@@ -581,6 +606,10 @@ static void zealphp_cwd_snapshot_delete(zend_long cid)
 static void zealphp_locale_snapshot_save(zend_long cid)
 {
     if (!zealphp_locale_isolation_active || !zealphp_locale_baseline) return;
+    /* Owner gate (#31/#32 family): a go() child's (or service coroutine's)
+     * yield must not steal the request root's process state — only the owner
+     * saves + re-parks; with no owner, legacy first-yielder behaviour. */
+    if (!zealphp_process_state_owner_ok()) return;
     const char *cur = setlocale(LC_ALL, NULL);
     if (!cur) return;
     if (strcmp(cur, zealphp_locale_baseline) == 0) {
@@ -621,6 +650,10 @@ static void zealphp_locale_snapshot_delete(zend_long cid)
 static void zealphp_umask_snapshot_save(zend_long cid)
 {
     if (!zealphp_umask_isolation_active || !zealphp_umask_baseline_set) return;
+    /* Owner gate (#31/#32 family): a go() child's (or service coroutine's)
+     * yield must not steal the request root's process state — only the owner
+     * saves + re-parks; with no owner, legacy first-yielder behaviour. */
+    if (!zealphp_process_state_owner_ok()) return;
     /* One syscall: set the baseline AND read the previous value. */
     mode_t cur = umask(zealphp_umask_baseline);
     if (cur == zealphp_umask_baseline) {

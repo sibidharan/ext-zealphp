@@ -31,7 +31,12 @@ $done = new Channel(2);
 
 Co::run(function () use (&$results, $done) {
     go(function () use (&$results, $done) {
+        zealphp_superglobals_owner(); // the request-root claim the framework makes
         umask(0077);
+        // #31-family pin: a fire-and-forget child's yield must not steal the
+        // owner's umask (pre-0.3.39 it re-parked the parent to the baseline).
+        go(function () { zp056_yield(2); });
+        if (umask(0077) !== 0077) { $results['wrong'] = ($results['wrong'] ?? 0) + 1; }
         for ($i = 0; $i < 3; $i++) {
             zp056_yield(5);
             if (umask(0077) !== 0077) { $results['wrong'] = ($results['wrong'] ?? 0) + 1; }
