@@ -1797,19 +1797,29 @@ static void zealphp_on_close(void *arg)
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
     /* #9: free the request constants that zealphp_constants_clear() ORPHANED on
      * this coroutine — now safe, the request has ended and its run_time_cache is
-     * gone, so no FETCH_CONSTANT can read the freed struct. */
-    {
-        zval *cdef = zend_hash_index_find(&zealphp_coro_constant_deferred, (zend_ulong)(uintptr_t)arg);
-        if (cdef && Z_TYPE_P(cdef) == IS_ARRAY) {
-            zval *cv;
-            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(cdef), cv) {
-                zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(cv);
-                if (c) {
-                    zealphp_free_orphan_constant(c);
-                }
-            } ZEND_HASH_FOREACH_END();
+     * gone, so no FETCH_CONSTANT can read the freed struct. KEY FIX (2026-06-10):
+     * the producer (zealphp_constants_clear) parks the orphans keyed by
+     * os_get_cid() — a SMALL coroutine id — but this drain was keyed by the
+     * (uintptr_t)arg POINTER. The two key spaces never collide, so the deferred
+     * orphans were NEVER found here and leaked (bounded by worker recycle).
+     * os_get_cid() is reliable in a coroutine's own close callback (see the
+     * identity-rationale comment above zealphp_on_yield), so drain by cid —
+     * matching the producer. */
+    if (os_get_cid) {
+        long zp_cc = os_get_cid();
+        if (zp_cc > 0) {
+            zval *cdef = zend_hash_index_find(&zealphp_coro_constant_deferred, (zend_ulong)zp_cc);
+            if (cdef && Z_TYPE_P(cdef) == IS_ARRAY) {
+                zval *cv;
+                ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(cdef), cv) {
+                    zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(cv);
+                    if (c) {
+                        zealphp_free_orphan_constant(c);
+                    }
+                } ZEND_HASH_FOREACH_END();
+            }
+            zend_hash_index_del(&zealphp_coro_constant_deferred, (zend_ulong)zp_cc);
         }
-        zend_hash_index_del(&zealphp_coro_constant_deferred, (zend_ulong)(uintptr_t)arg);
     }
     zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_cwd_snapshot_delete((zend_long)(uintptr_t)arg);
