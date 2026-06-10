@@ -112,7 +112,7 @@ connection — is the actual reason classic `require_once`-bootstrap apps crashe
 ### Via PIE (recommended)
 
 ```bash
-pie install sibidharan/ext-zealphp
+pie install zealphp/ext
 ```
 
 ### From source
