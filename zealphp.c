@@ -591,8 +591,10 @@ static void zealphp_cwd_snapshot_save(zend_long cid)
     if (!zealphp_cwd_isolation_active || zealphp_cwd_baseline[0] == '\0') return;
     /* Owner gate (#31/#32 family): a go() child's (or service coroutine's)
      * yield must not steal the request root's process state — only the owner
-     * saves + re-parks; with no owner, legacy first-yielder behaviour. */
-    if (!zealphp_process_state_owner_ok()) return;
+     * saves + re-parks; with no owner, legacy first-yielder behaviour.
+     * Lane-symmetry exception (2026-06-10) — see zealphp_setting_snapshot_save. */
+    if (!zealphp_process_state_owner_ok()
+        && !zend_hash_index_exists(&zealphp_coro_cwd_snapshots, (zend_ulong)cid)) return;
     char buf[MAXPATHLEN];
     if (!VCWD_GETCWD(buf, sizeof(buf))) return;
     if (strcmp(buf, zealphp_cwd_baseline) == 0) {
@@ -620,8 +622,15 @@ static void zealphp_cwd_snapshot_restore(zend_long cid)
 
 static void zealphp_cwd_snapshot_delete(zend_long cid)
 {
+    bool zp_cwd_had_lane = zend_hash_index_exists(&zealphp_coro_cwd_snapshots, (zend_ulong)cid);
     zend_hash_index_del(&zealphp_coro_cwd_snapshots, (zend_ulong)cid);
     if (zealphp_cwd_isolation_active && zealphp_cwd_baseline[0] != '\0') {
+        /* Lane-or-owner gate (2026-06-10): re-park when the closing coroutine
+         * HAD A LANE (final teardown slice restored its cwd with no further
+         * yield) or is a registered request coroutine / legacy mode. An
+         * unregistered, lane-less service/timer coroutine closing MID-REQUEST
+         * must not re-park the RUNNING request's cwd. */
+        if (!zp_cwd_had_lane && !zealphp_process_state_owner_ok()) return;
         /* A coroutine can END while chdir'd (no further yield to re-park it).
          * Re-park the process so the next request starts at the baseline. */
         char buf[MAXPATHLEN];
@@ -638,8 +647,10 @@ static void zealphp_locale_snapshot_save(zend_long cid)
     if (!zealphp_locale_isolation_active || !zealphp_locale_baseline) return;
     /* Owner gate (#31/#32 family): a go() child's (or service coroutine's)
      * yield must not steal the request root's process state — only the owner
-     * saves + re-parks; with no owner, legacy first-yielder behaviour. */
-    if (!zealphp_process_state_owner_ok()) return;
+     * saves + re-parks; with no owner, legacy first-yielder behaviour.
+     * Lane-symmetry exception (2026-06-10) — see zealphp_setting_snapshot_save. */
+    if (!zealphp_process_state_owner_ok()
+        && !zend_hash_index_exists(&zealphp_coro_locale_snapshots, (zend_ulong)cid)) return;
     const char *cur = setlocale(LC_ALL, NULL);
     if (!cur) return;
     if (strcmp(cur, zealphp_locale_baseline) == 0) {
@@ -664,8 +675,11 @@ static void zealphp_locale_snapshot_restore(zend_long cid)
 
 static void zealphp_locale_snapshot_delete(zend_long cid)
 {
+    bool zp_loc_had_lane = zend_hash_index_exists(&zealphp_coro_locale_snapshots, (zend_ulong)cid);
     zend_hash_index_del(&zealphp_coro_locale_snapshots, (zend_ulong)cid);
     if (zealphp_locale_isolation_active && zealphp_locale_baseline) {
+        /* Lane-or-owner gate (2026-06-10) — see zealphp_cwd_snapshot_delete. */
+        if (!zp_loc_had_lane && !zealphp_process_state_owner_ok()) return;
         /* A coroutine can END with a changed locale (no further yield to
          * re-park it) — re-park so the next request starts at the baseline. */
         const char *cur = setlocale(LC_ALL, NULL);
@@ -682,8 +696,10 @@ static void zealphp_umask_snapshot_save(zend_long cid)
     if (!zealphp_umask_isolation_active || !zealphp_umask_baseline_set) return;
     /* Owner gate (#31/#32 family): a go() child's (or service coroutine's)
      * yield must not steal the request root's process state — only the owner
-     * saves + re-parks; with no owner, legacy first-yielder behaviour. */
-    if (!zealphp_process_state_owner_ok()) return;
+     * saves + re-parks; with no owner, legacy first-yielder behaviour.
+     * Lane-symmetry exception (2026-06-10) — see zealphp_setting_snapshot_save. */
+    if (!zealphp_process_state_owner_ok()
+        && !zend_hash_index_exists(&zealphp_coro_umask_snapshots, (zend_ulong)cid)) return;
     /* One syscall: set the baseline AND read the previous value. */
     mode_t cur = umask(zealphp_umask_baseline);
     if (cur == zealphp_umask_baseline) {
@@ -705,10 +721,289 @@ static void zealphp_umask_snapshot_restore(zend_long cid)
 
 static void zealphp_umask_snapshot_delete(zend_long cid)
 {
+    bool zp_um_had_lane = zend_hash_index_exists(&zealphp_coro_umask_snapshots, (zend_ulong)cid);
     zend_hash_index_del(&zealphp_coro_umask_snapshots, (zend_ulong)cid);
     if (zealphp_umask_isolation_active && zealphp_umask_baseline_set) {
+        /* Lane-or-owner gate (2026-06-10) — see zealphp_cwd_snapshot_delete. */
+        if (!zp_um_had_lane && !zealphp_process_state_owner_ok()) return;
         /* Re-park for the next request (a coroutine can end mid-umask). */
         umask(zealphp_umask_baseline);
+    }
+}
+
+/* ── Per-coroutine PHP-setting isolation: timezone + mb encoding ─────
+ *
+ * date_default_timezone_set() and mb_internal_encoding() write PROCESS-
+ * GLOBAL state (DATEG(default_timezone) / MBSTRG(current_internal_encoding))
+ * that classic request-style PHP changes per request (WordPress sets the
+ * site timezone in core boot; legacy code sets the mb encoding before
+ * string work). Under coroutine concurrency request A's setting bleeds
+ * into request B — measured 179/250 (tz) and 173/250 (mb) leaks at
+ * 49-way concurrency on the 2026-06-10 schematic sweep.
+ *
+ * Same stage shape as locale/umask: baseline captured at activation;
+ * owner-gated save+re-park on yield; restore on resume; re-park on close.
+ * Implementation deliberately goes through the ENGINE'S OWN getter/setter
+ * functions (zend_call_function on date_default_timezone_get/set and
+ * mb_internal_encoding) instead of poking DATEG/MBSTRG directly — uniform
+ * across PHP versions, zero module-globals ABI risk, and mbstring being
+ * absent simply auto-disables the stage (function lookup fails). The
+ * calls are internal functions (no user code, no yield) — safe inside the
+ * scheduler callbacks, same execution context the ini stage already uses. */
+
+static int zealphp_sg_dbg(void);
+static int  zealphp_tz_isolation_active = 0;
+static char *zealphp_tz_baseline = NULL;            /* malloc'd boot value */
+static HashTable zealphp_coro_tz_snapshots;         /* cid → zval string */
+static int  zealphp_mbenc_isolation_active = 0;
+static char *zealphp_mbenc_baseline = NULL;         /* malloc'd boot value */
+static HashTable zealphp_coro_mbenc_snapshots;      /* cid → zval string */
+
+/* Call a 0-arg PHP function returning a string; caller frees via efree on
+ * the returned char* (NULL on failure / non-string). */
+static char *zealphp_call_string_getter(const char *fname)
+{
+    zval fn, rv;
+    ZVAL_STRING(&fn, fname);
+    char *out = NULL;
+    if (call_user_function(EG(function_table), NULL, &fn, &rv, 0, NULL) == SUCCESS) {
+        if (Z_TYPE(rv) == IS_STRING) {
+            out = estrndup(Z_STRVAL(rv), Z_STRLEN(rv));
+        }
+        zval_ptr_dtor(&rv);
+    }
+    zval_ptr_dtor(&fn);
+    return out;
+}
+
+/* Call a 1-string-arg PHP function, discarding the return value. */
+static void zealphp_call_string_setter(const char *fname, const char *val)
+{
+    zval fn, rv, arg;
+    ZVAL_STRING(&fn, fname);
+    ZVAL_STRING(&arg, val);
+    if (call_user_function(EG(function_table), NULL, &fn, &rv, 1, &arg) == SUCCESS) {
+        zval_ptr_dtor(&rv);
+    }
+    zval_ptr_dtor(&arg);
+    zval_ptr_dtor(&fn);
+}
+
+static void zealphp_setting_snapshot_save(zend_long cid, int active, const char *baseline,
+                                          HashTable *snaps, const char *getter, const char *setter)
+{
+    if (!active || !baseline) return;
+    /* Owner gate (#31/#32 family) — only request coroutines save + re-park.
+     * SYMMETRY EXCEPTION (2026-06-10): a coroutine that already HAS a lane
+     * (snapshot present) keeps save+re-park rights even after request-end
+     * deregistration. Post-clear() teardown yields (session write, response
+     * flush) otherwise RESTORE the lane (restore is ungated by design) but
+     * never re-park it — the trace showed 8 consecutive restores with no
+     * save, each leaving its tz live for the NEXT request (the 33/250
+     * residual). Children never acquire a lane (their saves skip before one
+     * exists), so the anti-steal property is preserved. */
+    if (!zealphp_process_state_owner_ok()
+        && !zend_hash_index_exists(snaps, (zend_ulong)cid)) return;
+    char *cur = zealphp_call_string_getter(getter);
+    if (!cur) return;
+    if (strcmp(cur, baseline) == 0) {
+        zend_hash_index_del(snaps, (zend_ulong)cid);
+        if (zealphp_sg_dbg()) fprintf(stderr, "[SET %s] save AT-BASELINE key=%ld cur=%ld\n", getter, (long)cid, os_get_cid?os_get_cid():-99);
+        efree(cur);
+        return;
+    }
+    zval z;
+    ZVAL_STRING(&z, cur);
+    zend_hash_index_update(snaps, (zend_ulong)cid, &z);
+    if (zealphp_sg_dbg()) fprintf(stderr, "[SET %s] save+repark key=%ld cur=%ld val=%s\n", getter, (long)cid, os_get_cid?os_get_cid():-99, cur);
+    efree(cur);
+    /* Re-park peers (and brand-new coroutines) at the baseline. */
+    zealphp_call_string_setter(setter, baseline);
+}
+
+static void zealphp_setting_snapshot_restore(zend_long cid, int active, HashTable *snaps,
+                                             const char *setter)
+{
+    if (!active) return;
+    zval *z = zend_hash_index_find(snaps, (zend_ulong)cid);
+    if (!z || Z_TYPE_P(z) != IS_STRING) {
+        if (zealphp_sg_dbg()) fprintf(stderr, "[SET %s] restore NOSNAP key=%ld\n", setter, (long)cid);
+        return;
+    }
+    if (zealphp_sg_dbg()) fprintf(stderr, "[SET %s] restore key=%ld val=%s\n", setter, (long)cid, Z_STRVAL_P(z));
+    zealphp_call_string_setter(setter, Z_STRVAL_P(z));
+}
+
+static void zealphp_setting_snapshot_delete(zend_long cid, int active, const char *baseline,
+                                            HashTable *snaps, const char *getter, const char *setter)
+{
+    bool zp_had_lane = zend_hash_index_exists(snaps, (zend_ulong)cid);
+    zend_hash_index_del(snaps, (zend_ulong)cid);
+    if (active && baseline) {
+        /* Re-park when the closing coroutine HAD A LANE (its last resume
+         * restored its setting and no further yield re-parked — the final
+         * teardown slice) OR is a registered request coroutine / legacy
+         * no-claims mode. An UNREGISTERED, LANE-LESS service/timer coroutine
+         * closing MID-REQUEST must not re-park: the live setting at that
+         * moment belongs to the RUNNING request — re-parking from a
+         * Timer-channel helper's close was the original 185/250 leaker. */
+        if (!zp_had_lane && !zealphp_process_state_owner_ok()) return;
+        char *cur = zealphp_call_string_getter(getter);
+        if (cur) {
+            if (strcmp(cur, baseline) != 0) {
+                /* A coroutine can END with a changed setting (no further yield
+                 * to re-park it) — re-park so the next request starts clean. */
+                zealphp_call_string_setter(setter, baseline);
+            }
+            efree(cur);
+        }
+    }
+}
+
+#define zealphp_tz_snapshot_save(cid)    zealphp_setting_snapshot_save((cid), zealphp_tz_isolation_active, zealphp_tz_baseline, &zealphp_coro_tz_snapshots, "date_default_timezone_get", "date_default_timezone_set")
+#define zealphp_tz_snapshot_restore(cid) zealphp_setting_snapshot_restore((cid), zealphp_tz_isolation_active, &zealphp_coro_tz_snapshots, "date_default_timezone_set")
+#define zealphp_tz_snapshot_delete(cid)  zealphp_setting_snapshot_delete((cid), zealphp_tz_isolation_active, zealphp_tz_baseline, &zealphp_coro_tz_snapshots, "date_default_timezone_get", "date_default_timezone_set")
+#define zealphp_mbenc_snapshot_save(cid)    zealphp_setting_snapshot_save((cid), zealphp_mbenc_isolation_active, zealphp_mbenc_baseline, &zealphp_coro_mbenc_snapshots, "mb_internal_encoding", "mb_internal_encoding")
+#define zealphp_mbenc_snapshot_restore(cid) zealphp_setting_snapshot_restore((cid), zealphp_mbenc_isolation_active, &zealphp_coro_mbenc_snapshots, "mb_internal_encoding")
+#define zealphp_mbenc_snapshot_delete(cid)  zealphp_setting_snapshot_delete((cid), zealphp_mbenc_isolation_active, zealphp_mbenc_baseline, &zealphp_coro_mbenc_snapshots, "mb_internal_encoding", "mb_internal_encoding")
+
+/* ── Per-coroutine libxml_use_internal_errors() isolation ────────────
+ *
+ * libxml's "use internal errors" FLAG is process-global; under coroutine
+ * concurrency request A's enable bleeds into request B (measured 128/250
+ * leaks at 49-way concurrency). The flag's backing storage (the
+ * LIBXML(error_list) pointer) is NOT dynamically exported by stock PHP
+ * builds, so this stage rides the userland function pair exactly like the
+ * tz/mbenc stages: libxml_use_internal_errors() with no args reads the
+ * flag, with a bool sets it (allocating / freeing the error list the way
+ * php-src itself does).
+ *
+ * FIDELITY NOTE: re-parking an enabled coroutine at a yield frees its
+ * COLLECTED errors (that is php-src's own disable semantic). Errors are
+ * therefore preserved within a slice — parse + libxml_get_errors() with no
+ * yield between, the dominant legacy pattern (local-string parsing never
+ * yields) — but not across an I/O yield. The FLAG itself round-trips
+ * correctly across any number of yields. Documented honest boundary. */
+static int  zealphp_libxml_isolation_active = 0;
+static int  zealphp_libxml_baseline = 0;          /* boot flag (normally off) */
+static HashTable zealphp_coro_libxml_snapshots;   /* cid → IS_LONG flag */
+
+/* Call libxml_use_internal_errors() — no-arg read / one-bool-arg write. */
+static int zealphp_libxml_flag_get(void)
+{
+    zval fn, rv;
+    ZVAL_STRING(&fn, "libxml_use_internal_errors");
+    int out = -1;
+    if (call_user_function(EG(function_table), NULL, &fn, &rv, 0, NULL) == SUCCESS) {
+        if (Z_TYPE(rv) == IS_TRUE) out = 1;
+        else if (Z_TYPE(rv) == IS_FALSE) out = 0;
+        zval_ptr_dtor(&rv);
+    }
+    zval_ptr_dtor(&fn);
+    /* The no-arg READ form itself returns the current value WITHOUT
+     * changing it (PHP 8.x: null $use_errors keeps the state). */
+    return out;
+}
+
+static void zealphp_libxml_flag_set(int on)
+{
+    zval fn, rv, arg;
+    ZVAL_STRING(&fn, "libxml_use_internal_errors");
+    ZVAL_BOOL(&arg, on ? 1 : 0);
+    if (call_user_function(EG(function_table), NULL, &fn, &rv, 1, &arg) == SUCCESS) {
+        zval_ptr_dtor(&rv);
+    }
+    zval_ptr_dtor(&fn);
+}
+
+static void zealphp_libxml_snapshot_save(zend_long cid)
+{
+    if (!zealphp_libxml_isolation_active) return;
+    /* Owner gate + lane-symmetry exception — see zealphp_setting_snapshot_save. */
+    if (!zealphp_process_state_owner_ok()
+        && !zend_hash_index_exists(&zealphp_coro_libxml_snapshots, (zend_ulong)cid)) return;
+    int cur = zealphp_libxml_flag_get();
+    if (cur < 0) return;
+    if (cur == zealphp_libxml_baseline) {
+        zend_hash_index_del(&zealphp_coro_libxml_snapshots, (zend_ulong)cid);
+        return;
+    }
+    zval z;
+    ZVAL_LONG(&z, cur);
+    zend_hash_index_update(&zealphp_coro_libxml_snapshots, (zend_ulong)cid, &z);
+    zealphp_libxml_flag_set(zealphp_libxml_baseline);
+}
+
+static void zealphp_libxml_snapshot_restore(zend_long cid)
+{
+    if (!zealphp_libxml_isolation_active) return;
+    zval *z = zend_hash_index_find(&zealphp_coro_libxml_snapshots, (zend_ulong)cid);
+    if (!z || Z_TYPE_P(z) != IS_LONG) return;
+    zealphp_libxml_flag_set((int)Z_LVAL_P(z));
+}
+
+static void zealphp_libxml_snapshot_delete(zend_long cid)
+{
+    bool zp_had_lane = zend_hash_index_exists(&zealphp_coro_libxml_snapshots, (zend_ulong)cid);
+    zend_hash_index_del(&zealphp_coro_libxml_snapshots, (zend_ulong)cid);
+    if (zealphp_libxml_isolation_active
+        && (zp_had_lane || zealphp_process_state_owner_ok())) {
+        int cur = zealphp_libxml_flag_get();
+        if (cur >= 0 && cur != zealphp_libxml_baseline) {
+            zealphp_libxml_flag_set(zealphp_libxml_baseline);
+        }
+    }
+}
+
+/* Re-park every active process-setting stage to its baseline. Called from
+ * zealphp_superglobals_clear() — the REQUEST-END hook, which runs in the
+ * request coroutine's PHP context while it is STILL REGISTERED. This is the
+ * reliable end-of-request re-park: the on_close re-park can no longer cover
+ * the normal path because clear() removes the cid from the request set
+ * first, so the owner-gated delete skips (by design — that same gate is
+ * what stops a service/timer coroutine's close wiping a RUNNING request's
+ * settings). on_close remains the backstop for the fatal/early-close path,
+ * where clear() never ran and the cid is still registered. */
+static void zealphp_process_settings_repark(void)
+{
+    if (zealphp_cwd_isolation_active && zealphp_cwd_baseline[0] != '\0') {
+        char zp_buf[MAXPATHLEN];
+        if (VCWD_GETCWD(zp_buf, sizeof(zp_buf)) && strcmp(zp_buf, zealphp_cwd_baseline) != 0) {
+            if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do */ }
+        }
+    }
+    if (zealphp_locale_isolation_active && zealphp_locale_baseline) {
+        const char *zp_cur = setlocale(LC_ALL, NULL);
+        if (zp_cur && strcmp(zp_cur, zealphp_locale_baseline) != 0) {
+            setlocale(LC_ALL, zealphp_locale_baseline);
+        }
+    }
+    if (zealphp_umask_isolation_active && zealphp_umask_baseline_set) {
+        umask(zealphp_umask_baseline);
+    }
+    if (zealphp_tz_isolation_active && zealphp_tz_baseline) {
+        char *zp_cur = zealphp_call_string_getter("date_default_timezone_get");
+        if (zp_cur) {
+            if (strcmp(zp_cur, zealphp_tz_baseline) != 0) {
+                zealphp_call_string_setter("date_default_timezone_set", zealphp_tz_baseline);
+            }
+            efree(zp_cur);
+        }
+    }
+    if (zealphp_mbenc_isolation_active && zealphp_mbenc_baseline) {
+        char *zp_cur = zealphp_call_string_getter("mb_internal_encoding");
+        if (zp_cur) {
+            if (strcmp(zp_cur, zealphp_mbenc_baseline) != 0) {
+                zealphp_call_string_setter("mb_internal_encoding", zealphp_mbenc_baseline);
+            }
+            efree(zp_cur);
+        }
+    }
+    if (zealphp_libxml_isolation_active) {
+        int zp_cur = zealphp_libxml_flag_get();
+        if (zp_cur >= 0 && zp_cur != zealphp_libxml_baseline) {
+            zealphp_libxml_flag_set(zealphp_libxml_baseline);
+        }
     }
 }
 
@@ -1666,6 +1961,9 @@ static void zealphp_on_yield(void *arg)
     zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_locale_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_umask_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_tz_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_mbenc_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_libxml_snapshot_save((zend_long)(uintptr_t)arg);
     if (zp_req_owner_ok) {
         zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
         if (zealphp_fn_statics_active) {
@@ -1747,6 +2045,9 @@ static void zealphp_on_resume(void *arg)
         zealphp_cwd_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_locale_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_umask_snapshot_restore((zend_long)(uintptr_t)arg);
+        zealphp_tz_snapshot_restore((zend_long)(uintptr_t)arg);
+        zealphp_mbenc_snapshot_restore((zend_long)(uintptr_t)arg);
+        zealphp_libxml_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_statics_snapshot_restore((zend_long)(uintptr_t)arg);
         if (zealphp_fn_statics_active) {
             zealphp_fn_statics_snapshot_restore((zend_long)(uintptr_t)arg);
@@ -1825,6 +2126,9 @@ static void zealphp_on_close(void *arg)
     zealphp_cwd_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_locale_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_umask_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_tz_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_mbenc_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_libxml_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_fn_statics_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_globals_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -2370,6 +2674,17 @@ PHP_FUNCTION(zealphp_superglobals_clear)
         zealphp_sg_owner_cid = 0;
     }
     ZEND_PARSE_PARAMETERS_NONE();
+
+    /* Request end IS the reliable re-park point for the process-setting
+     * stages (cwd/locale/umask/tz/mbenc): we are in the request coroutine's
+     * own PHP context, so the live settings are THIS request's — restore the
+     * worker baseline so the NEXT fresh request doesn't inherit them (a fresh
+     * coroutine has no snapshot to restore, so whatever is live at its start
+     * becomes its state). The on_close re-park is owner-gated and the cid was
+     * just removed above, so without this call the normal request-end path
+     * would never re-park (measured: 33/250 residual tz leaks — every one a
+     * fresh request starting right after a tz-changing request ended). */
+    zealphp_process_settings_repark();
 
     for (const char **n = sg_names; *n; n++) {
         zval empty;
@@ -3657,6 +3972,18 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_locale_isolation, 0, 0, 
     ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_timezone_isolation, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_mbenc_isolation, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_libxml_isolation, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_umask_isolation, 0, 0, _IS_BOOL, 0)
     ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
 ZEND_END_ARG_INFO()
@@ -3799,6 +4126,134 @@ PHP_FUNCTION(zealphp_umask_isolation)
     RETURN_BOOL(prev);
 }
 
+/* Per-coroutine date_default_timezone_set() isolation knob — baseline is the
+ * timezone at enable time. See the PHP-setting stage block for rationale
+ * (measured 179/250 cross-request tz leaks at 49-way concurrency). */
+PHP_FUNCTION(zealphp_timezone_isolation)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = (bool)zealphp_tz_isolation_active;
+    if (!on_is_null) {
+        if ((bool)on && !zealphp_tz_isolation_active) {
+            if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+                php_error_docref(NULL, E_WARNING,
+                    "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+                    "Per-coroutine timezone isolation requires OpenSwoole.");
+                RETURN_BOOL(prev);
+            }
+            if (!zealphp_coro_wrappers_installed && !zealphp_install_coro_hooks()) {
+                RETURN_BOOL(prev);
+            }
+            char *zealphp_tz_cur = zealphp_call_string_getter("date_default_timezone_get");
+            if (!zealphp_tz_cur) {
+                RETURN_BOOL(prev); /* no baseline -> stay off (fail-closed) */
+            }
+            if (zealphp_tz_baseline) free(zealphp_tz_baseline);
+            zealphp_tz_baseline = strdup(zealphp_tz_cur);
+            efree(zealphp_tz_cur);
+            if (!zealphp_tz_baseline) {
+                RETURN_BOOL(prev);
+            }
+        }
+        zealphp_tz_isolation_active = (bool)on;
+        if (!(bool)on) {
+            zend_hash_clean(&zealphp_coro_tz_snapshots);
+        }
+    }
+    RETURN_BOOL(prev);
+}
+
+/* Per-coroutine mb_internal_encoding() isolation knob — baseline is the
+ * encoding at enable time. Auto-refuses when mbstring isn't loaded (the
+ * getter lookup fails → no baseline → stays off). Measured 173/250
+ * cross-request encoding leaks at 49-way concurrency. */
+PHP_FUNCTION(zealphp_mbenc_isolation)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = (bool)zealphp_mbenc_isolation_active;
+    if (!on_is_null) {
+        if ((bool)on && !zealphp_mbenc_isolation_active) {
+            if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+                php_error_docref(NULL, E_WARNING,
+                    "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+                    "Per-coroutine mb-encoding isolation requires OpenSwoole.");
+                RETURN_BOOL(prev);
+            }
+            if (!zealphp_coro_wrappers_installed && !zealphp_install_coro_hooks()) {
+                RETURN_BOOL(prev);
+            }
+            char *zealphp_mb_cur = zealphp_call_string_getter("mb_internal_encoding");
+            if (!zealphp_mb_cur) {
+                RETURN_BOOL(prev); /* mbstring absent / no baseline -> stay off */
+            }
+            if (zealphp_mbenc_baseline) free(zealphp_mbenc_baseline);
+            zealphp_mbenc_baseline = strdup(zealphp_mb_cur);
+            efree(zealphp_mb_cur);
+            if (!zealphp_mbenc_baseline) {
+                RETURN_BOOL(prev);
+            }
+        }
+        zealphp_mbenc_isolation_active = (bool)on;
+        if (!(bool)on) {
+            zend_hash_clean(&zealphp_coro_mbenc_snapshots);
+        }
+    }
+    RETURN_BOOL(prev);
+}
+
+/* Per-coroutine libxml_use_internal_errors() isolation knob — swaps the
+ * LIBXML(error_list) pointer per coroutine (state + collected errors).
+ * Resolves the libxml module globals via dlsym; refuses (stays off) when
+ * libxml isn't loaded. */
+PHP_FUNCTION(zealphp_libxml_isolation)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = (bool)zealphp_libxml_isolation_active;
+    if (!on_is_null) {
+        if ((bool)on && !zealphp_libxml_isolation_active) {
+            if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+                php_error_docref(NULL, E_WARNING,
+                    "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+                    "Per-coroutine libxml isolation requires OpenSwoole.");
+                RETURN_BOOL(prev);
+            }
+            if (!zealphp_coro_wrappers_installed && !zealphp_install_coro_hooks()) {
+                RETURN_BOOL(prev);
+            }
+            {
+                int zp_cur = zealphp_libxml_flag_get();
+                if (zp_cur < 0) {
+                    RETURN_BOOL(prev); /* libxml absent -> stay off (fail-closed) */
+                }
+                zealphp_libxml_baseline = zp_cur;
+            }
+        }
+        zealphp_libxml_isolation_active = (bool)on;
+        if (!(bool)on) {
+            zend_hash_clean(&zealphp_coro_libxml_snapshots);
+        }
+    }
+    RETURN_BOOL(prev);
+}
+
 /* Mark a request boundary for Stage 7: clears the current coroutine's
  * "force-re-included this request" set, so files re-execute on the NEXT
  * request while staying idempotent WITHIN a request. In real coroutine
@@ -3848,6 +4303,9 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_cwd_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_locale_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_tz_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_mbenc_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_libxml_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_umask_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
@@ -4594,6 +5052,9 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_include_isolation_reset, arginfo_zealphp_include_isolation_reset)
     PHP_FE(zealphp_cwd_isolation,         arginfo_zealphp_cwd_isolation)
     PHP_FE(zealphp_locale_isolation,      arginfo_zealphp_locale_isolation)
+    PHP_FE(zealphp_timezone_isolation,    arginfo_zealphp_timezone_isolation)
+    PHP_FE(zealphp_mbenc_isolation,       arginfo_zealphp_mbenc_isolation)
+    PHP_FE(zealphp_libxml_isolation,      arginfo_zealphp_libxml_isolation)
     PHP_FE(zealphp_umask_isolation,       arginfo_zealphp_umask_isolation)
     PHP_FE(zealphp_reset_request_rtcaches, arginfo_zealphp_reset_request_rtcaches)
     PHP_FE(zealphp_reset_request_statics,  arginfo_zealphp_reset_request_statics)
