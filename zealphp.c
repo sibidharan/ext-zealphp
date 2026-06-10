@@ -543,15 +543,32 @@ static long zealphp_sg_owner_cid;
 /* Shared save-side owner gate for the process-state stages: returns 1 when
  * the CURRENT coroutine may snapshot+re-park process-global state (it is the
  * owner, or nobody owns — the legacy first-yielder behaviour). */
+/* #37 — set of cids that claimed request state (via zealphp_request_input_set
+ * or zealphp_superglobals_owner). A SINGLE owner variable cannot represent
+ * several concurrently-SUSPENDED requests in one worker (request B claims
+ * while A awaits I/O; A's later save/restore then mis-gates → A's state
+ * lost — the 0.3.41-rc regression caught by the 12-concurrent probe). The
+ * SET discriminates the only thing that matters: request coroutines save +
+ * restore THEIR OWN per-cid/per-ptr snapshots (concurrency-safe by keying),
+ * while unclaimed coroutines (go() children, service runners like the
+ * async-log channel consumer) never touch the live request state at all.
+ * Entries: claim fns add; on_close + superglobals_clear remove. Empty set =
+ * no framework claims = legacy pass-all (raw/phpt usage unchanged). */
+static HashTable zealphp_request_coro_cids;
+/* ptr-keyed mirror, written at SAVE time (os_get_cid is reliable in on_yield,
+ * NOT in on_resume) — lets the RESTORE side recognize request coroutines.
+ * In framework mode (cid set non-empty) only these ptrs may restore the
+ * request-state stages; a service runner that saved during the pre-claim
+ * legacy era keeps its stale snapshots PARKED instead of replaying them
+ * over a live request (the phpt-057 shape-B residual). */
+static HashTable zealphp_request_coro_ptrs;
 static int zealphp_process_state_owner_ok(void)
 {
-    if (zealphp_sg_owner_cid > 0 && os_get_cid) {
-        long cur = os_get_cid();
-        if (cur > 0 && cur != zealphp_sg_owner_cid) {
-            return 0;
-        }
-    }
-    return 1;
+    if (zend_hash_num_elements(&zealphp_request_coro_cids) == 0) return 1;
+    if (!os_get_cid) return 1;
+    long cur = os_get_cid();
+    if (cur <= 0) return 1;   /* unknown context — fail open (legacy) */
+    return zend_hash_index_exists(&zealphp_request_coro_cids, (zend_ulong)cur) ? 1 : 0;
 }
 
 /* ── Per-coroutine CWD isolation (framework #323) ─────────────────── */
@@ -1276,6 +1293,16 @@ static void zealphp_globals_snapshot_restore(long cid)
 {
     if (!EG(symbol_table).nTableMask) return;
 
+    /* #37: never saved (an unclaimed go() child / service runner whose
+     * saves the owner gate skipped, or a first resume before any yield) →
+     * leave the live table COMPLETELY alone. Unconditionally resetting to
+     * the parent baseline here is exactly how the async-log runner's
+     * mid-request resume wiped the live owner's $GLOBALS (`$g` → NULL). */
+    if (!zend_hash_index_exists(&zealphp_coro_globals_deltas, (zend_ulong)cid)
+        && !zend_hash_index_exists(&zealphp_coro_globals_tombstones, (zend_ulong)cid)) {
+        return;
+    }
+
     /* Step 1 — parent baseline (belt-and-suspenders: on_yield reset it too,
      * but on_resume may fire without a preceding on_yield if OpenSwoole
      * resumes a coroutine that was never explicitly yielded). */
@@ -1564,21 +1591,51 @@ static void zealphp_on_yield(void *arg)
         zend_hash_index_update(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg, &al);
         zend_hash_clean(EG(in_autoload));
     }
+    /* #37 — request-state owner gate, computed BEFORE the SG save below
+     * releases ownership. A fire-and-forget go() child's first yield (or a
+     * service coroutine like the async-log runner) must NOT save the live
+     * request state under ITS key and reset/orphan it to baseline: the
+     * still-running parent would see $GLOBALS entries become NULL (#37, the
+     * labs-dashboard `$g` wipe), define()s vanish, and statics/ini roll back
+     * on the child's later resume. Same #31-family steal already gated for
+     * the 7 superglobals (0.3.36) and cwd/locale/umask (0.3.39) — this
+     * extends the gate to constants/ini/statics/fn-statics/$GLOBALS, at the
+     * dispatcher level so each stage's body stays untouched. No owner
+     * claimed (raw non-framework use) → gate passes everyone (legacy
+     * first-yielder behaviour, all existing phpt semantics preserved). */
+    int zp_req_owner_ok = zealphp_process_state_owner_ok();
+    /* Record this coroutine as a KNOWN request coroutine (ptr-keyed, for the
+     * restore side) when it is strictly claimed — i.e. its cid is in the
+     * claim set, not merely passing via the empty-set legacy mode. */
+    if (os_get_cid) {
+        long zp_cur = os_get_cid();
+        if (zp_cur > 0 && zend_hash_index_exists(&zealphp_request_coro_cids, (zend_ulong)zp_cur)) {
+            zval zp1; ZVAL_LONG(&zp1, 1);
+            zend_hash_index_update(&zealphp_request_coro_ptrs, (zend_ulong)(uintptr_t)arg, &zp1);
+        }
+    }
+    if (zealphp_sg_dbg()) fprintf(stderr, "[GDBG] yield key=%ld cur=%ld reqset_n=%d save_ok=%d\n",
+        (long)(uintptr_t)arg, os_get_cid ? os_get_cid() : -99,
+        (int)zend_hash_num_elements(&zealphp_request_coro_cids), zp_req_owner_ok);
     zealphp_snapshot_save((zend_long)(uintptr_t)arg);
-    zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
-    zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
+    if (zp_req_owner_ok) {
+        zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
+        zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
+    }
     zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_locale_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_umask_snapshot_save((zend_long)(uintptr_t)arg);
-    zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
-    if (zealphp_fn_statics_active) {
-        zealphp_fn_statics_snapshot_save((zend_long)(uintptr_t)arg);
+    if (zp_req_owner_ok) {
+        zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
+        if (zealphp_fn_statics_active) {
+            zealphp_fn_statics_snapshot_save((zend_long)(uintptr_t)arg);
+        }
     }
     /* Full $GLOBALS snapshot: runs AFTER superglobals save so the
      * snapshot reflects whatever the request handler last wrote. The
      * is_superglobal_key filter inside this call deliberately skips the
      * 7 SG slots — those are owned by zealphp_snapshot_save above. */
-    if (zealphp_coro_globals_hooks_active) {
+    if (zealphp_coro_globals_hooks_active && zp_req_owner_ok) {
         zealphp_globals_snapshot_save((zend_long)(uintptr_t)arg);
         /* Bridge cid→ptr so the PHP-context request-end drain can free this
          * coroutine's (pointer-keyed) delta. os_get_cid() is reliable in on_yield. */
@@ -1623,21 +1680,36 @@ static void zealphp_on_resume(void *arg)
     }
     /* NB: os_get_cid() == -1 here (see the identity-rationale comment on
      * zealphp_on_yield) — we MUST key on arg, never os_get_cid(), in this path. */
+    /* #37 restore gate: in framework mode (claim set non-empty) only KNOWN
+     * request coroutines (ptr recorded at save time — os_get_cid is -1 here,
+     * so cid can't be consulted) may replay request-state snapshots. Gated
+     * children never saved (natural no-ops), and a service runner that
+     * saved during the pre-claim legacy era keeps its STALE snapshots
+     * parked instead of reset_to_parent-ing the live request's $GLOBALS /
+     * cwd / statics (the phpt-057 shape-B residual). Legacy mode (no claims
+     * anywhere) restores unconditionally — raw/phpt semantics unchanged. */
+    int zp_restore_ok = 1;
+    if (zend_hash_num_elements(&zealphp_request_coro_cids) > 0
+        && !zend_hash_index_exists(&zealphp_request_coro_ptrs, (zend_ulong)(uintptr_t)arg)) {
+        zp_restore_ok = 0;
+    }
     /* Full $GLOBALS restore runs BEFORE superglobals restore so that
      * the superglobals layer can overwrite the 7 SG slots last and win
      * any race against stale snapshot data. */
-    if (zealphp_coro_globals_hooks_active) {
+    if (zealphp_coro_globals_hooks_active && zp_restore_ok) {
         zealphp_globals_snapshot_restore((zend_long)(uintptr_t)arg);
     }
     zealphp_snapshot_restore((zend_long)(uintptr_t)arg);
-    zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
-    zealphp_ini_snapshot_restore((zend_long)(uintptr_t)arg);
-    zealphp_cwd_snapshot_restore((zend_long)(uintptr_t)arg);
-    zealphp_locale_snapshot_restore((zend_long)(uintptr_t)arg);
-    zealphp_umask_snapshot_restore((zend_long)(uintptr_t)arg);
-    zealphp_statics_snapshot_restore((zend_long)(uintptr_t)arg);
-    if (zealphp_fn_statics_active) {
-        zealphp_fn_statics_snapshot_restore((zend_long)(uintptr_t)arg);
+    if (zp_restore_ok) {
+        zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
+        zealphp_ini_snapshot_restore((zend_long)(uintptr_t)arg);
+        zealphp_cwd_snapshot_restore((zend_long)(uintptr_t)arg);
+        zealphp_locale_snapshot_restore((zend_long)(uintptr_t)arg);
+        zealphp_umask_snapshot_restore((zend_long)(uintptr_t)arg);
+        zealphp_statics_snapshot_restore((zend_long)(uintptr_t)arg);
+        if (zealphp_fn_statics_active) {
+            zealphp_fn_statics_snapshot_restore((zend_long)(uintptr_t)arg);
+        }
     }
 }
 
@@ -1662,6 +1734,13 @@ static void zealphp_on_close(void *arg)
     }
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_sg_owner_cids, (zend_ulong)(uintptr_t)arg);
+    /* #37: a request coroutine closing without reaching superglobals_clear
+     * (fatal, early return) must not stay in the request set forever. */
+    if (os_get_cid) {
+        long zp_c = os_get_cid();
+        if (zp_c > 0) zend_hash_index_del(&zealphp_request_coro_cids, (zend_ulong)zp_c);
+    }
+    zend_hash_index_del(&zealphp_request_coro_ptrs, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
     /* #9: free the request constants that zealphp_constants_clear() ORPHANED on
      * this coroutine — now safe, the request has ended and its run_time_cache is
@@ -2148,7 +2227,11 @@ PHP_FUNCTION(zealphp_request_input_set)
      * go() children's yields must not snapshot-and-steal them (#332). */
     if (os_get_cid) {
         long zealphp_oc = os_get_cid();
-        if (zealphp_oc > 0) zealphp_sg_owner_cid = zealphp_oc;
+        if (zealphp_oc > 0) {
+            zealphp_sg_owner_cid = zealphp_oc;
+            zval zp1; ZVAL_LONG(&zp1, 1);
+            zend_hash_index_update(&zealphp_request_coro_cids, (zend_ulong)zealphp_oc, &zp1);
+        }
         if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] claim(input_set) cid=%ld\n", zealphp_oc);
     }
 }
@@ -2167,6 +2250,8 @@ PHP_FUNCTION(zealphp_superglobals_owner)
         long zealphp_oc = os_get_cid();
         if (zealphp_oc > 0) {
             zealphp_sg_owner_cid = zealphp_oc;
+            zval zp1; ZVAL_LONG(&zp1, 1);
+            zend_hash_index_update(&zealphp_request_coro_cids, (zend_ulong)zealphp_oc, &zp1);
             RETURN_TRUE;
         }
     }
@@ -2181,6 +2266,10 @@ PHP_FUNCTION(zealphp_superglobals_clear)
     /* Request end — the live state is being torn down; release ownership so
      * the next holder starts clean (#32). */
     zealphp_sg_owner_cid = 0;
+    if (os_get_cid) {
+        long zp_c = os_get_cid();
+        if (zp_c > 0) zend_hash_index_del(&zealphp_request_coro_cids, (zend_ulong)zp_c);
+    }
     ZEND_PARSE_PARAMETERS_NONE();
 
     for (const char **n = sg_names; *n; n++) {
@@ -3652,6 +3741,8 @@ PHP_MINIT_FUNCTION(zealphp)
 
     zend_hash_init(&zealphp_coro_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_sg_owner_cids, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_request_coro_cids, 256, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_request_coro_ptrs, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);

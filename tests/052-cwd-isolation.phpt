@@ -56,6 +56,7 @@ Co::run(function () use ($realA, $realB, $base, $wrongA, $wrongB, $leaked, $yiel
         $wg->push(1);
     });
     go(function () use ($realB, $wrongB, $yield, $wg) {
+        zealphp_superglobals_owner(); // B is a peer REQUEST ROOT — it claims too (#37 set semantics)
         chdir($realB);
         for ($i = 0; $i < 3; $i++) {
             $yield();
