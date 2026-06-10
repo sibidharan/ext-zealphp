@@ -1487,20 +1487,29 @@ static void zealphp_snapshot_restore(long cid)
             (sv && Z_TYPE_P(sv) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(sv)) : -1);
     }
 
-    /* Ownership gate on the RESTORE side (#32): a long-lived service
-     * coroutine (the async-log runner) resuming MID-REQUEST — while the
-     * request owner still holds the live superglobals — must not write its
-     * (typically empty) snapshot over them. Only restore when nobody owns
-     * the live state (owner==0: the normal suspended-owner handoff) or when
-     * THIS snapshot's recorded owner is the current holder. The skipped
-     * snapshot is kept for a later legitimate resume. */
+    /* Restore gate (#32 → reworked for #40): the original single-owner
+     * check ("skip when someone else owns") FALSE-SKIPPED a legitimate
+     * request resume — with one worker, request A suspends at I/O, request
+     * B claims ownership and (window) hasn't released it when A resumes; A's
+     * restore was skipped as "owned", so A continued on B's live $_SERVER
+     * (cross-request CONTAMINATION) or on the post-save empties (the
+     * labs-dashboard PHP_SELF= empty flavor). A single owner variable cannot
+     * represent several concurrently-suspended requests — the same #37
+     * disease, in this stage's own gate. The correct discriminator is the
+     * #37 ptr set: a KNOWN request coroutine (recorded at its save) always
+     * restores ITS OWN snapshot; an unclaimed service runner (the #32
+     * async-log case — never saved, never recorded) is skipped in framework
+     * mode. Legacy mode (no claims anywhere) restores unconditionally. */
     {
-        zval *zealphp_oc = zend_hash_index_find(&zealphp_coro_sg_owner_cids, (zend_ulong)cid);
-        long zealphp_snap_cid = (zealphp_oc && Z_TYPE_P(zealphp_oc) == IS_LONG) ? Z_LVAL_P(zealphp_oc) : 0;
-        if (zealphp_sg_owner_cid > 0 && zealphp_snap_cid != zealphp_sg_owner_cid) {
-            if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] restore SKIP(owned) key=%ld snap_cid=%ld owner=%ld\n", cid, zealphp_snap_cid, zealphp_sg_owner_cid);
+        if (zend_hash_num_elements(&zealphp_request_coro_cids) > 0
+            && !zend_hash_index_exists(&zealphp_request_coro_ptrs, (zend_ulong)cid)) {
+            if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] restore SKIP(not-request-ptr) key=%ld owner=%ld\n", cid, zealphp_sg_owner_cid);
             return;
         }
+        /* Re-claim live ownership for the resumed request so ITS children's
+         * yields keep being save-gated (the #332 child-steal protection). */
+        zval *zealphp_oc = zend_hash_index_find(&zealphp_coro_sg_owner_cids, (zend_ulong)cid);
+        long zealphp_snap_cid = (zealphp_oc && Z_TYPE_P(zealphp_oc) == IS_LONG) ? Z_LVAL_P(zealphp_oc) : 0;
         if (zealphp_snap_cid > 0) {
             zealphp_sg_owner_cid = zealphp_snap_cid;
         }
@@ -1724,12 +1733,21 @@ static void zealphp_on_close(void *arg)
     zend_hash_index_del(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg);
     /* Release live-state ownership held by the closing coroutine (#32):
      * a request that ends while owning (e.g. finished without a final
-     * yield) must not leave a stale owner that gates peers' restores. */
+     * yield) must not leave a stale owner that gates peers' restores. #40:
+     * ALSO release by the closing coroutine's cid — a request that claimed
+     * but never yielded has no recorded snapshot owner, so the record-based
+     * check alone left its claim dangling forever. */
     {
         zval *zealphp_oc = zend_hash_index_find(&zealphp_coro_sg_owner_cids, (zend_ulong)(uintptr_t)arg);
         if (zealphp_oc && Z_TYPE_P(zealphp_oc) == IS_LONG
             && Z_LVAL_P(zealphp_oc) == zealphp_sg_owner_cid) {
             zealphp_sg_owner_cid = 0;
+        }
+        if (os_get_cid) {
+            long zp_close_cid = os_get_cid();
+            if (zp_close_cid > 0 && zp_close_cid == zealphp_sg_owner_cid) {
+                zealphp_sg_owner_cid = 0;
+            }
         }
     }
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
@@ -2263,12 +2281,21 @@ PHP_FUNCTION(zealphp_superglobals_owner)
  * to prevent cross-request leakage in coroutine mode. */
 PHP_FUNCTION(zealphp_superglobals_clear)
 {
-    /* Request end — the live state is being torn down; release ownership so
-     * the next holder starts clean (#32). */
-    zealphp_sg_owner_cid = 0;
+    /* Request end — release ownership so the next holder starts clean
+     * (#32), but ONLY when this coroutine is the current owner (#40): a
+     * request finishing its teardown while a RESUMED peer holds the live
+     * state must not strip the peer's claim (that reopens the child-steal
+     * window mid-peer-request). */
     if (os_get_cid) {
         long zp_c = os_get_cid();
-        if (zp_c > 0) zend_hash_index_del(&zealphp_request_coro_cids, (zend_ulong)zp_c);
+        if (zp_c > 0) {
+            if (zealphp_sg_owner_cid == zp_c) {
+                zealphp_sg_owner_cid = 0;
+            }
+            zend_hash_index_del(&zealphp_request_coro_cids, (zend_ulong)zp_c);
+        }
+    } else {
+        zealphp_sg_owner_cid = 0;
     }
     ZEND_PARSE_PARAMETERS_NONE();
 
