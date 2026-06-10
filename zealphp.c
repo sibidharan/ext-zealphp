@@ -24,6 +24,15 @@
 #include "php_zealphp.h"
 #include <dlfcn.h>
 #include <stdio.h>
+/* ext#44 — mysqlnd vio shim needs the mysqlnd structs; absent headers (a PHP
+ * built without mysqlnd) simply compile the shim out. */
+#if defined(__has_include)
+# if __has_include("ext/mysqlnd/mysqlnd.h") && __has_include("ext/mysqlnd/mysqlnd_structs.h")
+#  include "ext/mysqlnd/mysqlnd.h"
+#  include "ext/mysqlnd/mysqlnd_structs.h"
+#  define ZEALPHP_HAVE_MYSQLND_HEADERS 1
+# endif
+#endif
 #include <unistd.h>
 #include <locale.h>
 #include <sys/stat.h>
@@ -2159,6 +2168,84 @@ static void zealphp_on_close(void *arg)
  * Idempotent: once installed, later calls are a no-op returning true. The
  * single shared install path also de-duplicates what were four identical
  * dlsym blocks (M4). */
+#ifdef ZEALPHP_HAVE_MYSQLND_HEADERS
+/* ── mysqlnd vio orig_path allocator-consistency shim (ext#44) ────────
+ *
+ * Root cause (gdb-verified at field level): for a PERSISTENT-KEYED connect,
+ * the generic xport layer strdups stream->orig_path PERSISTENTLY
+ * (transports.c: pestrdup(orig_path, persistent_id ? 1 : 0) → malloc), but a
+ * coroutine-hooked transport factory (OpenSwoole's tcp_socket/coroutine ops)
+ * returns an emalloc'd NON-persistent stream. php_stream_free then frees
+ * orig_path with stream->is_persistent==0 → _efree() on a malloc'd pointer →
+ * Zend MM metadata catastrophe ("zend_mm_heap corrupted") at mysqlnd
+ * connection teardown — the coroutine-legacy WordPress crash. (Stock builds
+ * are consistent: xp_socket honours persistent_id, so the stream itself is
+ * malloc'd persistent and every pefree pairs up. And under USE_ZEND_ALLOC=0
+ * both allocators are malloc → the A/B that pinned this.)
+ *
+ * Fix: wrap the vio open methods via the EXPORTED method table
+ * (mysqlnd_mysqlnd_vio_methods, .data — vio instances copy it BY VALUE at
+ * creation, so patching at boot covers every later vio) and re-pair
+ * orig_path with the stream's actual allocator right after creation. The
+ * free(old) is safe precisely because persistent-keyed ⇒ pestrdup(,1) ⇒
+ * malloc'd. Covers every later free path (dtor, explicit close, error).
+ * Opt out: ZEALPHP_MYSQLND_SHIM_DISABLE=1. */
+static func_mysqlnd_vio__open_stream zealphp_orig_vio_open_tcp = NULL;
+static func_mysqlnd_vio__open_stream zealphp_orig_vio_open_pipe = NULL;
+
+static void zealphp_fix_stream_orig_path(php_stream *s, bool persistent_keyed,
+                                         const MYSQLND_CSTRING scheme)
+{
+    if (s && persistent_keyed && !s->is_persistent && s->orig_path) {
+        char *zp_fixed = pestrdup(s->orig_path, 0);
+        free(s->orig_path);   /* persistent-keyed ⇒ malloc'd (see block comment) */
+        s->orig_path = zp_fixed;
+        if (zealphp_sg_dbg()) {
+            fprintf(stderr, "[MND] orig_path re-paired stream=%p scheme=%.*s\n",
+                    (void *)s, (int)scheme.l, scheme.s ? scheme.s : "");
+        }
+    }
+}
+
+static php_stream * zealphp_vio_open_tcp_or_unix_shim(MYSQLND_VIO * const vio,
+        const MYSQLND_CSTRING scheme, const bool persistent,
+        MYSQLND_STATS * const conn_stats, MYSQLND_ERROR_INFO * const error_info)
+{
+    php_stream *zp_s = zealphp_orig_vio_open_tcp(vio, scheme, persistent, conn_stats, error_info);
+    zealphp_fix_stream_orig_path(zp_s, persistent, scheme);
+    return zp_s;
+}
+
+static php_stream * zealphp_vio_open_pipe_shim(MYSQLND_VIO * const vio,
+        const MYSQLND_CSTRING scheme, const bool persistent,
+        MYSQLND_STATS * const conn_stats, MYSQLND_ERROR_INFO * const error_info)
+{
+    php_stream *zp_s = zealphp_orig_vio_open_pipe(vio, scheme, persistent, conn_stats, error_info);
+    zealphp_fix_stream_orig_path(zp_s, persistent, scheme);
+    return zp_s;
+}
+
+static void zealphp_install_mysqlnd_vio_shim(void)
+{
+    if (zealphp_orig_vio_open_tcp) {
+        return;   /* installed once */
+    }
+    const char *zp_dis = getenv("ZEALPHP_MYSQLND_SHIM_DISABLE");
+    if (zp_dis && *zp_dis == '1') {
+        return;
+    }
+    MYSQLND_CLASS_METHODS_TYPE(mysqlnd_vio) *zp_m =
+        (MYSQLND_CLASS_METHODS_TYPE(mysqlnd_vio) *)dlsym(RTLD_DEFAULT, "mysqlnd_mysqlnd_vio_methods");
+    if (!zp_m || !zp_m->open_tcp_or_unix || !zp_m->open_pipe) {
+        return;   /* mysqlnd absent / unexported — shim stays off */
+    }
+    zealphp_orig_vio_open_tcp = zp_m->open_tcp_or_unix;
+    zp_m->open_tcp_or_unix = zealphp_vio_open_tcp_or_unix_shim;
+    zealphp_orig_vio_open_pipe = zp_m->open_pipe;
+    zp_m->open_pipe = zealphp_vio_open_pipe_shim;
+}
+#endif /* ZEALPHP_HAVE_MYSQLND_HEADERS */
+
 static bool zealphp_install_coro_hooks(void)
 {
     if (zealphp_coro_wrappers_installed) {
@@ -2208,6 +2295,11 @@ static bool zealphp_install_coro_hooks(void)
     os_set_on_resume(zealphp_on_resume);
     os_set_on_close(zealphp_on_close);
     zealphp_coro_wrappers_installed = true;
+#ifdef ZEALPHP_HAVE_MYSQLND_HEADERS
+    /* ext#44 — the orig_path mismatch only exists under hooked transports,
+     * so the vio shim rides the same activation. */
+    zealphp_install_mysqlnd_vio_shim();
+#endif
     return true;
 }
 
