@@ -277,6 +277,31 @@ static bool zealphp_include_isolation_enabled = false;
  * fresh (absent) set; on_close drops the entry when the coroutine ends. */
 static HashTable zealphp_coro_reincluded;
 
+/* ── exit()/die() → ZealPHP\HaltException (ext#47) ──────────────────── */
+
+/* Under coroutine concurrency, OpenSwoole turns exit()/die() into a thrown
+ * OpenSwoole\ExitException — which extends \Exception, so the ubiquitous
+ * Apache-migration idiom `try { … exit; … } catch (\Exception $e)` catches
+ * the NORMAL exit and converts it into an error response (FreshRSS 500s on
+ * every redirecting POST, DokuWiki's fatal-handler swallow, CodeIgniter 4's
+ * 0-byte bodies). This hook layers ABOVE OpenSwoole's: when the exit happens
+ * inside a coroutine and the framework's ZealPHP\HaltException class is
+ * loaded (it extends \Error BY DESIGN, so catch(\Exception) cannot grab it),
+ * we throw THAT instead; in every other situation we delegate to the saved
+ * handler (OpenSwoole's — ExitException in-server, true exit on plain CLI).
+ * The class is looked up WITHOUT autoload (re-entering the autoloader from
+ * an exit site is not safe); the framework guarantees it is loaded at boot.
+ * PHP >= 8.4: exit() is a real function — chain its zif handler. PHP < 8.4:
+ * chain the ZEND_EXIT user opcode handler, status extracted from op1 the
+ * same way OpenSwoole's coro_exit_handler does. */
+static bool zealphp_exit_hook_active = false;
+#if PHP_VERSION_ID >= 80400
+static zif_handler zealphp_orig_exit_handler = NULL;
+#elif defined(ZEND_EXIT)
+static user_opcode_handler_t zealphp_orig_exit_opcode_handler = NULL;
+static bool zealphp_exit_opcode_hooked = false;
+#endif
+
 /* ── Per-request define() isolation ─────────────────────────────────── */
 
 /* Track constants defined during the current request so they can be
@@ -3610,6 +3635,158 @@ PHP_FUNCTION(zealphp_define_hook)
     RETURN_BOOL(zealphp_define_hooked);
 }
 
+/* ── exit()/die() interception (ext#47) ───────────────────────────── */
+
+/* Throw ZealPHP\HaltException carrying the exit status. Returns true when
+ * thrown, false when the class is not loaded and the caller must delegate
+ * to the saved OpenSwoole/engine behaviour. The lookup deliberately does
+ * NOT autoload (re-entering the autoloader from an exit site is unsafe) —
+ * the framework class_exists()-loads HaltException before enabling the
+ * hook. The `status` property is only written when the class declares it
+ * (an older framework without the property still gets the throw; writing
+ * an undeclared property would trip the dynamic-property deprecation). */
+static bool zealphp_throw_halt(zend_string *message, zend_long status_long)
+{
+    zend_string *lc = zend_string_init(ZEND_STRL("zealphp\\haltexception"), 0);
+    zend_class_entry *ce = zend_hash_find_ptr(EG(class_table), lc);
+    zend_string_release(lc);
+    if (!ce) {
+        return false;
+    }
+
+    zend_object *obj = zend_throw_exception(ce,
+        message ? ZSTR_VAL(message) : "zealphp exit", 0);
+    if (obj && zend_hash_str_exists(&ce->properties_info, ZEND_STRL("status"))) {
+        zval ex;
+        ZVAL_OBJ(&ex, obj);
+        if (message) {
+            zend_update_property_str(ce, Z_OBJ(ex), ZEND_STRL("status"), message);
+        } else {
+            zend_update_property_long(ce, Z_OBJ(ex), ZEND_STRL("status"), status_long);
+        }
+    }
+    return true;
+}
+
+#if PHP_VERSION_ID >= 80400
+/* PHP 8.4+: exit()/die() is a real internal function (OpenSwoole already
+ * replaced its handler at MINIT to throw ExitException in-coroutine /
+ * in-server). We layer ABOVE that saved handler: HaltException when inside
+ * a coroutine with the framework loaded, delegate otherwise. */
+static ZEND_NAMED_FUNCTION(zealphp_exit_intercept)
+{
+    if (zealphp_exit_hook_active && os_get_cid && os_get_cid() > 0) {
+        zend_string *message = NULL;
+        zend_long status = 0;
+        ZEND_PARSE_PARAMETERS_START(0, 1)
+            Z_PARAM_OPTIONAL
+            Z_PARAM_STR_OR_LONG(message, status)
+        ZEND_PARSE_PARAMETERS_END();
+        if (zealphp_throw_halt(message, status)) {
+            return;
+        }
+    }
+    if (zealphp_orig_exit_handler) {
+        zealphp_orig_exit_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    }
+}
+#elif defined(ZEND_EXIT)
+/* PHP < 8.4: exit compiles to the ZEND_EXIT opcode. Status extraction
+ * mirrors OpenSwoole's coro_exit_handler; throw-then-DISPATCH is the same
+ * proven shape (the VM's exception check unwinds before the opcode body). */
+static int zealphp_exit_opcode_handler(zend_execute_data *execute_data)
+{
+    if (zealphp_exit_hook_active && os_get_cid && os_get_cid() > 0) {
+        const zend_op *opline = EX(opline);
+        zval *exit_status = NULL;
+        if (opline->op1_type != IS_UNUSED) {
+            if (opline->op1_type == IS_CONST) {
+                exit_status = RT_CONSTANT(opline, opline->op1);
+            } else {
+                exit_status = EX_VAR(opline->op1.var);
+            }
+            if (exit_status && Z_ISREF_P(exit_status)) {
+                exit_status = Z_REFVAL_P(exit_status);
+            }
+        }
+        zend_string *msg = (exit_status && Z_TYPE_P(exit_status) == IS_STRING)
+            ? Z_STR_P(exit_status) : NULL;
+        zend_long stl = (exit_status && Z_TYPE_P(exit_status) == IS_LONG)
+            ? Z_LVAL_P(exit_status) : 0;
+        if (zealphp_throw_halt(msg, stl)) {
+            return ZEND_USER_OPCODE_DISPATCH;
+        }
+    }
+    if (zealphp_orig_exit_opcode_handler) {
+        return zealphp_orig_exit_opcode_handler(execute_data);
+    }
+    return ZEND_USER_OPCODE_DISPATCH;
+}
+#endif
+
+/* zealphp_exit_hook(bool): bool — toggle the exit()/die() interceptor.
+ * Enable at boot AFTER OpenSwoole is loaded (the saved handler must be
+ * OpenSwoole's) and AFTER class_exists(ZealPHP\HaltException::class).
+ * On <8.4 disable is flag-gated (the opcode handler stays installed and
+ * delegates) — swapping user opcode handlers back mid-run is not safe. */
+PHP_FUNCTION(zealphp_exit_hook)
+{
+    bool enable;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_BOOL(enable)
+    ZEND_PARSE_PARAMETERS_END();
+
+#if PHP_VERSION_ID >= 80400
+    if (enable && !zealphp_exit_hook_active) {
+        zend_string *name = zend_string_init(ZEND_STRL("exit"), 0);
+        zend_function *func = zend_hash_find_ptr(CG(function_table), name);
+        if (func && func->type == ZEND_INTERNAL_FUNCTION
+            && func->internal_function.handler != zealphp_exit_intercept) {
+            zealphp_orig_exit_handler = func->internal_function.handler;
+            func->internal_function.handler = zealphp_exit_intercept;
+            zealphp_exit_hook_active = true;
+        }
+        zend_string_release(name);
+    } else if (!enable && zealphp_exit_hook_active) {
+        zend_string *name = zend_string_init(ZEND_STRL("exit"), 0);
+        zend_function *func = zend_hash_find_ptr(CG(function_table), name);
+        if (func && zealphp_orig_exit_handler
+            && func->internal_function.handler == zealphp_exit_intercept) {
+            func->internal_function.handler = zealphp_orig_exit_handler;
+        }
+        zealphp_orig_exit_handler = NULL;
+        zealphp_exit_hook_active = false;
+        zend_string_release(name);
+    }
+#elif defined(ZEND_EXIT)
+    if (enable && !zealphp_exit_hook_active) {
+        if (!os_get_cid) {
+            /* dlsym'd in MINIT — NULL means OpenSwoole isn't loaded, so
+             * there is no coroutine context to gate on (and no ExitException
+             * behaviour to fix). Refuse cleanly. */
+            php_error_docref(NULL, E_WARNING,
+                "ext-zealphp: exit hook needs OpenSwoole's coroutine API");
+            RETURN_FALSE;
+        }
+        if (!zealphp_exit_opcode_hooked) {
+            zealphp_orig_exit_opcode_handler = zend_get_user_opcode_handler(ZEND_EXIT);
+            zend_set_user_opcode_handler(ZEND_EXIT, zealphp_exit_opcode_handler);
+            zealphp_exit_opcode_hooked = true;
+        }
+        zealphp_exit_hook_active = true;
+    } else if (!enable) {
+        zealphp_exit_hook_active = false;
+    }
+#else
+    if (enable) {
+        php_error_docref(NULL, E_WARNING,
+            "ext-zealphp: exit hook is unsupported on this PHP build");
+    }
+#endif
+
+    RETURN_BOOL(zealphp_exit_hook_active);
+}
+
 /* ── Module lifecycle ────────────────────────────────────────────── */
 
 /* ── Stage 3: silent-redeclare opcode hooks ───────────────────────────
@@ -4882,6 +5059,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_define_hook, 0, 1, _IS_B
     ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_exit_hook, 0, 1, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, enable, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_protect_classes, 0, 1, IS_VOID, 0)
     ZEND_ARG_TYPE_INFO(0, names, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
@@ -5290,6 +5471,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_constants_clear,        arginfo_zealphp_constants_clear)
     PHP_FE(zealphp_ini_restore,           arginfo_zealphp_ini_restore)
     PHP_FE(zealphp_define_hook,            arginfo_zealphp_define_hook)
+    PHP_FE(zealphp_exit_hook,              arginfo_zealphp_exit_hook)
     PHP_FE(zealphp_require_global,         arginfo_zealphp_require_global)
     PHP_FE(zealphp_globals_snapshot,       arginfo_zealphp_globals_snapshot)
     PHP_FE(zealphp_globals_clean,          arginfo_zealphp_globals_clean)
