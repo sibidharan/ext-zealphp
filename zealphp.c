@@ -204,6 +204,25 @@ static HashTable zealphp_coro_globals_deltas;      /* coro-ptr → zval-array (l
 static HashTable zealphp_coro_globals_tombstones;  /* coro-ptr → zval-array (set of deleted keys) */
 static bool zealphp_coro_globals_hooks_active = false;
 
+/* Stage-8 object-global isolation (object-store-corruption fix).
+ * coro-ptr → zval-array(key → OBJECT). Holds, per coroutine, the OBJECT-valued
+ * globals that live as IS_INDIRECT top-code frame CVs in the SHARED
+ * EG(symbol_table) (the `App::globalScopeInclude(true)` / zealphp_require_global
+ * path). Those slots are deliberately SKIPPED by the delta path (the #10/#033
+ * IS_INDIRECT master-frame guard) and so were never isolated — two concurrent
+ * coroutines' top-code frames share one symbol table, the second's
+ * zend_attach_symbol_table COPY_VALUE-aliases the first's object pointer (no
+ * addref) into its own frame slot, and whichever frame unwinds/overwrites first
+ * frees the object out from under the peer → EG(objects_store) free-list
+ * poison → SIGSEGV in the next zend_objects_store_put (a closure/clone/fopen in
+ * ANY coroutine). We can't isolate via the bucket (post-attach each coroutine
+ * reads its OWN frame CV directly), so we save the object here on yield + NULL
+ * the owning frame CV, and on resume re-derive the resuming coroutine's frame CV
+ * and write the object back into it. The registry holds one ref for the
+ * suspended lifetime; request-end / on_close frees it (dtor in coroutine ctx via
+ * the request-end drain, same contract as the object-delta). */
+static HashTable zealphp_coro_indirect_objs;
+
 /* os_get_cid() (integer) → Coroutine* (the pointer the deltas above are keyed by).
  * The scheduler callbacks key everything by the coroutine POINTER (arg), which is
  * NOT available in PHP execution context — but os_get_cid() IS reliable there. So
@@ -1413,6 +1432,52 @@ static bool zealphp_globals_isolatable_obj(zval *v)
     return Z_TYPE_P(v) != IS_RESOURCE;   /* objects YES, resources NO */
 }
 
+/* Stage-8 helpers (object-store-corruption fix) ───────────────────────
+ *
+ * Is `target` (the deref of an IS_INDIRECT EG(symbol_table) bucket) a CV slot of
+ * a top-code frame on the CURRENT coroutine's call chain that shares
+ * &EG(symbol_table)? That is exactly a `zealphp_require_global` (Stage-8) request
+ * global-scope var. Walking the current coroutine's execute_data chain naturally
+ * EXCLUDES the master boot frame (app.php's `$app` etc.) — the master frame is on
+ * the MAIN context's stack, never on a worker coroutine's chain — so we isolate
+ * request globals without ever touching genuine master-frame CVs. */
+static bool zealphp_indirect_in_request_frame(const zval *target)
+{
+    zend_execute_data *ex = EG(current_execute_data);
+    for (; ex; ex = ex->prev_execute_data) {
+        if (!ex->func || !ZEND_USER_CODE(ex->func->type)) continue;
+        if (ex->symbol_table != &EG(symbol_table)) continue;   /* only shared-global frames */
+        uint32_t nvars = ex->func->op_array.last_var;
+        if (nvars == 0) continue;
+        const zval *lo = ZEND_CALL_VAR_NUM(ex, 0);
+        const zval *hi = ZEND_CALL_VAR_NUM(ex, nvars);   /* one past the last CV */
+        if (target >= lo && target < hi) return true;
+    }
+    return false;
+}
+
+/* Re-derive the resuming coroutine's frame CV slot for `key` — the top-code frame
+ * (shared symbol table) whose op_array declares a CV named `key`. Returns the slot
+ * pointer, or NULL if no such live frame (coroutine already unwound past it).
+ * Used on resume to write a saved Stage-8 object global back into the CORRECT
+ * frame slot rather than through the shared bucket (which a peer may have
+ * repointed). */
+static zval *zealphp_find_request_frame_cv(zend_string *key)
+{
+    zend_execute_data *ex = EG(current_execute_data);
+    for (; ex; ex = ex->prev_execute_data) {
+        if (!ex->func || !ZEND_USER_CODE(ex->func->type)) continue;
+        if (ex->symbol_table != &EG(symbol_table)) continue;
+        zend_op_array *oa = &ex->func->op_array;
+        for (uint32_t i = 0; i < oa->last_var; i++) {
+            if (zend_string_equals(oa->vars[i], key)) {
+                return ZEND_CALL_VAR_NUM(ex, i);
+            }
+        }
+    }
+    return NULL;
+}
+
 /* Take the shared parent snapshot from current EG(symbol_table). Called
  * once when zealphp_coroutine_globals(true) flips on. Deep-copies every
  * non-superglobal user var so the parent owns its storage. */
@@ -1573,6 +1638,43 @@ static void zealphp_globals_snapshot_save(long cid)
 
     zend_hash_index_update(&zealphp_coro_globals_deltas, (zend_ulong)cid, &delta);
 
+    /* Pass 1b — Stage-8 object globals (object-store-corruption fix). The delta
+     * pass above SKIPS IS_INDIRECT object globals (the #10/#033 master-frame
+     * guard). Those that belong to THIS coroutine's request global-scope frame
+     * must be isolated so a peer's zend_attach_symbol_table can't alias+free the
+     * object: save the object into the per-coroutine registry (one held ref) and
+     * NULL the owning frame CV, leaving the bucket pointing at a NULL slot so the
+     * next coroutine's attach copies NULL, not a live pointer. Re-applied to the
+     * correct frame CV on resume. */
+    {
+        zend_string *ikey;
+        zval *ival;
+        zval *reg = NULL;   /* lazily created per-cid registry array */
+        ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), ikey, ival) {
+            if (!ikey) continue;
+            if (Z_TYPE_P(ival) != IS_INDIRECT) continue;
+            zval *tgt = Z_INDIRECT_P(ival);
+            if (Z_ISREF_P(tgt)) tgt = Z_REFVAL_P(tgt);
+            if (Z_TYPE_P(tgt) != IS_OBJECT) continue;     /* objects only; scalars rely on the frame */
+            if (zealphp_globals_is_superglobal_key(ZSTR_VAL(ikey), ZSTR_LEN(ikey))) continue;
+            if (!zealphp_indirect_in_request_frame(tgt)) continue;  /* skip master-frame CVs */
+
+            if (!reg) {
+                reg = zend_hash_index_find(&zealphp_coro_indirect_objs, (zend_ulong)cid);
+                if (!reg) {
+                    zval arr;
+                    array_init(&arr);
+                    reg = zend_hash_index_add_new(&zealphp_coro_indirect_objs, (zend_ulong)cid, &arr);
+                }
+            }
+            zval held;
+            ZVAL_COPY(&held, tgt);                          /* +1: registry holds the object */
+            zend_hash_update(Z_ARRVAL_P(reg), ikey, &held); /* frees a prior entry (replaced object) */
+            zval_ptr_dtor(tgt);                             /* drop the frame CV's ref */
+            ZVAL_NULL(tgt);                                 /* leave the bucket pointing at NULL */
+        } ZEND_HASH_FOREACH_END();
+    }
+
     /* Pass 2: tombstone parent keys that are now absent from EG. */
     if (zealphp_coro_globals_parent_set) {
         zval tombstones;
@@ -1658,6 +1760,53 @@ static void zealphp_globals_snapshot_restore(long cid)
         } ZEND_HASH_FOREACH_END();
     }
 
+    /* Step 2b — re-apply Stage-8 object globals into THIS coroutine's frame CVs
+     * (object-store-corruption fix). On yield we saved each into the registry and
+     * NULLed its frame CV; write it back into the correct frame slot (re-derived
+     * from the resuming coroutine's live frame chain — NOT through the shared
+     * bucket, which a peer may have repointed at its own frame) and re-point the
+     * bucket IS_INDIRECT → our slot so $GLOBALS/symbol-table reads stay coherent.
+     * If the owning frame already unwound (a since-returned require_once), fall
+     * back to a real bucket zval so the value survives. */
+    zval *iobjs = zend_hash_index_find(&zealphp_coro_indirect_objs, (zend_ulong)cid);
+    if (iobjs && Z_TYPE_P(iobjs) == IS_ARRAY) {
+        zend_string *okey;
+        zval *oval;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(iobjs), okey, oval) {
+            if (!okey) continue;
+            zval *slot = zealphp_find_request_frame_cv(okey);
+            if (slot) {
+                zval old;
+                ZVAL_COPY_VALUE(&old, slot);
+                ZVAL_COPY(slot, oval);            /* +1: frame CV gets the object */
+                zval_ptr_dtor(&old);              /* drop whatever the slot held (NULL → no-op) */
+                zval *b = zend_hash_find(&EG(symbol_table), okey);
+                if (b) {
+                    if (Z_TYPE_P(b) != IS_INDIRECT) zval_ptr_dtor(b);
+                    ZVAL_INDIRECT(b, slot);
+                } else {
+                    zval ind;
+                    ZVAL_INDIRECT(&ind, slot);
+                    zend_hash_add_new(&EG(symbol_table), okey, &ind);
+                }
+            } else {
+                /* Frame gone — materialise as a real bucket zval. */
+                zval *b = zend_hash_find(&EG(symbol_table), okey);
+                if (b) {
+                    if (Z_TYPE_P(b) == IS_INDIRECT) b = Z_INDIRECT_P(b);
+                    zval old;
+                    ZVAL_COPY_VALUE(&old, b);
+                    ZVAL_COPY(b, oval);
+                    zval_ptr_dtor(&old);
+                } else {
+                    zval copy;
+                    ZVAL_COPY(&copy, oval);
+                    zend_hash_add_new(&EG(symbol_table), okey, &copy);
+                }
+            }
+        } ZEND_HASH_FOREACH_END();
+    }
+
     /* Step 3 — delete tombstoned keys (parent keys this coroutine unset). */
     zval *tombs = zend_hash_index_find(&zealphp_coro_globals_tombstones, (zend_ulong)cid);
     if (tombs && Z_TYPE_P(tombs) == IS_ARRAY) {
@@ -1676,6 +1825,12 @@ static void zealphp_globals_snapshot_delete(long cid)
 {
     zend_hash_index_del(&zealphp_coro_globals_deltas,     (zend_ulong)cid);
     zend_hash_index_del(&zealphp_coro_globals_tombstones, (zend_ulong)cid);
+    /* Releases this coroutine's held refs to its Stage-8 object globals. When
+     * called from the request-end drain (coroutine context) an I/O __destruct
+     * (e.g. the connection closing under HOOK_ALL) runs safely; from on_close
+     * (the abnormal-exit backstop) it shares the same out-of-coroutine caveat as
+     * the object-delta drain. */
+    zend_hash_index_del(&zealphp_coro_indirect_objs,      (zend_ulong)cid);
 }
 
 /* Defined below (~1713); forward-declared so snapshot_save()/snapshot_restore()
@@ -2886,6 +3041,7 @@ PHP_FUNCTION(zealphp_coroutine_globals)
         zealphp_coro_globals_hooks_active = false;
         zend_hash_clean(&zealphp_coro_globals_deltas);
         zend_hash_clean(&zealphp_coro_globals_tombstones);
+        zend_hash_clean(&zealphp_coro_indirect_objs);
         /* Drop the shared parent so the next enable re-snapshots fresh. */
         zealphp_globals_parent_clear();
         RETURN_TRUE;
@@ -4409,6 +4565,9 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_fn_static_registry, 256, NULL, NULL, 0);
     zend_hash_init(&zealphp_coro_globals_deltas,     256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_globals_tombstones, 256, NULL, ZVAL_PTR_DTOR, 0);
+    /* Stage-8 object-global registry: cid → array(key → object). ZVAL_PTR_DTOR
+     * releases held object refs when a coroutine's entry is deleted. */
+    zend_hash_init(&zealphp_coro_indirect_objs,      256, NULL, ZVAL_PTR_DTOR, 0);
     /* cid→Coroutine* bridge (raw pointers, NULL dtor — the deltas own the zvals). */
     zend_hash_init(&zealphp_coro_cid_to_ptr, 64, NULL, NULL, 0);
     /* persistent=0 — parent snapshot contents come from the per-request heap.

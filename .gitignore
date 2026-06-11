@@ -28,3 +28,5 @@ tests/*.log
 tests/*.out
 tests/*.php
 tests/*.sh
+config.h.in~
+configure~
