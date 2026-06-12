@@ -1457,50 +1457,46 @@ static bool zealphp_globals_isolatable_obj(zval *v)
     return Z_TYPE_P(v) != IS_RESOURCE;   /* objects YES, resources NO */
 }
 
-/* Stage-8 helpers (object-store-corruption fix) ───────────────────────
+/* Stage-8 helpers (object-store-corruption fix, generalized for ext#52) ──
  *
- * Is `target` (the deref of an IS_INDIRECT EG(symbol_table) bucket) a CV slot of
- * a top-code frame on the CURRENT coroutine's call chain that shares
- * &EG(symbol_table)? That is exactly a `zealphp_require_global` (Stage-8) request
- * global-scope var. Walking the current coroutine's execute_data chain naturally
- * EXCLUDES the master boot frame (app.php's `$app` etc.) — the master frame is on
- * the MAIN context's stack, never on a worker coroutine's chain — so we isolate
- * request globals without ever touching genuine master-frame CVs. */
-static bool zealphp_indirect_in_request_frame(const zval *target)
-{
-    zend_execute_data *ex = EG(current_execute_data);
-    for (; ex; ex = ex->prev_execute_data) {
-        if (!ex->func || !ZEND_USER_CODE(ex->func->type)) continue;
-        if (ex->symbol_table != &EG(symbol_table)) continue;   /* only shared-global frames */
-        uint32_t nvars = ex->func->op_array.last_var;
-        if (nvars == 0) continue;
-        const zval *lo = ZEND_CALL_VAR_NUM(ex, 0);
-        const zval *hi = ZEND_CALL_VAR_NUM(ex, nvars);   /* one past the last CV */
-        if (target >= lo && target < hi) return true;
-    }
-    return false;
-}
+ * A CV slot of a top-code frame on the CURRENT coroutine's call chain that
+ * shares &EG(symbol_table) is exactly a `zealphp_require_global` (Stage-8)
+ * request global-scope var. Walking the current coroutine's execute_data chain
+ * naturally EXCLUDES the master boot frame (app.php's `$app` etc.) — the
+ * master frame is on the MAIN context's stack, never on a worker coroutine's
+ * chain — so we isolate request globals without ever touching genuine
+ * master-frame CVs.
+ *
+ * Per-yield hot path (ext#52 perf): snapshot_save tests EVERY IS_INDIRECT
+ * bucket against the request frames; re-walking the execute_data chain per key
+ * is O(keys × frames). Collect the CV slot ranges ONCE per save instead — the
+ * per-key test collapses to a handful of pointer comparisons. */
+typedef struct { const zval *lo; const zval *hi; } zealphp_frame_range;
+#define ZEALPHP_MAX_REQ_FRAME_RANGES 64
 
-/* Re-derive the resuming coroutine's frame CV slot for `key` — the top-code frame
- * (shared symbol table) whose op_array declares a CV named `key`. Returns the slot
- * pointer, or NULL if no such live frame (coroutine already unwound past it).
- * Used on resume to write a saved Stage-8 object global back into the CORRECT
- * frame slot rather than through the shared bucket (which a peer may have
- * repointed). */
-static zval *zealphp_find_request_frame_cv(zend_string *key)
+static int zealphp_collect_request_frame_ranges(zealphp_frame_range *out, int max)
 {
+    int n = 0;
     zend_execute_data *ex = EG(current_execute_data);
-    for (; ex; ex = ex->prev_execute_data) {
+    for (; ex && n < max; ex = ex->prev_execute_data) {
         if (!ex->func || !ZEND_USER_CODE(ex->func->type)) continue;
         if (ex->symbol_table != &EG(symbol_table)) continue;
-        zend_op_array *oa = &ex->func->op_array;
-        for (uint32_t i = 0; i < oa->last_var; i++) {
-            if (zend_string_equals(oa->vars[i], key)) {
-                return ZEND_CALL_VAR_NUM(ex, i);
-            }
-        }
+        uint32_t nvars = ex->func->op_array.last_var;
+        if (nvars == 0) continue;
+        out[n].lo = ZEND_CALL_VAR_NUM(ex, 0);
+        out[n].hi = ZEND_CALL_VAR_NUM(ex, nvars);
+        n++;
     }
-    return NULL;
+    return n;
+}
+
+static zend_always_inline bool zealphp_ptr_in_frame_ranges(
+    const zval *t, const zealphp_frame_range *r, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (t >= r[i].lo && t < r[i].hi) return true;
+    }
+    return false;
 }
 
 /* Take the shared parent snapshot from current EG(symbol_table). Called
@@ -1630,6 +1626,12 @@ static void zealphp_globals_snapshot_save(long cid)
 {
     if (!EG(symbol_table).nTableMask) return;
 
+    /* ext#52 perf: one frame-chain walk per save; per-key tests below are a
+     * few pointer comparisons instead of an O(frames) re-walk each. */
+    zealphp_frame_range zp_ranges[ZEALPHP_MAX_REQ_FRAME_RANGES];
+    int zp_nranges = zealphp_collect_request_frame_ranges(
+        zp_ranges, ZEALPHP_MAX_REQ_FRAME_RANGES);
+
     zval delta;
     array_init(&delta);
 
@@ -1645,7 +1647,15 @@ static void zealphp_globals_snapshot_save(long cid)
          * on restore. */
         bool indirect = (Z_TYPE_P(val) == IS_INDIRECT);
         zval *uv = val;
-        if (indirect) uv = Z_INDIRECT_P(uv);
+        if (indirect) {
+            uv = Z_INDIRECT_P(uv);
+            /* ext#52: a request-frame CV is parked through the Pass-1b registry
+             * below (ALL value types as of 0.3.49, not just objects). Capturing
+             * it into the delta too would double-apply on resume and write
+             * through a bucket a peer's zend_attach_symbol_table may have
+             * repointed at ITS frame. The registry owns request-frame slots. */
+            if (zealphp_ptr_in_frame_ranges(uv, zp_ranges, zp_nranges)) continue;
+        }
         if (Z_ISREF_P(uv)) uv = Z_REFVAL_P(uv);  /* deref global-keyword refs */
         if (Z_TYPE_P(uv) == IS_UNDEF) continue;  /* indirect to an unset CV — nothing to capture */
         if (!zealphp_globals_isolatable_obj(uv)) continue;  /* resources stay shared; objects isolated + drained at request-end */
@@ -1663,14 +1673,27 @@ static void zealphp_globals_snapshot_save(long cid)
 
     zend_hash_index_update(&zealphp_coro_globals_deltas, (zend_ulong)cid, &delta);
 
-    /* Pass 1b — Stage-8 object globals (object-store-corruption fix). The delta
-     * pass above SKIPS IS_INDIRECT object globals (the #10/#033 master-frame
-     * guard). Those that belong to THIS coroutine's request global-scope frame
-     * must be isolated so a peer's zend_attach_symbol_table can't alias+free the
-     * object: save the object into the per-coroutine registry (one held ref) and
-     * NULL the owning frame CV, leaving the bucket pointing at a NULL slot so the
-     * next coroutine's attach copies NULL, not a live pointer. Re-applied to the
-     * correct frame CV on resume. */
+    /* Pass 1b — Stage-8 request-frame globals (store-corruption fix, generalized
+     * for ext#52). The delta pass above SKIPS IS_INDIRECT request-frame globals.
+     * Every value that belongs to THIS coroutine's request global-scope frame
+     * must be PARKED across the yield, because the engine's symbol-table
+     * protocol (zend_attach_symbol_table / zend_detach_symbol_table / the
+     * re-attach in zend_leave_helper) MOVES values between frame CVs with no
+     * refcount change, assuming a single flow of control. A concurrent Stage-8
+     * request's attach hijacks the shared bucket, moves OUR value into ITS
+     * frame, and leaves a stale alias in our CV — our next write to that CV
+     * (e.g. the next foreach iteration) then dtors a payload we no longer own
+     * → over-free → heap corruption (ext#52: DokuWiki $config_group, ASAN-
+     * pinned; v0.3.47 parked IS_OBJECT only — "scalars rely on the frame" was
+     * exactly the bug, strings/arrays die the same way).
+     *
+     * Park = save the value into the per-coroutine registry (one held ref),
+     * NULL the frame CV, and SEVER the bucket to a plain NULL (0.3.49 — no
+     * longer left IS_INDIRECT at a parked slot). Invariant: at every suspension
+     * point NO bucket is INDIRECT into any request frame, so a peer's attach
+     * can only ever move a plain NULL and the parent-baseline reset never
+     * writes into a parked frame slot. Re-applied to the correct frame CV (and
+     * the bucket re-pointed) by restore Step 2b on resume. */
     {
         zend_string *ikey;
         zval *ival;
@@ -1679,10 +1702,18 @@ static void zealphp_globals_snapshot_save(long cid)
             if (!ikey) continue;
             if (Z_TYPE_P(ival) != IS_INDIRECT) continue;
             zval *tgt = Z_INDIRECT_P(ival);
-            if (Z_ISREF_P(tgt)) tgt = Z_REFVAL_P(tgt);
-            if (Z_TYPE_P(tgt) != IS_OBJECT) continue;     /* objects only; scalars rely on the frame */
+            /* Frame-range test on the CV SLOT pointer, BEFORE any REF deref —
+             * a `global $x`-bound CV is IS_REFERENCE and its refval lives on
+             * the HEAP (&ref->val), never inside a VM-stack page, so testing
+             * the post-deref pointer silently exempted every REF-wrapped slot
+             * from parking (the residual ext#52 crash: the unparked bucket
+             * stayed INDIRECT across the yield, a peer's attach moved the REF
+             * bytes, and the peer's detach-update freed the zend_reference
+             * while stale aliases survived). */
+            if (!zealphp_ptr_in_frame_ranges(tgt, zp_ranges, zp_nranges)) continue;  /* skip master-frame CVs */
             if (zealphp_globals_is_superglobal_key(ZSTR_VAL(ikey), ZSTR_LEN(ikey))) continue;
-            if (!zealphp_indirect_in_request_frame(tgt)) continue;  /* skip master-frame CVs */
+            if (Z_ISREF_P(tgt)) tgt = Z_REFVAL_P(tgt);
+            if (Z_TYPE_P(tgt) == IS_UNDEF) continue;      /* nothing to park */
 
             if (!reg) {
                 reg = zend_hash_index_find(&zealphp_coro_indirect_objs, (zend_ulong)cid);
@@ -1693,10 +1724,11 @@ static void zealphp_globals_snapshot_save(long cid)
                 }
             }
             zval held;
-            ZVAL_COPY(&held, tgt);                          /* +1: registry holds the object */
-            zend_hash_update(Z_ARRVAL_P(reg), ikey, &held); /* frees a prior entry (replaced object) */
+            ZVAL_COPY(&held, tgt);                          /* +1: registry holds the value */
+            zend_hash_update(Z_ARRVAL_P(reg), ikey, &held); /* frees a prior entry (replaced value) */
             zval_ptr_dtor(tgt);                             /* drop the frame CV's ref */
-            ZVAL_NULL(tgt);                                 /* leave the bucket pointing at NULL */
+            ZVAL_NULL(tgt);                                 /* park the frame slot */
+            ZVAL_NULL(ival);                                /* sever the bucket→frame edge (plain NULL) */
         } ZEND_HASH_FOREACH_END();
     }
 
@@ -1794,28 +1826,56 @@ static void zealphp_globals_snapshot_restore(long cid)
      * If the owning frame already unwound (a since-returned require_once), fall
      * back to a real bucket zval so the value survives. */
     zval *iobjs = zend_hash_index_find(&zealphp_coro_indirect_objs, (zend_ulong)cid);
-    if (iobjs && Z_TYPE_P(iobjs) == IS_ARRAY) {
-        zend_string *okey;
-        zval *oval;
-        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(iobjs), okey, oval) {
-            if (!okey) continue;
-            zval *slot = zealphp_find_request_frame_cv(okey);
-            if (slot) {
+    if (iobjs && Z_TYPE_P(iobjs) == IS_ARRAY
+        && zend_hash_num_elements(Z_ARRVAL_P(iobjs)) > 0) {
+        HashTable *reg = Z_ARRVAL_P(iobjs);
+
+        /* Phase 1 — frames OUTER, O(1) registry hash lookups per CV name
+         * (ext#52 perf: replaces a per-key frames×vars scan that was
+         * O(keys × frames × vars) per resume). Innermost frame wins, matching
+         * the engine's "bucket points at the most recently attached frame".
+         * Delete-on-apply: Phase 2 then sees only frame-gone leftovers, and a
+         * var the request unset before its yield is never ghost-re-applied. */
+        zend_execute_data *ex = EG(current_execute_data);
+        for (; ex && zend_hash_num_elements(reg) > 0; ex = ex->prev_execute_data) {
+            if (!ex->func || !ZEND_USER_CODE(ex->func->type)) continue;
+            if (ex->symbol_table != &EG(symbol_table)) continue;
+            zend_op_array *oa = &ex->func->op_array;
+            for (uint32_t i = 0; i < oa->last_var; i++) {
+                zval *oval = zend_hash_find(reg, oa->vars[i]);
+                if (!oval) continue;
+                zval *slot = ZEND_CALL_VAR_NUM(ex, i);
+                /* Write THROUGH a global-bound reference (a function-level
+                 * `global $x` made the frame CV IS_REFERENCE) — the park pass
+                 * derefs symmetrically; clobbering the wrapper here would sever
+                 * that function's binding after its yield. The bucket below
+                 * still points at the CV slot itself (the wrapper). */
+                zval *wslot = slot;
+                if (Z_ISREF_P(wslot)) wslot = Z_REFVAL_P(wslot);
                 zval old;
-                ZVAL_COPY_VALUE(&old, slot);
-                ZVAL_COPY(slot, oval);            /* +1: frame CV gets the object */
+                ZVAL_COPY_VALUE(&old, wslot);
+                ZVAL_COPY(wslot, oval);           /* +1: frame CV gets the value */
                 zval_ptr_dtor(&old);              /* drop whatever the slot held (NULL → no-op) */
-                zval *b = zend_hash_find(&EG(symbol_table), okey);
+                zval *b = zend_hash_find(&EG(symbol_table), oa->vars[i]);
                 if (b) {
                     if (Z_TYPE_P(b) != IS_INDIRECT) zval_ptr_dtor(b);
                     ZVAL_INDIRECT(b, slot);
                 } else {
                     zval ind;
                     ZVAL_INDIRECT(&ind, slot);
-                    zend_hash_add_new(&EG(symbol_table), okey, &ind);
+                    zend_hash_add_new(&EG(symbol_table), oa->vars[i], &ind);
                 }
-            } else {
-                /* Frame gone — materialise as a real bucket zval. */
+                zend_hash_del(reg, oa->vars[i]);
+            }
+        }
+
+        /* Phase 2 — leftovers: frame gone (a since-returned include), keep the
+         * value alive as a real bucket zval. */
+        if (zend_hash_num_elements(reg) > 0) {
+            zend_string *okey;
+            zval *oval;
+            ZEND_HASH_FOREACH_STR_KEY_VAL(reg, okey, oval) {
+                if (!okey) continue;
                 zval *b = zend_hash_find(&EG(symbol_table), okey);
                 if (b) {
                     if (Z_TYPE_P(b) == IS_INDIRECT) b = Z_INDIRECT_P(b);
@@ -1828,8 +1888,9 @@ static void zealphp_globals_snapshot_restore(long cid)
                     ZVAL_COPY(&copy, oval);
                     zend_hash_add_new(&EG(symbol_table), okey, &copy);
                 }
-            }
-        } ZEND_HASH_FOREACH_END();
+            } ZEND_HASH_FOREACH_END();
+            zend_hash_clean(reg);
+        }
     }
 
     /* Step 3 — delete tombstoned keys (parent keys this coroutine unset). */
@@ -5434,6 +5495,29 @@ PHP_FUNCTION(zealphp_require_global)
     } zend_end_try();
 
     if (zealphp_bailed) {
+        /* ext#52 hardening: a bailout longjmps past every zend_leave_helper, so
+         * NO frame on this coroutine detached its symbol table — any bucket
+         * still IS_INDIRECT into this coroutine's VM stack dangles into memory
+         * that dies with the coroutine, and the NEXT request's
+         * zend_attach_symbol_table would move those recycled bytes into a live
+         * frame (over-free on its first overwrite). Scrub: NULL every
+         * EG(symbol_table) bucket whose INDIRECT target lies inside one of THIS
+         * coroutine's VM-stack pages. Master-frame CVs live on another
+         * context's stack and are untouched. The CV values leak — same
+         * tradeoff php-src itself accepts for bailout. */
+        if (EG(symbol_table).nTableMask) {
+            zval *zuaf_b;
+            ZEND_HASH_FOREACH_VAL(&EG(symbol_table), zuaf_b) {
+                if (Z_TYPE_P(zuaf_b) != IS_INDIRECT) continue;
+                const zval *zuaf_t = Z_INDIRECT_P(zuaf_b);
+                for (zend_vm_stack zuaf_p = EG(vm_stack); zuaf_p; zuaf_p = zuaf_p->prev) {
+                    if (zuaf_t >= (const zval *)zuaf_p && zuaf_t < zuaf_p->end) {
+                        ZVAL_NULL(zuaf_b);
+                        break;
+                    }
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
         destroy_op_array(op_array);
         efree_size(op_array, sizeof(zend_op_array));
         zend_bailout();
