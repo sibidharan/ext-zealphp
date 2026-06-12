@@ -235,6 +235,30 @@ static HashTable zealphp_coro_cid_to_ptr;
 static HashTable zealphp_coro_globals_parent;
 static bool zealphp_coro_globals_parent_set = false;
 
+/* Debug tracing for ONE global key through the S2 machinery (park / reset /
+ * delta / re-apply). Enable with ZEALPHP_TRACE_GLOBAL=<name>; zero cost when
+ * off (one pointer null-check per site). Diagnostic aid for write-through /
+ * parking regressions (the 0.3.49 $wpdb investigation). */
+static const char *zealphp_trace_key = NULL;
+static bool zealphp_trace_key_resolved = false;
+static zend_always_inline bool zealphp_trace_match(zend_string *key)
+{
+    if (UNEXPECTED(!zealphp_trace_key_resolved)) {
+        zealphp_trace_key = getenv("ZEALPHP_TRACE_GLOBAL");
+        if (zealphp_trace_key && !*zealphp_trace_key) zealphp_trace_key = NULL;
+        zealphp_trace_key_resolved = true;
+    }
+    return UNEXPECTED(zealphp_trace_key != NULL)
+        && key && strcmp(ZSTR_VAL(key), zealphp_trace_key) == 0;
+}
+#define ZTRACE(key, ...) do { \
+    if (zealphp_trace_match(key)) { \
+        fprintf(stderr, "[ztrace cid=%lld] ", os_get_cid ? (long long) os_get_cid() : -1); \
+        fprintf(stderr, __VA_ARGS__); \
+        fputc('\n', stderr); \
+    } \
+} while (0)
+
 /* Stage 3a/3b/3c silent-redeclare master flag. Hoisted to file-scope here
  * (vs co-located with the Stage 3a storage block farther down) so the
  * zealphp_define_intercept hook below can read it. */
@@ -1480,6 +1504,7 @@ static int zealphp_collect_request_frame_ranges(zealphp_frame_range *out, int ma
     zend_execute_data *ex = EG(current_execute_data);
     for (; ex && n < max; ex = ex->prev_execute_data) {
         if (!ex->func || !ZEND_USER_CODE(ex->func->type)) continue;
+        if (!(ZEND_CALL_INFO(ex) & ZEND_CALL_HAS_SYMBOL_TABLE)) continue;  /* symbol_table is UNION-uninitialized on plain fn frames — a stale match pulled require_wp_db()'s fn frame into the request set (the 0.3.49 $wpdb regression) */
         if (ex->symbol_table != &EG(symbol_table)) continue;
         uint32_t nvars = ex->func->op_array.last_var;
         if (nvars == 0) continue;
@@ -1583,6 +1608,8 @@ static void zealphp_globals_reset_to_parent(void)
          * resets to NULL below; an IS_INDIRECT that IS in the baseline (a master
          * global a request overwrote) still resets to the baseline value. */
         if (!pv && indirect) continue;
+        ZTRACE(key, "reset: write %s indirect=%d oldtype=%d", pv ? "baseline" : "NULL",
+               (int) indirect, (int) Z_TYPE_P(target));
         zval old;
         ZVAL_COPY_VALUE(&old, target);
         if (pv) {
@@ -1654,11 +1681,15 @@ static void zealphp_globals_snapshot_save(long cid)
              * it into the delta too would double-apply on resume and write
              * through a bucket a peer's zend_attach_symbol_table may have
              * repointed at ITS frame. The registry owns request-frame slots. */
-            if (zealphp_ptr_in_frame_ranges(uv, zp_ranges, zp_nranges)) continue;
+            if (zealphp_ptr_in_frame_ranges(uv, zp_ranges, zp_nranges)) {
+                ZTRACE(key, "save: delta-skip indirect-in-frame slot=%p", (void *) uv);
+                continue;
+            }
         }
         if (Z_ISREF_P(uv)) uv = Z_REFVAL_P(uv);  /* deref global-keyword refs */
         if (Z_TYPE_P(uv) == IS_UNDEF) continue;  /* indirect to an unset CV — nothing to capture */
         if (!zealphp_globals_isolatable_obj(uv)) continue;  /* resources stay shared; objects isolated + drained at request-end */
+        ZTRACE(key, "save: delta-capture type=%d indirect=%d", (int) Z_TYPE_P(uv), (int) indirect);
         zval *pv = zealphp_coro_globals_parent_set
             ? zend_hash_find(&zealphp_coro_globals_parent, key) : NULL;
         /* #10/033: a master-frame CV (IS_INDIRECT) not in the baseline is the
@@ -1712,8 +1743,11 @@ static void zealphp_globals_snapshot_save(long cid)
              * while stale aliases survived). */
             if (!zealphp_ptr_in_frame_ranges(tgt, zp_ranges, zp_nranges)) continue;  /* skip master-frame CVs */
             if (zealphp_globals_is_superglobal_key(ZSTR_VAL(ikey), ZSTR_LEN(ikey))) continue;
-            if (Z_ISREF_P(tgt)) tgt = Z_REFVAL_P(tgt);
+            int zt_wasref = Z_ISREF_P(tgt);
+            if (zt_wasref) tgt = Z_REFVAL_P(tgt);
             if (Z_TYPE_P(tgt) == IS_UNDEF) continue;      /* nothing to park */
+            ZTRACE(ikey, "park: type=%d wasref=%d slot=%p refval=%p", (int) Z_TYPE_P(tgt), zt_wasref,
+                   (void *) Z_INDIRECT_P(ival), (void *) tgt);
 
             if (!reg) {
                 reg = zend_hash_index_find(&zealphp_coro_indirect_objs, (zend_ulong)cid);
@@ -1805,6 +1839,8 @@ static void zealphp_globals_snapshot_restore(long cid)
                 zval *slot = existing;
                 if (Z_TYPE_P(slot) == IS_INDIRECT) slot = Z_INDIRECT_P(slot);
                 if (Z_ISREF_P(slot)) slot = Z_REFVAL_P(slot);
+                ZTRACE(key, "restore: delta-apply type=%d buckettype=%d", (int) Z_TYPE_P(val),
+                       (int) Z_TYPE_P(existing));
                 zval old;
                 ZVAL_COPY_VALUE(&old, slot);
                 ZVAL_DUP(slot, val);
@@ -1839,12 +1875,16 @@ static void zealphp_globals_snapshot_restore(long cid)
         zend_execute_data *ex = EG(current_execute_data);
         for (; ex && zend_hash_num_elements(reg) > 0; ex = ex->prev_execute_data) {
             if (!ex->func || !ZEND_USER_CODE(ex->func->type)) continue;
-            if (ex->symbol_table != &EG(symbol_table)) continue;
+            if (!(ZEND_CALL_INFO(ex) & ZEND_CALL_HAS_SYMBOL_TABLE)) continue;  /* symbol_table is UNION-uninitialized on plain fn frames — a stale match pulled require_wp_db()'s fn frame into the request set (the 0.3.49 $wpdb regression) */
+        if (ex->symbol_table != &EG(symbol_table)) continue;
             zend_op_array *oa = &ex->func->op_array;
             for (uint32_t i = 0; i < oa->last_var; i++) {
                 zval *oval = zend_hash_find(reg, oa->vars[i]);
                 if (!oval) continue;
                 zval *slot = ZEND_CALL_VAR_NUM(ex, i);
+                ZTRACE(oa->vars[i], "restore: reapply-to-frame type=%d slot=%p slotisref=%d file=%s",
+                       (int) Z_TYPE_P(oval), (void *) slot, (int) Z_ISREF_P(slot),
+                       oa->filename ? ZSTR_VAL(oa->filename) : "?");
                 /* Write THROUGH a global-bound reference (a function-level
                  * `global $x` made the frame CV IS_REFERENCE) — the park pass
                  * derefs symmetrically; clobbering the wrapper here would sever
@@ -1876,6 +1916,7 @@ static void zealphp_globals_snapshot_restore(long cid)
             zval *oval;
             ZEND_HASH_FOREACH_STR_KEY_VAL(reg, okey, oval) {
                 if (!okey) continue;
+                ZTRACE(okey, "restore: reapply-frame-gone type=%d", (int) Z_TYPE_P(oval));
                 zval *b = zend_hash_find(&EG(symbol_table), okey);
                 if (b) {
                     if (Z_TYPE_P(b) == IS_INDIRECT) b = Z_INDIRECT_P(b);
