@@ -334,6 +334,13 @@ static HashTable zealphp_request_constants;
 static bool zealphp_define_hooked = false;
 static zif_handler zealphp_orig_define_handler = NULL;
 
+/* class_alias() intercept (ext#50) — same first-wins family as the define()
+ * intercept. A runtime class_alias() is a FUNCTION CALL, not a
+ * ZEND_DECLARE_* opcode, so S3a/S3c never see it; an S7-re-executed file's
+ * alias call then fatals "Cannot redeclare class" on request 2. */
+static bool zealphp_class_alias_hooked = false;
+static zif_handler zealphp_orig_class_alias_handler = NULL;
+
 /* #9: request constants removed by zealphp_constants_clear() in COROUTINE mode are
  * ORPHANED (removed from EG without freeing) and parked here per coroutine id, then
  * freed at coroutine close — an immediate free mid-request dangles a cached
@@ -3705,6 +3712,58 @@ PHP_FUNCTION(zealphp_ini_restore)
     efree(names);
 }
 
+/* ── class_alias() interception (ext#50) ─────────────────────────── */
+
+/* First-wins for runtime aliases under silent_redeclare: when the ALIAS
+ * name already exists in the class table, return true WITHOUT calling the
+ * real class_alias() — the vanilla call would fatal "Cannot redeclare
+ * class" when an S7-re-executed file runs its alias line again (DokuWiki's
+ * inc/legacy.php Doku_Event_Handler). Matches the define() intercept's
+ * FPM fresh-proc semantics: request 1's alias is the binding for the
+ * worker's lifetime. */
+static ZEND_NAMED_FUNCTION(zealphp_class_alias_intercept)
+{
+    if (zealphp_silent_redeclare_enabled && ZEND_NUM_ARGS() >= 2) {
+        zval *arg2 = ZEND_CALL_ARG(execute_data, 2);
+        if (arg2 && Z_TYPE_P(arg2) == IS_STRING && Z_STRLEN_P(arg2) > 0) {
+            zend_string *lc = zend_string_tolower(Z_STR_P(arg2));
+            /* Class-table keys are lowercased FQNs WITHOUT a leading '\'. */
+            const char *n = ZSTR_VAL(lc);
+            size_t len = ZSTR_LEN(lc);
+            if (n[0] == '\\') { n++; len--; }
+            bool exists = len > 0 && zend_hash_str_exists(EG(class_table), n, len);
+            zend_string_release(lc);
+            if (exists) {
+                RETURN_TRUE;
+            }
+        }
+    }
+    zealphp_orig_class_alias_handler(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+/* Install/remove the class_alias() intercept. Follows the same lifecycle as
+ * the define() hook: engaged alongside silent_redeclare, idempotent. */
+static void zealphp_class_alias_hook_set(bool enable)
+{
+    if (enable && !zealphp_class_alias_hooked) {
+        zend_function *func = zend_hash_str_find_ptr(
+            CG(function_table), "class_alias", sizeof("class_alias") - 1);
+        if (func && func->type == ZEND_INTERNAL_FUNCTION) {
+            zealphp_orig_class_alias_handler = func->internal_function.handler;
+            func->internal_function.handler = zealphp_class_alias_intercept;
+            zealphp_class_alias_hooked = true;
+        }
+    } else if (!enable && zealphp_class_alias_hooked) {
+        zend_function *func = zend_hash_str_find_ptr(
+            CG(function_table), "class_alias", sizeof("class_alias") - 1);
+        if (func && zealphp_orig_class_alias_handler) {
+            func->internal_function.handler = zealphp_orig_class_alias_handler;
+            zealphp_orig_class_alias_handler = NULL;
+            zealphp_class_alias_hooked = false;
+        }
+    }
+}
+
 /* ── zealphp_define_hook(bool $enable): bool ─────────────────────── */
 
 PHP_FUNCTION(zealphp_define_hook)
@@ -4478,6 +4537,10 @@ PHP_FUNCTION(zealphp_silent_redeclare)
                 zealphp_define_hooked = true;
             }
         }
+        /* ext#50: class_alias() rides the same engagement — a runtime alias
+         * re-executed by S7 is the one redeclare shape neither the opcode
+         * hooks (S3a) nor the compile swap (S3c) can see. */
+        zealphp_class_alias_hook_set((bool)on);
     }
     RETURN_BOOL(prev);
 }
