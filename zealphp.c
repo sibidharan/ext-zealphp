@@ -235,8 +235,8 @@ static HashTable zealphp_coro_cid_to_ptr;
 static HashTable zealphp_coro_globals_parent;
 static bool zealphp_coro_globals_parent_set = false;
 
-/* Stage 3/4 silent-redeclare master flag. Hoisted to file-scope here
- * (vs co-located with the Stage 3 storage block farther down) so the
+/* Stage 3a/3b/3c silent-redeclare master flag. Hoisted to file-scope here
+ * (vs co-located with the Stage 3a storage block farther down) so the
  * zealphp_define_intercept hook below can read it. */
 static bool zealphp_silent_redeclare_enabled = false;
 
@@ -1082,9 +1082,9 @@ static void zealphp_statics_snapshot_save(long cid)
     zend_string *class_name;
     zval *cls_zv;
     /* HAZARD-2 fix: iterate EG(class_table), NOT CG(class_table). The compile-file
-     * hook (Stage 4) swaps CG(class_table) to a STACK-LOCAL scratch table on the
+     * hook (Stage 3c) swaps CG(class_table) to a STACK-LOCAL scratch table on the
      * coroutine's stack during compile; EG is deliberately left pointing at the
-     * real global table (see the "Stage 4: swap CG only" note in
+     * real global table (see the "Stage 3c: swap CG only" note in
      * zealphp_compile_file_hook). This snapshot fires on EVERY coroutine yield —
      * including a yield mid-compile (autoload) or during bailout/teardown — so
      * iterating CG(class_table) there can read a coroutine-stack scratch that
@@ -3544,7 +3544,7 @@ PHP_FUNCTION(zealphp_coroutine_globals_request_end)
  * can remove it at request end. */
 static ZEND_NAMED_FUNCTION(zealphp_define_intercept)
 {
-    /* Stage 3.5 — silent-define-redeclare. When silent_redeclare is on
+    /* Stage 3b — silent-define-redeclare. When silent_redeclare is on
      * and define(NAME, VAL) targets a name that's already defined, we
      * return true WITHOUT calling the real define(). Suppresses PHP's
      * "Constant X already defined" E_WARNING — exactly the legacy-app
@@ -3850,7 +3850,7 @@ PHP_FUNCTION(zealphp_exit_hook)
 
 /* ── Module lifecycle ────────────────────────────────────────────── */
 
-/* ── Stage 3: silent-redeclare opcode hooks ───────────────────────────
+/* ── Stage 3a: silent-redeclare opcode hooks ───────────────────────────
  *
  * Top-level `function foo() {}` / `class Bar {}` in legacy PHP fires
  * E_COMPILE_ERROR ("Cannot redeclare ...") on the SECOND request in a
@@ -4020,7 +4020,7 @@ static int zealphp_bind_static_handler(zend_execute_data *execute_data)
  * If NO → remove from EG(included_files) so the standard handler
  * re-includes it. Bootstrap stays fast, per-request code re-executes.
  *
- * Combined with Stage 3 (silent function/class redeclare) and Stage 3.5
+ * Combined with Stage 3a (silent function/class redeclare) and Stage 3b
  * (silent define redeclare), the re-included file's declarations are
  * silently skipped while its per-request logic runs fresh. */
 
@@ -4114,12 +4114,12 @@ static int zealphp_include_eval_handler(zend_execute_data *execute_data)
     return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
 }
 
-/* ── Stage 4: compile-time silent-redeclare via CG-table swap ──────────
+/* ── Stage 3c: compile-time silent-redeclare via CG-table swap ──────────
  *
  * Top-level `function foo() {}` / `class Bar {}` at file scope are bound
  * to CG(function_table) / CG(class_table) at COMPILE time by
  * zend_register_top_func / zend_register_top_class — they never emit a
- * runtime ZEND_DECLARE_* opcode for Stage 3 to intercept.
+ * runtime ZEND_DECLARE_* opcode for Stage 3a to intercept.
  *
  * The earlier attempt (snapshot-detach-compile-restore the WHOLE user
  * symbol space per compile) deadlocked production: every nested
@@ -4157,7 +4157,7 @@ static zend_op_array *(*zealphp_original_compile_file)(zend_file_handle *file_ha
  * "Cannot redeclare" on the persistent dup-check), we pre-remove the
  * tracked symbols from EG. opcache loads cleanly into the empty slots.
  * After load, we destroy the new (compile-added) duplicates and reinstall
- * our originals — first-wins, identical semantics to Stage 4 but applied
+ * our originals — first-wins, identical semantics to Stage 3c but applied
  * surgically to KNOWN-conflicting symbols instead of swap-the-whole-table.
  *
  * Process-wide table (persistent=1) — same lifecycle as zealphp_orig_handlers. */
@@ -4211,7 +4211,7 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
      * use-after-free → worker SIGSEGV under load (phpmyadmin on the 50-app
      * sweep; gdb: zealphp_compile_file_hook at "(*shell->refcount)++"). An
      * op_array cannot be safely shared by shallow memcpy + refcount across
-     * requests. Stage 4's CG-table swap below already handles top-level
+     * requests. Stage 3c's CG-table swap below already handles top-level
      * redeclaration correctly on EVERY compile, so the cache was only a
      * re-compile optimization — not worth a UAF. */
     /* Save real table pointers — restore on exit.
@@ -4237,12 +4237,12 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     zend_hash_init(&scratch_fn, 8, NULL, NULL, 0);
     zend_hash_init(&scratch_cl, 8, NULL, NULL, 0);
 
-    /* Stage 4: swap CG only. EG stays pointing at the real table so
+    /* Stage 3c: swap CG only. EG stays pointing at the real table so
      * internal function/class lookups during compile (Closure for type
      * hints, attribute classes, parent classes for inheritance fixup)
      * still resolve.
      *
-     * Stage 4-v2 attempt — swapping EG(function_table) only, keeping
+     * Stage 3c-v2 attempt — swapping EG(function_table) only, keeping
      * EG(class_table) real — also broke compiles. Even the WordPress
      * homepage that previously worked started returning 500 on the
      * second request. The function_table swap interacts with the
@@ -4290,7 +4290,7 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
     /* Restore BEFORE anything else — must hold even on the bailout path. */
     CG(function_table) = real_cg_fn;
     CG(class_table)    = real_cg_cl;
-    /* EG was never swapped (Stage 4 CG-only design) — keep these
+    /* EG was never swapped (Stage 3c CG-only design) — keep these
      * locals referenced so the compiler doesn't warn. */
     (void) real_eg_fn;
     (void) real_eg_cl;
@@ -4355,7 +4355,7 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
             zend_class_entry *lce = (zend_class_entry *)ptr;
             /* Stage-7 re-execution crash fix (v0.3.24, 2026-05-30): the "non-autoload
              * losers are safe to destroy" assumption above is FALSE for a loser class
-             * WITH A PARENT / interfaces / traits. Stage 4 swaps CG only, never EG, so
+             * WITH A PARENT / interfaces / traits. Stage 3c swaps CG only, never EG, so
              * when this compile linked the loser it resolved parent/interfaces against
              * the LIVE WINNER hierarchy in EG(class_table). The loser's inherited
              * method / property-info / default-property slots therefore reference
@@ -4388,7 +4388,7 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
 
     /* Stage 6.2 cache-save REMOVED — see the cache-hit note above: a cached
      * op_array's refcount pointer dangles once the engine frees it, segfaulting
-     * the next compile. Stage 4 re-compiles + first-wins-merges every time,
+     * the next compile. Stage 3c re-compiles + first-wins-merges every time,
      * which is correct without the cache. */
     if (file_key) {
         zend_string_release(file_key);
@@ -4425,7 +4425,7 @@ PHP_FUNCTION(zealphp_silent_redeclare)
          * path inside zealphp_define_intercept activates. Without this hook
          * being installed, legacy apps' top-of-file `define('FOO', __DIR__)`
          * fires PHP's native "already defined" E_WARNING on request 2 in
-         * coroutine mode — exactly the redeclare crash Stage 3/4 close for
+         * coroutine mode — exactly the redeclare crash Stage 3a/4 close for
          * functions and classes. The intercept stays installed until
          * explicit zealphp_define_hook(false) or RSHUTDOWN. */
         if ((bool)on && !zealphp_define_hooked) {
@@ -4862,7 +4862,7 @@ PHP_MINIT_FUNCTION(zealphp)
         dlclose(handle);
     }
 
-    /* Stage 3: register silent-redeclare opcode handlers.
+    /* Stage 3a: register silent-redeclare opcode handlers.
      *
      * Opcode handlers catch RUNTIME declarations (ZEND_DECLARE_FUNCTION /
      * ZEND_DECLARE_CLASS / _DELAYED — emitted for declarations inside an
@@ -4876,7 +4876,7 @@ PHP_MINIT_FUNCTION(zealphp)
      * intercept that snapshots+restores class_entry pointers around the
      * compile breaks class inheritance / method-table invariants
      * (validated by test failures on 019/020 when wired up). That's
-     * deferred to Stage 4 — see docs/architecture/state-isolation-reference.md.
+     * deferred to Stage 3c — see docs/architecture/state-isolation-reference.md.
      *
      * The gate is `zealphp_silent_redeclare_enabled`, set via the public
      * `zealphp_silent_redeclare(bool)` PHP function. Handlers fall through
@@ -4913,12 +4913,12 @@ PHP_MINIT_FUNCTION(zealphp)
     zealphp_bind_static_installed = true;
 
     /* Stage 7: smart require_once. Same zero-overhead-when-off pattern as
-     * Stage 3 — the handler checks zealphp_include_isolation_enabled and
+     * Stage 3a — the handler checks zealphp_include_isolation_enabled and
      * chains/DISPATCHes immediately when disabled. */
     zealphp_prev_include_eval = zend_get_user_opcode_handler(ZEND_INCLUDE_OR_EVAL);
     zend_set_user_opcode_handler(ZEND_INCLUDE_OR_EVAL,        zealphp_include_eval_handler);
 
-    /* Stage 4: compile-time silent-redeclare via CG-table swap.
+    /* Stage 3c: compile-time silent-redeclare via CG-table swap.
      * Pointer-swap design — O(K) per compile (K = symbols this file
      * declares), independent of total user-symbol count. Reentrant
      * safe (scratch tables are stack-local). See the hook function's

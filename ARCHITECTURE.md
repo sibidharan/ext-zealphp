@@ -1,5 +1,12 @@
 # ext-zealphp Architecture
 
+> **Stage naming:** canonical isolation-stage names live in the framework repo at
+> `docs/architecture/isolation-stages.md` — S1 Superglobals, S2 Globals,
+> S3 Redeclare (3a opcodes / 3b define intercept / 3c compile CG-swap),
+> S5 Function statics, S7 Include-once, S8 Global scope, S9 Process settings,
+> S10 Constants, S11 Request resets, S12 Exit hook (S4/S6 retired tombstones).
+> The "gen-1/gen-2" terms below are implementation GENERATIONS of S2, not stages.
+
 Authoritative reference for the C internals — what each subsystem does, where the code lives, and why the design ended up this shape. Companion to the high-level README and to ZealPHP's `docs/architecture/state-isolation-reference.md`.
 
 > Last updated 2026-05-28 · v0.3.8 · PHP 8.3 / 8.4 verified
@@ -104,7 +111,7 @@ Banner: `── Level X: Per-coroutine X isolation ──` (three of them)
 
 **How:** At yield, walk the relevant Zend table (`EG(zend_constants)` / `EG(ini_directives)` / class entries) and copy any user-set values into the snapshot. At resume, restore.
 
-**Why not Stage 2 COW like $GLOBALS?** These categories don't accumulate writes the way `$GLOBALS` does — constants are write-once, `ini_set` calls are rare, static-property mutations are bounded. Deep-copy at yield is acceptable.
+**Why not S2-style COW like $GLOBALS?** These categories don't accumulate writes the way `$GLOBALS` does — constants are write-once, `ini_set` calls are rare, static-property mutations are bounded. Deep-copy at yield is acceptable.
 
 **Public PHP API:**
 
@@ -116,15 +123,15 @@ Banner: `── Level X: Per-coroutine X isolation ──` (three of them)
 
 ---
 
-### 4. Per-coroutine `$GLOBALS` (Stage 1 → Stage 2 COW) — `zealphp.c:70–712, 1151–1238`
+### 4. Per-coroutine `$GLOBALS` — canonical stage **S2 Globals** (gen-1 deep-copy → gen-2 COW) — `zealphp.c:70–712, 1151–1238`
 
 Banner: `── Per-coroutine full $GLOBALS / EG(symbol_table) isolation ──`
 
 **The problem:** `$GLOBALS['app_state'] = 'foo'` in coroutine A is read by coroutine B as `'foo'` mid-request. Classic race. Workaround was "use `$g->app_state`" — but that requires user-code discipline. The framework wanted automatic isolation.
 
-**Stage 1 (v0.3.6, REPLACED):** Deep-copy every non-superglobal slot of `EG(symbol_table)` per coroutine via `ZVAL_DUP`. Worked. Cost: O(N keys) memory per active coroutine.
+**gen-1 (v0.3.6, REPLACED):** Deep-copy every non-superglobal slot of `EG(symbol_table)` per coroutine via `ZVAL_DUP`. Worked. Cost: O(N keys) memory per active coroutine.
 
-**Stage 2 (v0.3.7, CURRENT):** Copy-on-write parent + per-coroutine delta. Storage at `zealphp.c:91–97`:
+**gen-2 (v0.3.7, CURRENT):** Copy-on-write parent + per-coroutine delta. Storage at `zealphp.c:91–97`:
 
 - `zealphp_coro_globals_parent` — shared baseline HashTable. Snapshotted ONCE at activation. Read-mostly.
 - `zealphp_coro_globals_deltas` — `cid → zval-array of slots the coroutine wrote that differ from parent`.
@@ -140,9 +147,9 @@ Banner: `── Per-coroutine full $GLOBALS / EG(symbol_table) isolation ──`
 2. Apply `deltas[cid]` over baseline.
 3. `zend_hash_del` each key in `tombstones[cid]`.
 
-**Memory characteristics:** 50 coroutines × 5 unique writes each = ~2 MB peak. Stage 1 was O(N × coros).
+**Memory characteristics:** 50 coroutines × 5 unique writes each = ~2 MB peak. gen-1 was O(N × coros).
 
-**The IS_UNDEF tombstone bug worth knowing about:** Early Stage 2 stored tombstones as `IS_UNDEF` inside the delta array. `ZEND_HASH_FOREACH_*` macros silently skip `IS_UNDEF` because that's Zend's internal "deleted bucket" marker — tombstones were invisible. Fix at `zealphp.c:91`: separate tombstones HashTable with non-UNDEF dummies.
+**The IS_UNDEF tombstone bug worth knowing about:** Early gen-2 stored tombstones as `IS_UNDEF` inside the delta array. `ZEND_HASH_FOREACH_*` macros silently skip `IS_UNDEF` because that's Zend's internal "deleted bucket" marker — tombstones were invisible. Fix at `zealphp.c:91`: separate tombstones HashTable with non-UNDEF dummies.
 
 **Public PHP API:**
 
@@ -150,7 +157,7 @@ Banner: `── Per-coroutine full $GLOBALS / EG(symbol_table) isolation ──`
 |---|---|
 | `zealphp_globals_snapshot()` | One-shot snapshot for non-coroutine modes |
 | `zealphp_globals_clean()` | Reset to parent (mid-request cleanup) |
-| `zealphp_coroutine_globals(bool)` | Toggle Stage 2 COW on/off |
+| `zealphp_coroutine_globals(bool)` | Toggle S2 Globals (gen-2 COW) on/off |
 
 ---
 
@@ -175,9 +182,9 @@ Banner: `── Process-state snapshot/clean (FPM-style) ──`
 
 ---
 
-### 6. Stage 3 silent-redeclare opcode hooks — `zealphp.c:1547–1645`
+### 6. Stage 3a silent-redeclare opcode hooks — `zealphp.c:1547–1645`
 
-Banner: `── Stage 3: silent-redeclare opcode hooks ──`
+Banner: `── Stage 3a: silent-redeclare opcode hooks ──`
 
 **The problem:** Legacy PHP code wrapping `function foo() {}` inside `if (PHP_VERSION_ID > 80000) { ... }` (a conditional declaration) re-runs on every request in a long-lived worker. Second request fires `E_COMPILE_ERROR: Cannot redeclare foo()`. FPM doesn't hit this because each request gets a fresh process.
 
@@ -188,7 +195,7 @@ Banner: `── Stage 3: silent-redeclare opcode hooks ──`
 
 **Registration (`zealphp.c:1748–1757`):** `zend_set_user_opcode_handler(ZEND_DECLARE_FUNCTION, ...)` and two siblings. Installation is unconditional in MINIT — handlers gate themselves on `zealphp_silent_redeclare_enabled`, so the cost when the feature is off is one branch per opcode.
 
-**Stage 3 limitation:** Catches RUNTIME declarations (inside if/fn/method scope). Top-level (file-scope) declarations are bound at COMPILE time via `zend_register_top_func` — no runtime opcode. Stage 4 covers that.
+**Stage 3a limitation:** Catches RUNTIME declarations (inside if/fn/method scope). Top-level (file-scope) declarations are bound at COMPILE time via `zend_register_top_func` — no runtime opcode. Stage 3c covers that.
 
 **Public PHP API:**
 
@@ -198,11 +205,11 @@ Banner: `── Stage 3: silent-redeclare opcode hooks ──`
 
 ---
 
-### 7. Stage 4 compile-time silent-redeclare via CG-table swap — `zealphp.c:1647–1746`
+### 7. Stage 3c compile-time silent-redeclare via CG-table swap — `zealphp.c:1647–1746`
 
-Banner: `── Stage 4: compile-time silent-redeclare via CG-table swap ──`
+Banner: `── Stage 3c: compile-time silent-redeclare via CG-table swap ──`
 
-**The problem:** Top-level `function foo() {}` / `class Bar {}` at file scope are bound to `CG(function_table)` / `CG(class_table)` at COMPILE time by `zend_register_top_func` / `zend_register_top_class`. Stage 3's opcode hook never sees them. Second include of the same file fires `E_COMPILE_ERROR`.
+**The problem:** Top-level `function foo() {}` / `class Bar {}` at file scope are bound to `CG(function_table)` / `CG(class_table)` at COMPILE time by `zend_register_top_func` / `zend_register_top_class`. Stage 3a's opcode hook never sees them. Second include of the same file fires `E_COMPILE_ERROR`.
 
 **Why the first attempt failed:** Naively walking the entire user symbol table per compile and detaching with refcount bumps gave O(N×M) cumulative cost across nested compiles (autoloader chains do M nested compiles per request, each walking N symbols). Workers timed out before serving any request — every cell in the 32-app sweep returned `X` (timeout). Lab disaster, rolled back to commit `226e9e3` for archival.
 
@@ -284,7 +291,7 @@ zend_compile_file = zealphp_compile_file_hook;
                                   └──────────────────────┘
 ```
 
-For Stage 3/4 (silent-redeclare):
+For Stage 3a/3c (silent-redeclare):
 
 ```
                 ┌─────────────────────────────┐
@@ -292,7 +299,7 @@ For Stage 3/4 (silent-redeclare):
                 └──────────────┬──────────────┘
                                │
                 ┌──────────────▼──────────────┐
-                │ zealphp_compile_file_hook   │   ← Stage 4
+                │ zealphp_compile_file_hook   │   ← Stage 3c
                 │  swap CG tables → scratch   │
                 │  call original_compile_file │
                 │   (compile writes scratch)  │
@@ -303,7 +310,7 @@ For Stage 3/4 (silent-redeclare):
                 ┌──────────────▼──────────────┐
                 │ Interpreter runs op_array   │
                 │  hits ZEND_DECLARE_FUNCTION │
-                │   → zealphp_declare_…       │   ← Stage 3
+                │   → zealphp_declare_…       │   ← Stage 3a
                 │      handler (skip if dup)  │
                 └─────────────────────────────┘
 ```
@@ -319,9 +326,9 @@ For Stage 3/4 (silent-redeclare):
 | 001–006 | Function overrides | §1 |
 | 007–012 | Superglobals save/restore | §2 |
 | 013–016 | Coroutine yield/resume | §2 |
-| 017 | $GLOBALS Stage 2 COW | §4 |
-| 018–019 | Stage 3 silent-redeclare | §6 |
-| 020 | Stage 4 compile-time silent-redeclare | §7 |
+| 017 | $GLOBALS S2 (gen-2 COW) | §4 |
+| 018–019 | Stage 3a silent-redeclare | §6 |
+| 020 | Stage 3c compile-time silent-redeclare | §7 |
 
 Tests 007–016 are coroutine-runtime-dependent and skip-fail on the CLI test harness (no OpenSwoole scheduler) — they pass under the live framework integration tests.
 
@@ -340,8 +347,8 @@ TEST_PHP_EXECUTABLE=$(which php) make test TESTS="tests/018-silent-redeclare-fun
 |---|---|---|
 | Persistent hash tables hold per-request refcounted zvals | HIGH security finding | `zealphp_callbacks` etc. are `persistent=1` but store request-heap closures. Latent UAF if usage moves to per-request registration. Fix: `persistent=0` + add `RINIT`/`RSHUTDOWN`. |
 | Restore protocol overwrites later-installed handlers | HIGH security finding | `zealphp_restore` puts the saved pointer back unconditionally — clobbers extensions that hooked the slot after us. Fix: compare-and-restore. |
-| `global $foo;` reference binding across yield | Documented limitation | Stage 2 COW swaps `EG(symbol_table)` contents on yield/resume; a `global` keyword's by-reference binding becomes stale. Workaround: use `$g->foo` (per-coroutine `RequestContext`). |
-| User functions/classes are still process-wide | By design | `CG(function_table)` and `CG(class_table)` are shared. Autoloaders depend on this. Per-coroutine tables would defeat autoloading. Stage 3 + Stage 4 silent-redeclare are the pragmatic ceiling. |
+| `global $foo;` reference binding across yield | Documented limitation | S2 (Globals) swaps `EG(symbol_table)` contents on yield/resume; a `global` keyword's by-reference binding becomes stale. Workaround: use `$g->foo` (per-coroutine `RequestContext`). |
+| User functions/classes are still process-wide | By design | `CG(function_table)` and `CG(class_table)` are shared. Autoloaders depend on this. Per-coroutine tables would defeat autoloading. S3a + S3c silent-redeclare are the pragmatic ceiling. |
 | MSHUTDOWN is a no-op | Intentional | PHP 8.5+ shutdown ordering issue. OS reclaims memory at exit. Matches opcache. |
 
 The security review at the bottom of `zealphp.c`'s git history (see commits `9b8111b`, `428ef60`, `892f979`) tracked these issues honestly — none are critical, but the HIGH-severity ones should land before any new public-API surface is added.
@@ -362,9 +369,9 @@ ZealPHP workers can serve millions of requests over days without restart. ext-ze
 - `zealphp_coro_constant_snapshots[cid]` — user `define()` constants
 - `zealphp_coro_ini_snapshots[cid]` — `ini_set()` overrides
 - `zealphp_coro_static_snapshots[cid]` — static class properties
-- `zealphp_coro_globals_deltas[cid]` + `zealphp_coro_globals_tombstones[cid]` — Stage 2 `$GLOBALS` deltas
+- `zealphp_coro_globals_deltas[cid]` + `zealphp_coro_globals_tombstones[cid]` — S2 Globals deltas
 
-Each entry's `ZVAL_PTR_DTOR` fires → refcounts drop → engine frees the values. **Typical size: 1–10 KB per coroutine**. At 1000 coros/sec that's ~10 MB/sec churn, all reclaimed immediately. The COW design here matters: deltas only contain what the coroutine ACTUALLY wrote — not a full deep-copy of `$GLOBALS` per coroutine (which was Stage 1's design and the reason it was replaced).
+Each entry's `ZVAL_PTR_DTOR` fires → refcounts drop → engine frees the values. **Typical size: 1–10 KB per coroutine**. At 1000 coros/sec that's ~10 MB/sec churn, all reclaimed immediately. The COW design here matters: deltas only contain what the coroutine ACTUALLY wrote — not a full deep-copy of `$GLOBALS` per coroutine (which was gen-1's design and the reason it was replaced).
 
 ### Tier 2 — per-HTTP-request (framework explicitly calls cleanup)
 
@@ -404,7 +411,7 @@ OpenSwoole's `max_request` setting (ZealPHP's typical config: 10,000–50,000) f
 
 The v0.3.9 follow-up moved THREE tables from `persistent=1` to RINIT/RSHUTDOWN — they had held request-heap closures and zend_string keys, which the persistent table outlived. Cross-request UAF window closed. The fourth table (`zealphp_orig_handlers`) joined the same lifecycle when the reviewer found that even raw `zif_handler` pointers could go stale across SAPI module-reload cycles.
 
-The `zealphp_dispatch` thunk now `ZVAL_COPY`-pins the callback before invoking it, so a concurrent RSHUTDOWN destroying the callbacks table during an in-flight call no longer dangles the cb pointer. The Stage 4 compile-file hook wraps the original compile in `zend_try`/`zend_catch` so `E_COMPILE_ERROR` / OOM bailout still restores `CG(function_table)` properly.
+The `zealphp_dispatch` thunk now `ZVAL_COPY`-pins the callback before invoking it, so a concurrent RSHUTDOWN destroying the callbacks table during an in-flight call no longer dangles the cb pointer. The Stage 3c compile-file hook wraps the original compile in `zend_try`/`zend_catch` so `E_COMPILE_ERROR` / OOM bailout still restores `CG(function_table)` properly.
 
 **Net effect:** at idle, the extension's heap footprint is bounded by the worker's `max_request` count plus the size of the active coroutines' deltas. There is no monotonic growth across requests. The Docker lab has been left running 48+ hour soak tests on Modes 4/5 and RSS stays flat after the initial worker warm-up.
 
@@ -416,7 +423,7 @@ The `zealphp_dispatch` thunk now `ZVAL_COPY`-pins the callback before invoking i
 - **Banner-comment sections** (`── Title ──`) are the unit of navigation. Add a new banner when you add a new subsystem.
 - **Public PHP functions** are at the bottom of `zealphp.c` (the `PHP_FUNCTION` block) and declared in `php_zealphp.h`. New ones must be added to both the prototype list AND the `zealphp_functions[]` entries array.
 - **Memory safety:** every `zend_hash_init` either uses `ZVAL_PTR_DTOR` (engine handles cleanup) or NULL (we manage manually). Mixing them silently leaks; pick one per table.
-- **Refcount discipline:** when stashing a `zend_function*` or `zend_class_entry*` outside its owning hash, bump the refcount. The engine's destructors gate on refcount reaching zero — leaving extra references prevents premature free. Stage 4's failed first attempt is the cautionary tale (commit `226e9e3`).
+- **Refcount discipline:** when stashing a `zend_function*` or `zend_class_entry*` outside its owning hash, bump the refcount. The engine's destructors gate on refcount reaching zero — leaving extra references prevents premature free. Stage 3c's failed first attempt is the cautionary tale (commit `226e9e3`).
 
 ---
 
