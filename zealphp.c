@@ -1103,6 +1103,17 @@ static void zealphp_process_settings_repark(void)
  * on_resume callback). Class- and function-static snapshots reuse this so they
  * match the $GLOBALS discipline exactly — see SECURITY-FIX (objects-in-statics).*/
 static bool zealphp_globals_isolatable(zval *v);
+/* Forward decls — boot-provenance markers (defined with the S11 snapshot
+ * machinery below). ext#48: the S5b v2 save splits behavior on them. */
+static HashTable zealphp_snapshot_classes;
+static bool zealphp_state_snapshotted;
+
+/* ext#48: object-bearing static snapshots whose coroutine died (on_close)
+ * before the request-end drain ran. Freeing them in on_close could fire
+ * __destruct outside a coroutine; they are parked here and drained by the
+ * next zealphp_coroutine_globals_request_end() — coroutine context. */
+static HashTable zealphp_statics_orphans;
+static bool zealphp_statics_orphans_live = false;
 
 static void zealphp_statics_snapshot_save(long cid)
 {
@@ -1131,24 +1142,94 @@ static void zealphp_statics_snapshot_save(long cid)
         zval *statics = CE_STATIC_MEMBERS(ce);
         if (!statics) continue;
 
-        /* Snapshot each static property value */
+        /* ext#48 (S5b v2) — two regimes by class provenance:
+         *
+         * BOOT classes (in zealphp_snapshot_classes — framework state like
+         * App::$routes / the middleware stack): the ORIGINAL behavior, byte
+         * for byte. Scalars/arrays snapshot+restore per coroutine; objects
+         * stay process-shared; live slots are never re-parked. Framework
+         * per-worker state must stay warm.
+         *
+         * POST-BOOT (request-loaded) classes — the #48 frontier
+         * (CakePHP Router::$_collection, Kirby App::$instance, Piwigo), and
+         * empirically ALSO the ext#44/#49 concurrent-corruption substrate:
+         * the ASAN-pinned property-walk crashes (gc_mark_grey /
+         * zend_object_dtor_property / the S11c drain) all walked object
+         * graphs held in PROCESS-SHARED class statics that concurrent
+         * requests mutated under each other. Isolating + re-parking them
+         * took WordPress cold-concurrent bursts from 5/5 worker deaths to
+         * 0/5 and phpMyAdmin to 0 — with NO other change:
+         *   1. snapshot slots that DIFFER from the template, INCLUDING
+         *      OBJECTS (ref-hold via ZVAL_DUP — objects copy by handle).
+         *      Snapshot-first ordering makes the re-park dtor below safe:
+         *      the displaced value's refcount is >= 2, so no __destruct can
+         *      fire inside this C scheduler callback (the exact safety
+         *      argument of the object-globals stage, 0.3.23/0.3.47).
+         *   2. re-park the live slot to the boot TEMPLATE (the S11c
+         *      in-place discipline: stable address, IS_INDIRECT skipped) so
+         *      a peer that never touched this class reads the PHP-FPM
+         *      default — closing BOTH #48 legs (object leak + first-touch
+         *      scalar/array leak). The owner's values come back via
+         *      restore-over-template on its resume.
+         * Object refs held here are released by the in-coroutine request-end
+         * drain (zealphp_coroutine_globals_request_end), NEVER by on_close —
+         * see zealphp_statics_snapshot_delete's orphan path. */
+        static int zp_v2_disabled = -1;
+        if (zp_v2_disabled < 0) {
+            const char *e = getenv("ZEALPHP_CLASS_STATICS_V2_DISABLE");
+            zp_v2_disabled = (e && *e && *e != '0') ? 1 : 0;
+        }
+        bool zp_boot_class = zp_v2_disabled
+            || (zealphp_state_snapshotted
+                && zend_hash_exists(&zealphp_snapshot_classes, class_name));
+
         zval class_snapshot;
         array_init_size(&class_snapshot, ce->default_static_members_count);
         bool any = false;
         for (int i = 0; i < ce->default_static_members_count; i++) {
-            /* SECURITY-FIX (objects-in-statics): leave object/resource statics
-             * process-shared, exactly like the $GLOBALS path. Snapshotting them
-             * would ZVAL_DUP (incref) on save and zval_ptr_dtor on restore — and
-             * if the displaced object's last ref is dropped here, its __destruct
-             * fires INSIDE zealphp_on_resume (a C scheduler callback where
-             * os_get_cid()==-1), which can re-enter the executor / yield mid-
-             * resume and corrupt the scheduler. Scalars/arrays are deep-copied
-             * and safe; objects/resources are not isolatable by value. */
-            if (!zealphp_globals_isolatable(&statics[i])) continue;
+            zval *slot = &statics[i];
+            if (Z_TYPE_P(slot) == IS_INDIRECT) continue;   /* parent owns inherited slots */
+
+            if (zp_boot_class) {
+                if (!zealphp_globals_isolatable(slot)) continue;
+                zval copy;
+                ZVAL_DUP(&copy, slot);
+                zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
+                any = true;
+                continue;
+            }
+
+            zval *tmpl = &ce->default_static_members_table[i];
+            if (Z_TYPE_P(tmpl) == IS_INDIRECT) continue;   /* defensive (inherited) */
+
+            /* Fast same-as-template checks — untouched slots cost ~nothing. */
+            if (Z_TYPE_P(slot) == Z_TYPE_P(tmpl)) {
+                if (Z_REFCOUNTED_P(slot)) {
+                    if (Z_COUNTED_P(slot) == Z_COUNTED_P(tmpl)) continue;  /* still shares payload */
+                } else if (Z_TYPE_P(slot) <= IS_TRUE) {
+                    continue;                                   /* UNDEF/NULL/FALSE/TRUE match */
+                } else if (Z_TYPE_P(slot) == IS_LONG && Z_LVAL_P(slot) == Z_LVAL_P(tmpl)) {
+                    continue;
+                } else if (Z_TYPE_P(slot) == IS_DOUBLE && Z_DVAL_P(slot) == Z_DVAL_P(tmpl)) {
+                    continue;
+                }
+            }
+            if (Z_TYPE_P(slot) == IS_RESOURCE) continue;       /* resources stay shared */
+
+            /* 1. snapshot (objects = +1 ref-hold; scalars/arrays = deep copy) */
             zval copy;
-            ZVAL_DUP(&copy, &statics[i]);
+            ZVAL_DUP(&copy, slot);
             zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
             any = true;
+
+            /* 2. re-park the live slot to the template (S11c discipline). The
+             * dtor of the displaced value cannot fire __destruct here: our
+             * snapshot copy above holds a reference. */
+            zval fresh;
+            ZVAL_COPY(&fresh, tmpl);
+            zval old = *slot;
+            ZVAL_COPY_VALUE(slot, &fresh);
+            zval_ptr_dtor(&old);
         }
         if (!any) { zval_ptr_dtor(&class_snapshot); continue; }
         zend_hash_update(Z_ARRVAL(snapshot), class_name, &class_snapshot);
@@ -1192,8 +1273,38 @@ static void zealphp_statics_snapshot_restore(long cid)
     } ZEND_HASH_FOREACH_END();
 }
 
+/* Does this per-coroutine statics snapshot hold any OBJECT refs? (Cheap walk —
+ * only runs on the on_close path.) */
+static bool zealphp_statics_snapshot_has_objects(zval *snapshot)
+{
+    zval *class_snapshot;
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(snapshot), class_snapshot) {
+        if (Z_TYPE_P(class_snapshot) != IS_ARRAY) continue;
+        zval *v;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(class_snapshot), v) {
+            zval *uv = v;
+            if (Z_ISREF_P(uv)) uv = Z_REFVAL_P(uv);
+            if (Z_TYPE_P(uv) == IS_OBJECT) return true;
+        } ZEND_HASH_FOREACH_END();
+    } ZEND_HASH_FOREACH_END();
+    return false;
+}
+
 static void zealphp_statics_snapshot_delete(long cid)
 {
+    /* ext#48: an object-bearing snapshot must NOT be dtor'd here — on_close
+     * runs OUTSIDE any coroutine, and dropping an object's last ref fires its
+     * __destruct (which may do I/O and yield) in the C callback. Park it in
+     * the orphan list; the next request-end drain (coroutine context) frees
+     * it. Scalar/array-only snapshots free directly (no user code runs). */
+    zval *snapshot = zend_hash_index_find(&zealphp_coro_static_snapshots, (zend_ulong)cid);
+    if (snapshot && Z_TYPE_P(snapshot) == IS_ARRAY
+        && zealphp_statics_orphans_live
+        && zealphp_statics_snapshot_has_objects(snapshot)) {
+        zval held;
+        ZVAL_COPY(&held, snapshot);            /* +1: orphan list keeps the array */
+        zend_hash_next_index_insert_new(&zealphp_statics_orphans, &held);
+    }
     zend_hash_index_del(&zealphp_coro_static_snapshots, (zend_ulong)cid);
 }
 
@@ -3577,8 +3688,20 @@ PHP_FUNCTION(zealphp_coroutine_globals_request_end)
         if (ptr) {
             /* Free this coroutine's pointer-keyed delta (drops its object refs). */
             zealphp_globals_snapshot_delete((zend_long)(uintptr_t)ptr);
+            /* ext#48: drop THIS request's class-static snapshot here too — we
+             * are in coroutine context, so an object static's __destruct (a
+             * cached connection etc.) may safely run/yield. Removes the
+             * snapshot's object refs before on_close could see them. */
+            zend_hash_index_del(&zealphp_coro_static_snapshots, (zend_ulong)(zend_long)(uintptr_t)ptr);
             zend_hash_index_del(&zealphp_coro_cid_to_ptr, cid);
         }
+    }
+    /* ext#48: drain orphaned object-bearing static snapshots from coroutines
+     * that died on the fatal path (on_close parked them — see
+     * zealphp_statics_snapshot_delete). We are in coroutine context. */
+    if (zealphp_statics_orphans_live
+        && zend_hash_num_elements(&zealphp_statics_orphans) > 0) {
+        zend_hash_clean(&zealphp_statics_orphans);   /* ZVAL_PTR_DTOR frees each */
     }
     /* Clear the live EG user globals to the parent baseline — drops the EG slot's
      * ref to any object global, firing __destruct HERE (coroutine context). */
@@ -4898,6 +5021,10 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_libxml_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_umask_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
+    /* ext#48: deferred-free list for object-bearing static snapshots whose
+     * coroutine closed before the request-end drain (see snapshot_delete). */
+    zend_hash_init(&zealphp_statics_orphans, 16, NULL, ZVAL_PTR_DTOR, 0);
+    zealphp_statics_orphans_live = true;
     zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_reincluded, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_cg_swap_fn, 64, NULL, NULL, 0);
