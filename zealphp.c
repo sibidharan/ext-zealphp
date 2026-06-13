@@ -452,56 +452,26 @@ static void zealphp_constants_snapshot_save(long cid)
  * preserved), so cached fetches that resolved them before the yield stay valid. */
 static void zealphp_constants_snapshot_restore(long cid)
 {
-    zval *pair = zend_hash_index_find(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
-    if (!pair || Z_TYPE_P(pair) != IS_ARRAY) return;
+    zval *pair  = zend_hash_index_find(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
+    zval *names = (pair && Z_TYPE_P(pair) == IS_ARRAY)
+        ? zend_hash_str_find(Z_ARRVAL_P(pair), "names", sizeof("names") - 1) : NULL;
+    zval *ptrs  = (pair && Z_TYPE_P(pair) == IS_ARRAY)
+        ? zend_hash_str_find(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1) : NULL;
 
-    zval *ptrs = zend_hash_str_find(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1);
-    zval *names = zend_hash_str_find(Z_ARRVAL_P(pair), "names", sizeof("names") - 1);
-    if (!ptrs || Z_TYPE_P(ptrs) != IS_ARRAY) return;
-
-    /* Re-insert each orphaned request-constant. If a PEER coroutine re-declared
-     * the same name while we were suspended, our orphan is unreachable -- BUT a
-     * cached op_array's run_time_cache FETCH_CONSTANT slot (shared across
-     * coroutines under opcache) may still point at it. Freeing it HERE (mid-
-     * request, in on_resume) dangles that cache -> ZEND_FETCH_CONSTANT
-     * use-after-free: the long-standing coroutine-legacy WordPress crash,
-     * root-caused by ASAN (free was here; the read at ZEND_FETCH_CONSTANT; the
-     * "mysqlnd teardown" zend_mm_heap corruption is just a downstream detection).
-     * So DEFER such frees to coroutine close (snapshot_delete), after the request
-     * has ended and its run_time_cache has been reset, where no fetch can read
-     * the freed constant. */
-    zval kept;
-    array_init(&kept);
+    /* Reset the process-wide request-constant tracker to THIS coroutine's own
+     * names FIRST, unconditionally (empty if we have no snapshot). The tracker
+     * is process-wide; without this reset a coroutine that resumes WITHOUT its
+     * own snapshot (e.g. the Co::run main, or a service coroutine) would inherit
+     * the names a previously-resumed peer left here, and its next yield's
+     * snapshot_save would re-capture the PEER's constant pointer into its OWN
+     * snapshot. That same pointer then lives in two snapshots and is freed twice
+     * at coroutine close — an intermittent double-free / heap abort (caught by
+     * the ASAN gate on this fix). Resetting per resume keeps the tracker
+     * reflecting only the running coroutine, so save() never cross-captures. */
     zend_string *name;
     zval *val;
-    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(ptrs), name, val) {
-        if (name) {
-            zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(val);
-            if (!c) {
-                continue;
-            }
-            if (!zend_hash_exists(EG(zend_constants), name)) {
-                zend_hash_add_ptr(EG(zend_constants), name, c);   /* re-insert; address preserved */
-            } else {
-                zval p;
-                ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
-                zend_hash_next_index_insert(Z_ARRVAL(kept), &p);  /* defer free to coroutine close */
-            }
-        }
-    } ZEND_HASH_FOREACH_END();
-
-    /* Keep "ptrs" holding ONLY the deferred-free orphans (re-inserted ones are now
-     * owned by EG). snapshot_delete frees whatever remains here at coroutine close. */
-    if (zend_hash_num_elements(Z_ARRVAL(kept)) > 0) {
-        zend_hash_str_update(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1, &kept);
-    } else {
-        zval_ptr_dtor(&kept);
-        zend_hash_str_del(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1);
-    }
-
-    /* Restore the tracked names into the process-wide tracker */
+    zend_hash_clean(&zealphp_request_constants);
     if (names && Z_TYPE_P(names) == IS_ARRAY) {
-        zend_hash_clean(&zealphp_request_constants);
         ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(names), name, val) {
             if (name) {
                 zval one;
@@ -510,26 +480,104 @@ static void zealphp_constants_snapshot_restore(long cid)
             }
         } ZEND_HASH_FOREACH_END();
     }
+
+    if (!ptrs || Z_TYPE_P(ptrs) != IS_ARRAY) return;
+
+    /* Re-install each of THIS coroutine's request-constants for our running
+     * slice. Two cases, with DELIBERATELY different ownership to stay
+     * memory-safe (the constant lifecycle is the most UAF-prone area here):
+     *
+     *   - name ABSENT in EG  -> add our orphan back (address preserved, so a
+     *     cached run_time_cache FETCH_CONSTANT slot stays valid) and HAND IT TO
+     *     EG: drop it from "ptrs" so the engine's per-process constant teardown
+     *     frees it exactly once. This is the original, proven-safe ownership —
+     *     and it is what makes the process-wide tracker's occasional
+     *     cross-capture of a name into a second coroutine's snapshot harmless
+     *     (both resolve it via this absent path → single EG owner, never a
+     *     double free).
+     *
+     *   - name PRESENT in EG  -> a peer (often a *finished* same-name request
+     *     whose constant was never cleared — there is no per-request constant
+     *     clear unless S10 defineIsolation is on) left its value installed. The
+     *     old code DEFERRED ours and left the peer's value, so this coroutine
+     *     silently read the PEER's value (ext#16). OVERWRITE with OURS so we
+     *     read our own define()'d value, WITHOUT freeing the displaced struct
+     *     (a shared opcache run_time_cache FETCH_CONSTANT slot may still point
+     *     at it — freeing here would dangle it, the documented WP UAF; the peer
+     *     re-installs its own on its next resume). Keep OUR struct in "ptrs"
+     *     (the deferred-free set): it is now live in EG under our name, so
+     *     snapshot_delete frees it at coroutine close (run_time_cache-safe),
+     *     detaching it from EG first so the engine can't double-free.
+     *
+     * The displaced struct of an already-finished peer is a small bounded leak
+     * (one per same-name cross-request collision), reclaimed at worker recycle —
+     * strictly better than the silent wrong value. */
+    zval kept;
+    array_init(&kept);
+    dtor_func_t orig_dtor = EG(zend_constants)->pDestructor;
+    EG(zend_constants)->pDestructor = NULL;   /* overwrite below must not free the displaced peer */
+    /* (name/val already declared at the top of this function) */
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(ptrs), name, val) {
+        if (name) {
+            zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(val);
+            if (!c) {
+                continue;
+            }
+            if (!zend_hash_exists(EG(zend_constants), name)) {
+                zend_hash_add_ptr(EG(zend_constants), name, c);   /* absent: re-insert, EG owns */
+            } else {
+                zend_hash_update_ptr(EG(zend_constants), name, c);  /* occupied: install ours, no free (ext#16) */
+                zval p;
+                ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
+                zend_hash_next_index_insert(Z_ARRVAL(kept), &p);    /* we still own it -> free at close */
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+    EG(zend_constants)->pDestructor = orig_dtor;
+
+    /* "ptrs" now holds ONLY the deferred (occupied-path) constants we still own;
+     * absent-path ones are owned by EG. snapshot_delete frees the remainder. */
+    if (zend_hash_num_elements(Z_ARRVAL(kept)) > 0) {
+        zend_hash_str_update(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1, &kept);
+    } else {
+        zval_ptr_dtor(&kept);
+        zend_hash_str_del(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1);
+    }
+    /* (tracker already reset to our names at the top of this function) */
 }
 
-/* Clean up this coroutine's constant snapshot (on close). If the coroutine
- * closed while SUSPENDED (its constants were orphaned by snapshot_save but never
- * re-inserted by a resume), the orphaned structs are not in EG(zend_constants)
- * and would leak — free them here. (Normal path: restore already re-inserted
- * them and deleted "ptrs", so this is a no-op.) */
+/* Clean up this coroutine's constant snapshot (on close). "ptrs" holds the
+ * constants this coroutine still owns and must free here — the run_time_cache-safe
+ * point (request ended, its cache reset):
+ *   - if the coroutine closed while SUSPENDED, its last save orphaned all its
+ *     constants into "ptrs" (none in EG) → free them directly;
+ *   - the deferred occupied-path constants (ext#16: installed via overwrite on
+ *     the last resume) may STILL be live in EG under their name → detach from EG
+ *     (WITHOUT freeing) before freeing, so the engine's per-process constant
+ *     teardown can't double-free. Only detach when the bucket actually points at
+ *     OUR struct — never evict a peer's live value.
+ * Absent-path constants were handed to EG by snapshot_restore (dropped from
+ * "ptrs"); the engine owns and frees those. */
 static void zealphp_constants_snapshot_delete(long cid)
 {
     zval *pair = zend_hash_index_find(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
     if (pair && Z_TYPE_P(pair) == IS_ARRAY) {
         zval *ptrs = zend_hash_str_find(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1);
         if (ptrs && Z_TYPE_P(ptrs) == IS_ARRAY) {
+            dtor_func_t orig_dtor = EG(zend_constants)->pDestructor;
+            EG(zend_constants)->pDestructor = NULL;   /* del must not free; we free explicitly below */
+            zend_string *name;
             zval *val;
-            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ptrs), val) {
+            ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(ptrs), name, val) {
                 zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(val);
                 if (c) {
+                    if (name && zend_hash_find_ptr(EG(zend_constants), name) == c) {
+                        zend_hash_del(EG(zend_constants), name);   /* detach ours, no free */
+                    }
                     zealphp_free_orphan_constant(c);
                 }
             } ZEND_HASH_FOREACH_END();
+            EG(zend_constants)->pDestructor = orig_dtor;
         }
     }
     zend_hash_index_del(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
