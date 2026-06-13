@@ -157,5 +157,56 @@ exist in EG, skip the re-include entirely (return a no-op op_array).
 
 ---
 
+## 8. Re-validation on 0.3.53 (2026-06-13) — hard source proof of scope
+
+Re-examined against the current code (ext 0.3.53, PHP 8.4.21) to refresh this
+0.3.27-era doc and de-risk the eventual build. Three concrete findings, each
+backed by source/measurement, all confirming: **Option A is the only safe fix
+and it requires re-implementing OPcache's persist + per-request-copy machinery
+(version-specific) — a multi-day dedicated project, NOT a multi-hour patch.**
+
+1. **Leak quantified.** Stage-7 re-execution of a minimal `class Child extends
+   Base { $x; m(); }` via `zealphp_include_isolation` + `zealphp_silent_redeclare`,
+   2000 iterations: `memory_get_usage(true)` grows ~**2 KB per re-exec**
+   (2 MB → 6 MB), bounded by `max_request` worker recycle. Matches the
+   "~4–7 KB" estimate (real classes are larger). **Validation metric for any
+   fix: this growth must go to ~0.**
+
+2. **No refcount/immutable shortcut — the VM frees the struct unconditionally.**
+   `ZEND_INCLUDE_OR_EVAL_SPEC_*_HANDLER` (Zend/zend_vm_execute.h, PHP 8.4.21,
+   ~line 5263), after executing an include result:
+   ```c
+   zend_destroy_static_vars(new_op_array);
+   destroy_op_array(new_op_array);
+   efree_size(new_op_array, sizeof(zend_op_array));   // STRUCT freed, NO immutable guard
+   ```
+   There is **no `ZEND_ACC_IMMUTABLE` check** in this handler path — the include
+   op_array STRUCT is always `efree`'d. This is exactly why the removed Stage-6
+   cache (`f728908`: shallow `memcpy` shell + `refcount++`) UAF'd: the body's
+   refcount was bumped but the *struct* was freed, so the cached pointer
+   dangled. **Any approach that shares the first op_array across requests
+   reintroduces this UAF.**
+
+3. **The engine does NOT export the copy/persist primitives.** `function_add_ref`
+   is not `ZEND_API` in 8.4; there is no exported `zend_op_array_copy` or
+   `zend_persist_op_array` (only `zend_extensions_op_array_persist`, for
+   extension-attached data — not the op_array itself). OPcache survives because
+   it keeps a **persistent SHM master** and returns a **per-request copy** the VM
+   safely `destroy_op_array+efree`s while the master persists. Replicating that
+   in zealphp means hand-writing BOTH halves — `zend_persist_op_array` (opcodes,
+   literals, CVs, static vars, the `ZEND_DECLARE_CLASS`'d classes, run_time_cache
+   via `ZEND_MAP_PTR`) AND the per-request copy — keyed by realpath,
+   version-specific for 8.3/8.4/8.5, with immutable invariants. Any wrong field →
+   corruption.
+
+**Conclusion:** the fix is **Option A, scoped as a multi-day dedicated build**
+(re-implement persist + copy), behind `ZEALPHP_OPARRAY_CACHE` /
+`App::oparrayCache()` default-off, ASAN+Valgrind-gated per §6. It is materially
+larger and riskier than ext#16 (which had a surgical, validatable fix). Until it
+lands, the orphan-leak stays bounded by `max_request` recycle — the documented
+operational mitigation.
+
+---
+
 *Companion analysis: the leak, the entanglement proof, and the 5-iteration log are
 also summarised on issue #12.*
