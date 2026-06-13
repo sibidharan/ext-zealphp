@@ -2723,6 +2723,101 @@ static void zealphp_install_mysqlnd_vio_shim(void)
 }
 #endif /* ZEALPHP_HAVE_MYSQLND_HEADERS */
 
+/* ── ext#45: neutralize persistent userland streams under coroutine hooks ──
+ *
+ * A persistent-keyed userland socket — pfsockopen(), or stream_socket_client()
+ * with STREAM_CLIENT_PERSISTENT — heap-corrupts at teardown under HOOK_ALL:
+ * the generic xport layer pestrdup()s stream->orig_path PERSISTENT, but the
+ * coroutine-hooked tcp/unix factory hands back an emalloc'd NON-persistent
+ * stream, so php_stream_free() pefree()s a malloc'd orig_path → _efree() on a
+ * malloc pointer → "zend_mm_heap corrupted". It is the sibling of the mysqlnd
+ * #44 crash, but in the GENERIC userland path, which has no method vtable to
+ * shim and sets orig_path AFTER the factory returns (so a factory wrapper can't
+ * re-pair it either). A persistent socket is ALSO semantically unsafe under
+ * coroutines: it lives in EG(persistent_list) and is reused across coroutines,
+ * so two coroutines interleave wire frames on one fd (violates the documented
+ * "one connection per coroutine" rule).
+ *
+ * Both the crash and the unsafety vanish if the socket is simply NON-persistent.
+ * So when the coroutine hooks activate we save + chain the relevant zif_handlers:
+ *   - pfsockopen           → route to fsockopen's handler (identical arg layout,
+ *                            just persistent=0)
+ *   - stream_socket_client → strip STREAM_CLIENT_PERSISTENT from the flags arg
+ *                            before the real handler runs
+ * Default on (rides install_coro_hooks like the mysqlnd shim); opt out with
+ * ZEALPHP_PERSIST_NEUTRALIZE_DISABLE=1. */
+#define ZEALPHP_STREAM_CLIENT_PERSISTENT 1  /* == PHP_STREAM_CLIENT_PERSISTENT */
+static zif_handler zealphp_orig_pfsockopen = NULL;
+static zif_handler zealphp_orig_fsockopen = NULL;
+static zif_handler zealphp_orig_stream_socket_client = NULL;
+static bool zealphp_persist_neutralize_installed = false;
+
+static void zealphp_pfsockopen_wrapper(INTERNAL_FUNCTION_PARAMETERS)
+{
+    /* persistent userland socket → non-persistent. fsockopen() and pfsockopen()
+     * share one C implementation (php_fsockopen_stream) and an identical arg
+     * layout — fsockopen just passes persistent=0 — so dispatching pfsockopen
+     * through fsockopen's handler yields a correct non-persistent socket. */
+    if (zealphp_orig_fsockopen) {
+        zealphp_orig_fsockopen(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+        return;
+    }
+    if (zealphp_orig_pfsockopen) {
+        zealphp_orig_pfsockopen(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    }
+}
+
+static void zealphp_stream_socket_client_wrapper(INTERNAL_FUNCTION_PARAMETERS)
+{
+    /* Clear STREAM_CLIENT_PERSISTENT (bit 0) from the flags arg before the real
+     * handler runs. stream_socket_client's signature is
+     *   ($address, &$error_code, &$error_message, $timeout, $flags, $context)
+     * so flags is the 5th positional arg. The arg is a by-value LONG in THIS
+     * call frame, so the rewrite touches only the frame slot, never the
+     * caller's variable. */
+    if (ZEND_NUM_ARGS() >= 5) {
+        zval *zp_flags = ZEND_CALL_ARG(execute_data, 5);
+        if (zp_flags && Z_TYPE_P(zp_flags) == IS_LONG
+                && (Z_LVAL_P(zp_flags) & ZEALPHP_STREAM_CLIENT_PERSISTENT)) {
+            ZVAL_LONG(zp_flags,
+                Z_LVAL_P(zp_flags) & ~(zend_long)ZEALPHP_STREAM_CLIENT_PERSISTENT);
+        }
+    }
+    if (zealphp_orig_stream_socket_client) {
+        zealphp_orig_stream_socket_client(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    }
+}
+
+static void zealphp_install_persist_neutralize(void)
+{
+    if (zealphp_persist_neutralize_installed) {
+        return;
+    }
+    const char *zp_dis = getenv("ZEALPHP_PERSIST_NEUTRALIZE_DISABLE");
+    if (zp_dis && *zp_dis == '1') {
+        return;
+    }
+    zend_function *zp_pf  = zend_hash_str_find_ptr(CG(function_table),
+        "pfsockopen", sizeof("pfsockopen") - 1);
+    zend_function *zp_fs  = zend_hash_str_find_ptr(CG(function_table),
+        "fsockopen", sizeof("fsockopen") - 1);
+    zend_function *zp_ssc = zend_hash_str_find_ptr(CG(function_table),
+        "stream_socket_client", sizeof("stream_socket_client") - 1);
+
+    if (zp_fs && zp_fs->type == ZEND_INTERNAL_FUNCTION) {
+        zealphp_orig_fsockopen = zp_fs->internal_function.handler;
+    }
+    if (zp_pf && zp_pf->type == ZEND_INTERNAL_FUNCTION) {
+        zealphp_orig_pfsockopen = zp_pf->internal_function.handler;
+        zp_pf->internal_function.handler = zealphp_pfsockopen_wrapper;
+    }
+    if (zp_ssc && zp_ssc->type == ZEND_INTERNAL_FUNCTION) {
+        zealphp_orig_stream_socket_client = zp_ssc->internal_function.handler;
+        zp_ssc->internal_function.handler = zealphp_stream_socket_client_wrapper;
+    }
+    zealphp_persist_neutralize_installed = true;
+}
+
 static bool zealphp_install_coro_hooks(void)
 {
     if (zealphp_coro_wrappers_installed) {
@@ -2777,6 +2872,10 @@ static bool zealphp_install_coro_hooks(void)
      * so the vio shim rides the same activation. */
     zealphp_install_mysqlnd_vio_shim();
 #endif
+    /* ext#45 — persistent userland sockets share the same hooked-transport
+     * orig_path mismatch (generic path, no vtable) AND are unsafe across
+     * coroutines, so neutralize persistence on the same activation. */
+    zealphp_install_persist_neutralize();
     return true;
 }
 
