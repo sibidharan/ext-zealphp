@@ -208,5 +208,41 @@ operational mitigation.
 
 ---
 
+## 9. SHIPPED (0.3.54) — Option D via compiled-op_array inspection
+
+Rather than the multi-day Option-A persist, the leak is closed for the **dominant
+case** (pure class/function declaration files — incl. the WordPress
+`WP_Block_Parser_Block`-style files the issue cites) by a small, corruption-free
+mechanism: **don't re-execute a file that has no side effects.**
+
+- `zealphp_oparray_cache(bool)` / `ZEALPHP_OPARRAY_CACHE=1`, **default OFF**.
+- On first compile, if the file's op_array is purely declarations
+  (`zealphp_op_array_is_pure_decl` — a precise COMPILED-opcode scan: only
+  `NOP`/`RETURN`/`DECLARE_CLASS[_DELAYED]`/`DECLARE_ANON_CLASS`/`DECLARE_FUNCTION`/
+  `DECLARE_LAMBDA_FUNCTION`; ANY other opcode ⇒ not pure), its declared symbols
+  are recorded per-realpath (keyed off `ce->name` / `function_name`, not the
+  NUL-prefixed delayed-binding scratch key).
+- Stage 7 then SKIPS re-evicting that file while every recorded symbol is still a
+  live winner in EG → it is never re-compiled → **no inherited-loser CE is created
+  → no leak.** Mixed files (any side-effecting top-level code) fail the pure check,
+  re-execute normally, and remain `max_request`-bounded.
+
+**Why this is safe (no Stage-6/persist surface):** there is NO op_array sharing,
+copying, persisting, or freeing — only a decision to leave a file cached. The
+worst-case failure of a misclassification is a behavioural bug (a side-effecting
+file wrongly skipped), which the conservative opcode scan prevents; it can never
+corrupt the heap.
+
+**Validated (PHP 8.4.21):** `tests/068` bidirectional (flag OFF ⇒ ~2 KB/re-exec
+leak, flag ON ⇒ **0 B/re-exec**, class stays usable, mixed file re-executes every
+request); 25,000-iteration `USE_ZEND_ALLOC=0` stress ⇒ 0 leak, 0 heap errors,
+clean MSHUTDOWN; full ext suite 65/65.
+
+**Remaining (Option A territory):** MIXED files (per-request code + an inherited
+class) still re-compile and orphan-leak, bounded by `max_request`. Closing that
+needs the persist + per-request-copy build scoped in §6–§8 — a separate effort.
+
+---
+
 *Companion analysis: the leak, the entanglement proof, and the 5-iteration log are
 also summarised on issue #12.*

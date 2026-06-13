@@ -301,6 +301,35 @@ static bool zealphp_include_isolation_enabled = false;
  * fresh (absent) set; on_close drops the entry when the coroutine ends. */
 static HashTable zealphp_coro_reincluded;
 
+/* ── ext#12: pure-declaration re-exec skip ──────────────────────────────
+ *
+ * The orphaned-inherited-loser leak (#12) is caused by Stage 7 RE-COMPILING a
+ * require_once'd file every request: silent-redeclare's first-wins orphans the
+ * re-compiled inherited class (it is early-bound against the live winner via EG,
+ * so it can't be freed — proven by 5 ASAN dead-ends, docs/issue-12-*.md), and
+ * the orphan leaks until worker recycle.
+ *
+ * Insight: if a file's ENTIRE top-level effect is class/function DECLARATIONS
+ * (no side-effecting opcodes) and all those symbols already exist as winners,
+ * re-executing it is a behavioural no-op (the declarations silently re-declare;
+ * there is no per-request code to re-run). So Stage 7 can simply NOT re-evict
+ * such a file → it is NOT re-compiled → no loser CE is created → no leak. This
+ * is the safe, surgical subset of the op_array-cache design (Option D, done by
+ * precise COMPILED-op_array opcode inspection — not source heuristics): there is
+ * NO op_array sharing/persisting/freeing, so none of the Stage-6 UAF surface.
+ * Mixed files (code + declarations) fail the pure check, re-execute normally,
+ * and stay max_request-bounded (the documented mitigation) until Option A lands.
+ *
+ * Opt-in (ZEALPHP_OPARRAY_CACHE=1 / zealphp_oparray_cache(true)), default OFF.
+ * `zealphp_reexec_skip` maps a recorded file's realpath → a persistent
+ * zend_array of its declared symbols (name → 1=class, 2=function); presence =
+ * "pure-declaration, skip re-exec iff every symbol is still present in EG". */
+static bool zealphp_reexec_skip_enabled = false;
+static HashTable zealphp_reexec_skip;
+static bool zealphp_reexec_skip_initialized = false;
+/* Defined below (before the compile hook); used by the Stage-7 handler above it. */
+static bool zealphp_reexec_may_skip(zend_string *resolved);
+
 /* ── exit()/die() → ZealPHP\HaltException (ext#47) ──────────────────── */
 
 /* Under coroutine concurrency, OpenSwoole turns exit()/die() into a thrown
@@ -4357,6 +4386,19 @@ static int zealphp_include_eval_handler(zend_execute_data *execute_data)
      * uses a single bucket (key 0). Include isolation otherwise needs the
      * coroutine scheduler, so a sync context is one logical request per process
      * (CLI / test), where key 0 gives correct once-per-request idempotency. */
+    /* ext#12 — pure-declaration re-exec skip. If this file was recorded as
+     * purely class/function declarations AND every symbol it declares is still a
+     * live winner in EG, re-executing it is a behavioural no-op (only re-declares
+     * existing winners; no per-request code). Leaving it cached (NOT evicting)
+     * means it is never re-compiled, so silent-redeclare never creates — and
+     * orphan-leaks — an inherited loser CE for it (#12). Opt-in; mixed / impure
+     * files are never recorded, so they fall through and re-execute normally. */
+    if (zealphp_reexec_skip_enabled && zealphp_reexec_skip_initialized
+        && zealphp_reexec_may_skip(resolved)) {
+        zend_string_release(resolved);
+        return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
+    }
+
     {
         zend_ulong reinc_key = os_get_cid ? (zend_ulong) os_get_cid() : 0;
         zval *seen = zend_hash_index_find(&zealphp_coro_reincluded, reinc_key);
@@ -4449,6 +4491,122 @@ static zend_string *zealphp_file_handle_path(zend_file_handle *file_handle)
         return zend_string_copy(file_handle->opened_path);
     }
     return NULL;
+}
+
+/* ext#12 — value dtor for zealphp_reexec_skip: each value is a persistent
+ * zend_array* of declared symbols. Free its contents + the array struct. */
+static void zealphp_reexec_skip_dtor(zval *zv)
+{
+    zend_array *syms = (zend_array *)Z_PTR_P(zv);
+    if (syms) {
+        zend_hash_destroy(syms);
+        pefree(syms, 1);
+    }
+}
+
+/* ext#12 — is this op_array purely class/function DECLARATIONS, with no
+ * side-effecting top-level code? Inspected from the COMPILED opcodes (precise,
+ * not a source heuristic). Conservative: ANY opcode outside the declaration /
+ * no-op / trivial-return safe-set means the file has observable per-request
+ * effects and MUST re-execute normally → returns false. Early-bound top-level
+ * classes leave NO declare opcode (bound at compile), so a pure file's op_array
+ * is often just ZEND_RETURN — still pure. */
+static bool zealphp_op_array_is_pure_decl(const zend_op_array *oa)
+{
+    if (!oa || !oa->opcodes) {
+        return false;
+    }
+    for (uint32_t i = 0; i < oa->last; i++) {
+        switch (oa->opcodes[i].opcode) {
+            case ZEND_NOP:
+            case ZEND_RETURN:               /* trivial/implicit file return */
+            case ZEND_DECLARE_CLASS:
+            case ZEND_DECLARE_CLASS_DELAYED:
+            case ZEND_DECLARE_ANON_CLASS:
+            case ZEND_DECLARE_FUNCTION:
+            case ZEND_DECLARE_LAMBDA_FUNCTION:
+                break;
+            default:
+                return false;               /* any other opcode = side effect */
+        }
+    }
+    return true;
+}
+
+/* ext#12 — record a pure-declaration file's declared symbols so Stage 7 can
+ * skip re-evicting (re-executing) it while every symbol is still a live winner.
+ * scratch_cl / scratch_fn hold the classes / functions THIS compile produced
+ * (lower-cased keys, matching EG(class_table)/EG(function_table) lookup). Stored
+ * once (first compile); persistent so it survives across requests/coroutines. */
+static void zealphp_reexec_skip_record(zend_string *file_key,
+                                       HashTable *scratch_cl,
+                                       HashTable *scratch_fn)
+{
+    if (!file_key
+        || zend_hash_exists(&zealphp_reexec_skip, file_key)) {
+        return;
+    }
+    uint32_t n = zend_hash_num_elements(scratch_cl) + zend_hash_num_elements(scratch_fn);
+    if (n == 0) {
+        return;   /* nothing declared → not a candidate */
+    }
+    zend_array *syms = pemalloc(sizeof(zend_array), 1);
+    zend_hash_init(syms, n, NULL, NULL, 1);   /* persistent; LONG values, no dtor */
+    void *ptr;
+    /* Classes: key off the CE's CANONICAL name (ce->name), not the scratch hash
+     * KEY — an inherited/delayed-bound class lives under a NUL-prefixed delayed
+     * key during compile, while the linked winner lands in EG(class_table) under
+     * its plain lower-cased name. Use ce->name (lower-cased) so the may_skip
+     * EG lookup matches. (First compile only → all scratch values are live
+     * winners; record runs after the first-wins merge but the values are still
+     * alive, having been moved into EG.) */
+    ZEND_HASH_FOREACH_PTR(scratch_cl, ptr) {
+        zend_class_entry *ce = (zend_class_entry *)ptr;
+        if (ce && ce->name) {
+            zend_string *lc = zend_string_tolower(ce->name);
+            zend_string *pk = zend_string_dup(lc, 1);   /* persistent key */
+            zval v; ZVAL_LONG(&v, 1);                    /* 1 = class */
+            zend_hash_add(syms, pk, &v);
+            zend_string_release(pk);
+            zend_string_release(lc);
+        }
+    } ZEND_HASH_FOREACH_END();
+    ZEND_HASH_FOREACH_PTR(scratch_fn, ptr) {
+        zend_function *fn = (zend_function *)ptr;
+        if (fn && fn->common.function_name) {
+            zend_string *lc = zend_string_tolower(fn->common.function_name);
+            zend_string *pk = zend_string_dup(lc, 1);
+            zval v; ZVAL_LONG(&v, 2);                    /* 2 = function */
+            zend_hash_add(syms, pk, &v);
+            zend_string_release(pk);
+            zend_string_release(lc);
+        }
+    } ZEND_HASH_FOREACH_END();
+    zend_hash_str_add_ptr(&zealphp_reexec_skip,
+                          ZSTR_VAL(file_key), ZSTR_LEN(file_key), syms);
+}
+
+/* ext#12 — may Stage 7 skip re-executing this file? True iff it was recorded as
+ * a pure-declaration file AND every symbol it declares is still present in the
+ * matching EG table (so re-exec would only re-declare existing winners — a
+ * no-op). A missing symbol (e.g. cleared by a reset) → re-execute to restore it. */
+static bool zealphp_reexec_may_skip(zend_string *resolved)
+{
+    zend_array *syms = zend_hash_find_ptr(&zealphp_reexec_skip, resolved);
+    if (!syms) {
+        return false;
+    }
+    zend_string *name;
+    zval *tv;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(syms, name, tv) {
+        if (name) {
+            HashTable *tbl = (Z_LVAL_P(tv) == 1) ? EG(class_table) : EG(function_table);
+            if (!zend_hash_exists(tbl, name)) {
+                return false;
+            }
+        }
+    } ZEND_HASH_FOREACH_END();
+    return true;
 }
 
 static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, int type)
@@ -4661,6 +4819,22 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
      * op_array's refcount pointer dangles once the engine frees it, segfaulting
      * the next compile. Stage 3c re-compiles + first-wins-merges every time,
      * which is correct without the cache. */
+
+    /* ext#12 — record this file as a re-exec-skip candidate if it is purely
+     * class/function declarations (no side-effecting top-level opcodes). The
+     * scratch tables still hold the symbols this compile produced. Recorded
+     * once; Stage 7 then skips re-evicting the file while its symbols are live
+     * winners, so it is never re-compiled and no inherited-loser CE is created.
+     * Opt-in + lazy-init so it is fully inert when disabled. */
+    if (zealphp_reexec_skip_enabled && file_key
+        && zealphp_op_array_is_pure_decl(result)) {
+        if (!zealphp_reexec_skip_initialized) {
+            zend_hash_init(&zealphp_reexec_skip, 64, NULL, zealphp_reexec_skip_dtor, 1);
+            zealphp_reexec_skip_initialized = true;
+        }
+        zealphp_reexec_skip_record(file_key, &scratch_cl, &scratch_fn);
+    }
+
     if (file_key) {
         zend_string_release(file_key);
     }
@@ -4725,6 +4899,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_include_isolation, 0, 0,
     ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_oparray_cache, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_cwd_isolation, 0, 0, _IS_BOOL, 0)
     ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
 ZEND_END_ARG_INFO()
@@ -4761,6 +4939,30 @@ PHP_FUNCTION(zealphp_include_isolation)
     bool prev = zealphp_include_isolation_enabled;
     if (!on_is_null) {
         zealphp_include_isolation_enabled = (bool)on;
+    }
+    RETURN_BOOL(prev);
+}
+
+/* ext#12 — pure-declaration re-exec skip knob. No-arg / null returns the
+ * current state; bool arg sets it and returns the PREVIOUS state. When on,
+ * Stage 7 skips re-executing require_once'd files whose entire top-level effect
+ * is class/function declarations already present as winners — so they are never
+ * re-compiled and no inherited-loser CE is orphan-leaked (#12). Pairs with
+ * zealphp_include_isolation()/zealphp_silent_redeclare() (coroutine-legacy).
+ * Default OFF; also resolvable from ZEALPHP_OPARRAY_CACHE at boot. Safe
+ * (conservative opcode scan; only ever skips side-effect-free files). */
+PHP_FUNCTION(zealphp_oparray_cache)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = zealphp_reexec_skip_enabled;
+    if (!on_is_null) {
+        zealphp_reexec_skip_enabled = (bool)on;
     }
     RETURN_BOOL(prev);
 }
@@ -5075,6 +5277,15 @@ PHP_MINIT_FUNCTION(zealphp)
     zealphp_statics_orphans_live = true;
     zend_hash_init(&zealphp_coro_fn_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_reincluded, 256, NULL, ZVAL_PTR_DTOR, 0);
+    /* ext#12: opt-in pure-declaration re-exec skip. Default off; ZEALPHP_OPARRAY_CACHE=1
+     * (or "on"/"true"/"yes") turns it on at boot. The framework also flips it via
+     * zealphp_oparray_cache(true). The skip hash itself is lazy-init'd on first record. */
+    {
+        const char *e = getenv("ZEALPHP_OPARRAY_CACHE");
+        if (e && (e[0] == '1' || e[0] == 'o' || e[0] == 'O' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y')) {
+            zealphp_reexec_skip_enabled = true;
+        }
+    }
     zend_hash_init(&zealphp_coro_cg_swap_fn, 64, NULL, NULL, 0);
     zend_hash_init(&zealphp_coro_cg_swap_cl, 64, NULL, NULL, 0);
     zend_hash_init(&zealphp_coro_in_autoload, 64, NULL, ZVAL_PTR_DTOR, 0);
@@ -5296,6 +5507,14 @@ PHP_RSHUTDOWN_FUNCTION(zealphp)
         zend_hash_destroy(&zealphp_request_constants);
         zend_hash_destroy(&zealphp_globals_snapshot);
         zealphp_request_tables_live = false;
+    }
+
+    /* ext#12: the pure-declaration re-exec-skip record is worker-lifetime
+     * (persistent keys + persistent per-file symbol arrays), so free it at
+     * module shutdown, not per request. The value dtor frees each symbol array. */
+    if (zealphp_reexec_skip_initialized) {
+        zend_hash_destroy(&zealphp_reexec_skip);
+        zealphp_reexec_skip_initialized = false;
     }
     return SUCCESS;
 }
@@ -5846,6 +6065,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_silent_redeclare,       arginfo_zealphp_silent_redeclare)
     PHP_FE(zealphp_include_isolation,     arginfo_zealphp_include_isolation)
     PHP_FE(zealphp_include_isolation_reset, arginfo_zealphp_include_isolation_reset)
+    PHP_FE(zealphp_oparray_cache,         arginfo_zealphp_oparray_cache)
     PHP_FE(zealphp_cwd_isolation,         arginfo_zealphp_cwd_isolation)
     PHP_FE(zealphp_locale_isolation,      arginfo_zealphp_locale_isolation)
     PHP_FE(zealphp_timezone_isolation,    arginfo_zealphp_timezone_isolation)
