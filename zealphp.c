@@ -2140,6 +2140,64 @@ static void zealphp_globals_snapshot_restore(long cid)
             zend_hash_del(&EG(symbol_table), key);
         } ZEND_HASH_FOREACH_END();
     }
+
+    /* Phase R — converge STALE deep-frame `global $K` bindings onto the live
+     * object global ($wpdb-null fix; path-agnostic — covers BOTH the delta path
+     * (plain IS_REFERENCE bucket from a function's `global $wpdb; $wpdb = new
+     * wpdb()`) and the Stage-8 registry path (IS_INDIRECT → TOP_CODE CV)).
+     *
+     * Root cause: under coroutine-legacy the engine's zend_attach_symbol_table
+     * (re-attach in zend_leave_helper) and the per-coroutine park/restore both
+     * manage ONE shared EG(symbol_table). A function deep in the call stack
+     * (WP get_posts / _prime_post_caches / get_terms, ...) binds its CV to the
+     * object global's zend_reference via `global $K`; a later re-attach / restore
+     * can hand the bucket a DIFFERENT canonical reference for the same key, so
+     * the deep frame keeps an orphaned reference reading NULL while $GLOBALS[$K]
+     * (the bucket) reads the live object — decisively captured as
+     * $GLOBALS['wpdb']=OBJ + the function local NULL → "prepare() on null".
+     *
+     * Now (after Steps 1/2/2b/3) EG(symbol_table) holds THIS coroutine's restored
+     * globals. The repair is type-AGNOSTIC: the divergence hits OBJECT globals
+     * ($wpdb → "prepare() on null") AND ARRAY globals ($wp_filter / $shortcode_tags
+     * / $wp_actions → "array_pop(): ... null given") identically — any `global $K`
+     * whose deep-frame CV was abandoned by the shared-table re-attach.
+     *
+     * Single O(frames × vars) walk (not O(symtab × frames)): for every live-frame
+     * CV that carries the stale signature — IS_REFERENCE whose deref is NULL/UNDEF
+     * (a `global $K` binding whose ref was orphaned) — look up $K in
+     * EG(symbol_table); if the bucket holds a live OBJECT/ARRAY canonical via a
+     * different zend_reference, converge the CV onto it. Tightly guarded so a
+     * genuine non-global by-ref local is never repointed, and we only repair
+     * toward a live object/array value (scalars don't fatal on null). Per-resume
+     * cost is one frame-chain walk + a hash probe ONLY for stale-ref CVs (rare). */
+    if (EG(symbol_table).nTableMask) {
+        zend_execute_data *rx = EG(current_execute_data);
+        for (; rx; rx = rx->prev_execute_data) {
+            if (!rx->func || !ZEND_USER_CODE(rx->func->type)) continue;
+            zend_op_array *roa = &rx->func->op_array;
+            for (uint32_t j = 0; j < roa->last_var; j++) {
+                zval *cv = ZEND_CALL_VAR_NUM(rx, j);
+                if (!Z_ISREF_P(cv)) continue;                        /* only `global`-style ref CVs */
+                if (Z_TYPE(Z_REF_P(cv)->val) > IS_NULL) continue;    /* stale signature: deref NULL/UNDEF */
+                zend_string *name = roa->vars[j];
+                if (zealphp_globals_is_superglobal_key(ZSTR_VAL(name), ZSTR_LEN(name))) continue;
+                zval *b = zend_hash_find(&EG(symbol_table), name);
+                if (!b) continue;
+                zval *slot = b;
+                if (Z_TYPE_P(slot) == IS_INDIRECT) slot = Z_INDIRECT_P(slot);
+                zval *dv = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot;
+                if (Z_TYPE_P(dv) != IS_OBJECT && Z_TYPE_P(dv) != IS_ARRAY) continue;  /* repair only toward a live object/array */
+                if (!Z_ISREF_P(slot)) ZVAL_MAKE_REF(slot);           /* establish a shareable canonical reference */
+                zend_reference *canon = Z_REF_P(slot);
+                if (Z_REF_P(cv) == canon) continue;                  /* already canonical — coherent */
+                zval tmp;
+                ZVAL_COPY_VALUE(&tmp, cv);                           /* old (stale/orphaned) ref */
+                ZVAL_REF(cv, canon);                                 /* converge onto the canonical reference */
+                GC_ADDREF(canon);
+                zval_ptr_dtor(&tmp);                                 /* release the stale ref (frees if last holder) */
+            }
+        }
+    }
 }
 
 /* Delete both per-coroutine tables on coroutine close. */
