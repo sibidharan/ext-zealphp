@@ -2170,31 +2170,65 @@ static void zealphp_globals_snapshot_restore(long cid)
      * genuine non-global by-ref local is never repointed, and we only repair
      * toward a live object/array value (scalars don't fatal on null). Per-resume
      * cost is one frame-chain walk + a hash probe ONLY for stale-ref CVs (rare). */
+    /* MEMORY-SAFE rewrite (#29 — ext 0.3.58). The first cut dereferenced and freed
+     * each frame CV's zend_reference (Z_REF_P(cv)->val read + zval_ptr_dtor of the
+     * old ref). Under concurrent worker-recycle a live-frame CV can alias a
+     * reference that the Step-2b reapply above ALREADY freed (the engine's
+     * attach/detach moves refs between CVs with no refcount change — ext#52
+     * family — so a freed ref can still be pointed at by another frame's CV).
+     * ASAN pinned it: heap-use-after-free reading ->val / over-free at the dtor,
+     * surfacing as `zend_mm_heap corrupted` under concurrent wp-admin. This
+     * version touches a frame CV's reference by POINTER IDENTITY ONLY — it never
+     * dereferences ->val and never frees the old reference — so a dangling or
+     * peer-aliased ref is neither read nor double-freed.
+     *
+     * Step 1: collect canonical refs for live OBJECT/ARRAY globals from the
+     * (stable, already-restored) symbol table. Step 2: walk live frames; a CV
+     * named like one of those globals that is IS_REFERENCE but points at a
+     * DIFFERENT reference is repointed at the canonical (ZVAL_REF + GC_ADDREF).
+     * The CV's old reference is ABANDONED, not released: if Step 2b freed it we
+     * must not touch it; if it is still live its slot resets at request-end
+     * reset_to_parent. The canonical set is bounded (a handful of object/array
+     * globals), so the abandoned-ref residue is tiny and worker-recycle bounded —
+     * the correct trade against the heap corruption the deref/free caused. */
     if (EG(symbol_table).nTableMask) {
-        zend_execute_data *rx = EG(current_execute_data);
-        for (; rx; rx = rx->prev_execute_data) {
-            if (!rx->func || !ZEND_USER_CODE(rx->func->type)) continue;
-            zend_op_array *roa = &rx->func->op_array;
-            for (uint32_t j = 0; j < roa->last_var; j++) {
-                zval *cv = ZEND_CALL_VAR_NUM(rx, j);
-                if (!Z_ISREF_P(cv)) continue;                        /* only `global`-style ref CVs */
-                if (Z_TYPE(Z_REF_P(cv)->val) > IS_NULL) continue;    /* stale signature: deref NULL/UNDEF */
-                zend_string *name = roa->vars[j];
-                if (zealphp_globals_is_superglobal_key(ZSTR_VAL(name), ZSTR_LEN(name))) continue;
-                zval *b = zend_hash_find(&EG(symbol_table), name);
-                if (!b) continue;
-                zval *slot = b;
-                if (Z_TYPE_P(slot) == IS_INDIRECT) slot = Z_INDIRECT_P(slot);
-                zval *dv = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot;
-                if (Z_TYPE_P(dv) != IS_OBJECT && Z_TYPE_P(dv) != IS_ARRAY) continue;  /* repair only toward a live object/array */
-                if (!Z_ISREF_P(slot)) ZVAL_MAKE_REF(slot);           /* establish a shareable canonical reference */
-                zend_reference *canon = Z_REF_P(slot);
-                if (Z_REF_P(cv) == canon) continue;                  /* already canonical — coherent */
-                zval tmp;
-                ZVAL_COPY_VALUE(&tmp, cv);                           /* old (stale/orphaned) ref */
-                ZVAL_REF(cv, canon);                                 /* converge onto the canonical reference */
-                GC_ADDREF(canon);
-                zval_ptr_dtor(&tmp);                                 /* release the stale ref (frees if last holder) */
+        struct { zend_string *name; zend_reference *ref; } zp_canon[ZEALPHP_MAX_REQ_FRAME_RANGES];
+        int zp_nc = 0;
+        zend_string *gk;
+        zval *gv;
+        ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), gk, gv) {
+            if (!gk) continue;
+            if (zp_nc >= (int)(sizeof(zp_canon) / sizeof(zp_canon[0]))) break;
+            if (zealphp_globals_is_superglobal_key(ZSTR_VAL(gk), ZSTR_LEN(gk))) continue;
+            zval *slot = gv;
+            if (Z_TYPE_P(slot) == IS_INDIRECT) slot = Z_INDIRECT_P(slot);
+            zval *dv = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot;
+            if (Z_TYPE_P(dv) != IS_OBJECT && Z_TYPE_P(dv) != IS_ARRAY) continue;  /* repair only toward a live object/array */
+            if (!Z_ISREF_P(slot)) ZVAL_MAKE_REF(slot);               /* establish a shareable canonical reference */
+            zp_canon[zp_nc].name = gk;
+            zp_canon[zp_nc].ref  = Z_REF_P(slot);
+            zp_nc++;
+        } ZEND_HASH_FOREACH_END();
+
+        if (zp_nc > 0) {
+            zend_execute_data *rx = EG(current_execute_data);
+            for (; rx; rx = rx->prev_execute_data) {
+                if (!rx->func || !ZEND_USER_CODE(rx->func->type)) continue;
+                zend_op_array *roa = &rx->func->op_array;
+                for (uint32_t j = 0; j < roa->last_var; j++) {
+                    zval *cv = ZEND_CALL_VAR_NUM(rx, j);
+                    if (!Z_ISREF_P(cv)) continue;            /* type tag — in-frame, always safe */
+                    zend_reference *cvref = Z_REF_P(cv);     /* pointer only — never dereferenced */
+                    for (int c = 0; c < zp_nc; c++) {
+                        if (!zend_string_equals(roa->vars[j], zp_canon[c].name)) continue;
+                        if (cvref == zp_canon[c].ref) break;  /* already canonical — coherent */
+                        /* stale `global $name` binding: repoint at the canonical
+                         * reference. Abandon the old ref (no read, no free). */
+                        ZVAL_REF(cv, zp_canon[c].ref);
+                        GC_ADDREF(zp_canon[c].ref);
+                        break;
+                    }
+                }
             }
         }
     }
