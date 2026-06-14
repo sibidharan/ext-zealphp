@@ -5859,6 +5859,10 @@ PHP_FUNCTION(zealphp_reset_request_rtcaches)
     RETURN_LONG(count);
 }
 
+/* fwd — in-place template refresh of one function's live static table (defined
+ * with the request-BEGIN companion below); used by the end-reset too (#28). */
+static void zealphp_fn_statics_refresh_one(zend_op_array *opa, HashTable *live);
+
 /* ── zealphp_reset_request_statics(): int ────────────────────────────────
  *
  * Per-request FUNCTION-STATIC reset — the PHP-FPM "fresh process per request"
@@ -5923,8 +5927,14 @@ PHP_FUNCTION(zealphp_reset_request_statics)
             if (!ZEND_MAP_PTR(opa->static_variables_ptr)) continue;
             HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
             if (live && live != opa->static_variables) {
-                zend_array_destroy(live);
-                ZEND_MAP_PTR_SET(opa->static_variables_ptr, NULL);
+                /* #28: rewrite values to the template IN PLACE instead of
+                 * destroy+null. Keeps the table address STABLE (the 0.3.28
+                 * class-static UAF lesson) AND removes the destroy-window that
+                 * let a concurrent peer briefly observe a half-reset static
+                 * (the residual wp_start_object_cache $first_init leak). The
+                 * begin-refresh + S5a multiplex per-coroutine values on the
+                 * stable table. */
+                zealphp_fn_statics_refresh_one(opa, live);
                 count++;
             }
         }
@@ -5946,8 +5956,7 @@ PHP_FUNCTION(zealphp_reset_request_statics)
                     if (!ZEND_MAP_PTR(opa->static_variables_ptr)) continue;
                     HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
                     if (live && live != opa->static_variables) {
-                        zend_array_destroy(live);
-                        ZEND_MAP_PTR_SET(opa->static_variables_ptr, NULL);
+                        zealphp_fn_statics_refresh_one(opa, live);  /* #28: in-place (stable address, no destroy-window) */
                         count++;
                     }
                 }
@@ -5955,6 +5964,107 @@ PHP_FUNCTION(zealphp_reset_request_statics)
         }
     } ZEND_HASH_FOREACH_END();
 
+    RETURN_LONG(count);
+}
+
+/* ── zealphp_reset_request_statics_begin(): int ──────────────────────────
+ *
+ * Request-BEGIN companion to zealphp_reset_request_statics() — closes the
+ * CONCURRENT in-flight function-static leak (#28 / $wp_object_cache).
+ *
+ * The request-END reset destroys the live static table + nulls the map_ptr, so
+ * the NEXT *sequential* request re-dups the template via ZEND_BIND_STATIC —
+ * correct fresh-per-request, but it cannot stop a peer reading a stale value
+ * MID-request: WordPress's wp_start_object_cache() has `static $first_init`;
+ * coroutine A sets it false (after creating $wp_object_cache), and a concurrent
+ * peer B reads that false BEFORE A's request ends, so B skips wp_cache_init()
+ * and B's $wp_object_cache stays NULL -> "switch_to_blog() on null". S5a only
+ * PRESERVES a coroutine's own static across ITS yields; a fresh request
+ * coroutine has no snapshot and reads the shared process-global (a peer's value).
+ *
+ * Fix: at request BEGIN, write each registered static back to its TEMPLATE value
+ * IN PLACE (keeping the table + map_ptr — unlike the destroy+null end-reset) so
+ * (a) this coroutine's first slice reads the template, and (b) S5a's per-yield
+ * save captures the template into THIS coroutine's snapshot and restore re-asserts
+ * it on every resume, surviving peer interleaving. Clobbering the shared
+ * process-global here is safe under cooperative scheduling: a yielded peer's value
+ * already lives in its S5a snapshot (saved on its yield, restored on its resume),
+ * and for the dominant init-once-guard pattern even a missed save only yields a
+ * harmless re-init (template = "first run"). Objects/resources are left
+ * process-shared (the S5a contract — no __destruct inside a scheduler callback).
+ * Gated by the framework on the same conditions as the end-reset, plus the
+ * ZEALPHP_FN_STATICS_RESET_DISABLE env kill-switch. */
+/* In-place refresh of one function's live static table to its template values.
+ * Keeps the table address STABLE (no destroy/realloc — the 0.3.28 class-static
+ * UAF lesson) so cached slots and S5a's per-coroutine save/restore stay valid.
+ * Objects/resources are left process-shared (the S5a contract — no __destruct in
+ * a scheduler callback); a function-static TEMPLATE is always a constant
+ * expression (PHP forbids `static $x = new Foo()`), so the source is never an
+ * object and this only ever writes scalars/arrays/null. */
+static void zealphp_fn_statics_refresh_one(zend_op_array *opa, HashTable *live)
+{
+    HashTable *tmpl = opa->static_variables;
+    if (!tmpl || tmpl == live) return;
+    zend_string *vn;
+    zval *tv;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(tmpl, vn, tv) {
+        if (!vn) continue;
+        zval *slot = zend_hash_find(live, vn);
+        if (!slot) continue;
+        zval *target = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot;
+        zval *src = Z_ISREF_P(tv) ? Z_REFVAL_P(tv) : tv;
+        if (!zealphp_globals_isolatable(src)) continue;  /* objects/resources stay process-shared */
+        zval old;
+        ZVAL_COPY_VALUE(&old, target);
+        ZVAL_DUP(target, src);
+        zval_ptr_dtor(&old);
+    } ZEND_HASH_FOREACH_END();
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_statics_begin, 0, 0, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+PHP_FUNCTION(zealphp_reset_request_statics_begin)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char *e = getenv("ZEALPHP_FN_STATICS_RESET_DISABLE");
+        disabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    if (disabled) {
+        RETURN_LONG(0);
+    }
+
+    /* Iterate the touched-set registry DIRECTLY (not zealphp_walk_fn_statics_registry,
+     * which SKIPS null-live entries) so we also re-INSTANTIATE a static the
+     * request-END reset destroyed+nulled. A null map_ptr means NO coroutine holds a
+     * binding to this static, so pre-instantiating it from the template is
+     * concurrency-safe — there is no live frame CV or peer value to clobber. This
+     * makes the table EXIST again so S5a's per-yield save (this coroutine's first
+     * yield) captures the template into its snapshot and restore re-asserts it across
+     * peer interleaving; without it, save/restore skip the null-live slot and the
+     * coroutine reads a peer's stale value — the wp_start_object_cache()
+     * `static $first_init` concurrent leak that left $wp_object_cache null (#28). */
+    zend_long count = 0;
+    zend_op_array *opa;
+    ZEND_HASH_FOREACH_PTR(&zealphp_fn_static_registry, opa) {
+        if (!opa || !opa->static_variables) continue;
+        if (!ZEND_MAP_PTR(opa->static_variables_ptr)) continue;  /* slot unallocated — first BIND will dup the template */
+        HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+        if (!live || live == opa->static_variables) {
+            /* Destroyed/nulled by the end-reset (or not yet bound this cycle):
+             * re-dup the template so the table exists with fresh values. Mirrors
+             * ZEND_BIND_STATIC's own dup; freed by the next end-reset. */
+            HashTable *dup = zend_array_dup(opa->static_variables);
+            ZEND_MAP_PTR_SET(opa->static_variables_ptr, dup);
+        } else {
+            /* Already live: rewrite values to template in place (stable address). */
+            zealphp_fn_statics_refresh_one(opa, live);
+        }
+        count++;
+    } ZEND_HASH_FOREACH_END();
     RETURN_LONG(count);
 }
 
@@ -6231,6 +6341,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_umask_isolation,       arginfo_zealphp_umask_isolation)
     PHP_FE(zealphp_reset_request_rtcaches, arginfo_zealphp_reset_request_rtcaches)
     PHP_FE(zealphp_reset_request_statics,  arginfo_zealphp_reset_request_statics)
+    PHP_FE(zealphp_reset_request_statics_begin, arginfo_zealphp_reset_request_statics_begin)
     PHP_FE(zealphp_reset_request_class_statics, arginfo_zealphp_reset_request_class_statics)
     PHP_FE_END
 };
