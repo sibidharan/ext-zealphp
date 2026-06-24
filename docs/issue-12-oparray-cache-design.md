@@ -244,5 +244,61 @@ needs the persist + per-request-copy build scoped in §6–§8 — a separate ef
 
 ---
 
+## 10. SHIPPED — Option A (full op_array cache for MIXED files)
+
+The residual the §9 pure-declaration skip left open — a MIXED file (per-request
+code + an inherited class) re-compiling every request — is now closed by the
+op_array cache scoped in §4.A, implemented WITHOUT replicating OPcache's persist
+machinery.
+
+**Mechanism** (`zealphp_oparray_cache_full(true)` / `ZEALPHP_OPARRAY_CACHE_FULL=1`,
+default OFF; a separate opt-in from `zealphp_oparray_cache()`'s pure-decl skip):
+
+- Compile each cacheable re-executed file ONCE; keep its op_array as a per-worker
+  MASTER (`zealphp_oparray_master_cache`, keyed by realpath). The master is NEVER
+  handed to the VM, so its body cannot dangle (the §3.1 / removed-Stage-6 UAF).
+- On every subsequent Stage-7 re-include, return a freeable SHALLOW COPY: the
+  copy's `static_variables` are nulled (so the include handler's
+  `zend_destroy_static_vars(copy)` is a no-op and never touches the master), and
+  the master's opcode body is refcount-held at baseline 1 (so `destroy_op_array`
+  on the copy early-returns with refcount still > 0 and only the throwaway copy
+  STRUCT is `efree`'d). Re-executing the copy re-runs the per-request code while
+  silent-redeclare skips the now-present class declarations.
+- **No re-compile ⇒ no inherited-loser CE (the orphan leak) AND no `CG(arena)`
+  growth (member structs compiled once)** — both #12 leak components, closed at
+  once.
+
+**Why §8's "needs OPcache-grade persist" is superseded:** the master persists
+trivially because coroutine-legacy never runs `shutdown_executor` (the same
+premise as the per-request resets), so the request-`emalloc`'d op_array survives
+for the worker's life without a persist copy. The copy is the only thing the VM
+frees; the refcount hold keeps the shared body alive while any copy (or the
+master) references it — so the §3.1 Stage-6 UAF does not resurface.
+
+**Exclusions (correctness boundaries, not workarounds):**
+- OPcache SHM (`ZEND_ACC_IMMUTABLE`) op_arrays are NOT cached — writing their
+  refcount would corrupt shared memory, and OPcache already owns their lifetime.
+- Files with TOP-LEVEL static vars are NOT cached (the copy nulls
+  `static_variables`); they re-compile normally. Rare in includes.
+
+**Validated (PHP 8.4.5):**
+- **Leak → 0** over 10k re-includes (sync AND coroutine). A 20-module synthetic
+  (traits + interfaces + abstract + deep inheritance + per-request code) leaked
+  **248 MB over 3k requests uncached → 0 cached**.
+- **Valgrind: 0 errors from 0 contexts** in BOTH sync and coroutine mode.
+- **Correctness**: per-request code re-executes every request; inherited,
+  abstract, trait, interface, conditional, anonymous classes + top-level functions
+  + the universal return contract all behave identically to the uncached path.
+- **OPcache on** (+`dups_fix`): correct, 0 leak, 0 crash, 0 redeclare errors.
+- **Full ext phpt suite green** (zero regressions) + new bidirectional
+  `tests/070-oparray-cache-full-mixed.phpt`.
+
+**Remaining before production-default:** the actual WordPress / 50-app sweep (§6)
+on an environment with those apps; and an A/B of the API surface (keep the
+separate `_full` opt-in vs. folding it into `zealphp_oparray_cache()` so one flag
+is the complete #12 fix). Until then it stays opt-in, default OFF.
+
+---
+
 *Companion analysis: the leak, the entanglement proof, and the 5-iteration log are
 also summarised on issue #12.*

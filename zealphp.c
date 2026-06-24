@@ -4800,6 +4800,61 @@ static bool zealphp_reexec_may_skip(zend_string *resolved)
     return true;
 }
 
+/* == ext#12 Option A: full op_array cache for re-executed mixed files ======
+ * Compile each cacheable file ONCE, keep the op_array as a per-worker MASTER,
+ * and on every subsequent Stage-7 re-include return a freeable SHALLOW COPY.
+ * The master's opcode body is refcount-held (baseline 1) so the VM's
+ * destroy_op_array early-returns (refcount stays > 0) and only the throwaway
+ * copy struct is efree'd. No re-compile => no inherited-loser CE (orphan leak)
+ * and no CG(arena) growth (member structs allocated once). The master is NEVER
+ * handed to the VM, so its body cannot dangle (the removed Stage-6 cache's UAF). */
+static HashTable zealphp_oparray_master_cache;
+static bool zealphp_oparray_master_cache_init = false;
+static bool zealphp_oparray_cache_full = false;
+
+static zend_op_array *zealphp_oparray_make_copy(zend_op_array *master)
+{
+    zend_op_array *copy = emalloc(sizeof(zend_op_array));
+    memcpy(copy, master, sizeof(zend_op_array));
+    if (master->refcount) {
+        (*master->refcount)++;       /* hold the shared body for this copy */
+    }
+    copy->static_variables = NULL;   /* zend_destroy_static_vars(copy) -> no-op */
+    return copy;
+}
+
+static bool zealphp_oparray_cacheable(zend_op_array *oa)
+{
+    if (!oa) {
+        return false;
+    }
+    /* opcache SHM op_arrays are IMMUTABLE + already persistent — never write to
+     * their refcount (it would corrupt shared memory) nor cache them ourselves;
+     * opcache already owns their lifetime. */
+    if (oa->fn_flags & ZEND_ACC_IMMUTABLE) {
+        return false;
+    }
+    /* top-level static vars would need the static_variables table we null in the
+     * copy; such includes are rare -> fall back to re-compile for them. */
+    return oa->static_variables == NULL;
+}
+
+static void zealphp_oparray_cache_store(zend_string *key, zend_op_array *master)
+{
+    if (!zealphp_oparray_master_cache_init) {
+        zend_hash_init(&zealphp_oparray_master_cache, 64, NULL, NULL, 1);
+        zealphp_oparray_master_cache_init = true;
+    }
+    if (zend_hash_str_exists(&zealphp_oparray_master_cache, ZSTR_VAL(key), ZSTR_LEN(key))) {
+        return;
+    }
+    if (!master->refcount) {
+        master->refcount = emalloc(sizeof(uint32_t));
+        *master->refcount = 1;       /* baseline reference held by the master */
+    }
+    zend_hash_str_add_ptr(&zealphp_oparray_master_cache, ZSTR_VAL(key), ZSTR_LEN(key), master);
+}
+
 static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, int type)
 {
     if (!zealphp_silent_redeclare_enabled || !zealphp_original_compile_file) {
@@ -4824,6 +4879,14 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
      * then serves from process-local cache for the rest of its
      * lifetime. Memory bounded: ~10 KB × 50 files = ~500 KB per worker. */
     zend_string *file_key = zealphp_file_handle_path(file_handle);
+    if (zealphp_oparray_cache_full && zealphp_oparray_master_cache_init && file_key) {
+        zend_op_array *zealphp_master = zend_hash_str_find_ptr(
+            &zealphp_oparray_master_cache, ZSTR_VAL(file_key), ZSTR_LEN(file_key));
+        if (zealphp_master) {
+            zend_string_release(file_key);
+            return zealphp_oparray_make_copy(zealphp_master);   /* no re-compile */
+        }
+    }
     /* Stage 6 compile-cache REMOVED. It cached the compiled op_array and, on a
      * later compile of the same file, returned a memcpy'd shell with
      * (*shell->refcount)++. But the engine destroys the compiled op_array after
@@ -5026,6 +5089,12 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
         zealphp_reexec_skip_record(file_key, &scratch_cl, &scratch_fn);
     }
 
+    zend_op_array *zealphp_to_return = result;
+    if (zealphp_oparray_cache_full && file_key && zealphp_oparray_cacheable(result)) {
+        zealphp_oparray_cache_store(file_key, result);
+        zealphp_to_return = zealphp_oparray_make_copy(result);   /* master persists */
+    }
+
     if (file_key) {
         zend_string_release(file_key);
     }
@@ -5035,7 +5104,7 @@ static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, i
      * already destroyed via the loser branch above). */
     zend_hash_destroy(&scratch_fn);
     zend_hash_destroy(&scratch_cl);
-    return result;
+    return zealphp_to_return;
 }
 
 /* Public API: zealphp_silent_redeclare(bool $on = true): bool
@@ -5154,6 +5223,32 @@ PHP_FUNCTION(zealphp_oparray_cache)
     bool prev = zealphp_reexec_skip_enabled;
     if (!on_is_null) {
         zealphp_reexec_skip_enabled = (bool)on;
+    }
+    RETURN_BOOL(prev);
+}
+
+/* Public API: zealphp_oparray_cache_full(bool $on = true): bool
+ * ext#12 Option A — cache each re-executed file's compiled op_array once and
+ * re-execute a freeable shallow copy thereafter (no re-compile => no
+ * inherited-loser orphan leak AND no CG(arena) growth, for MIXED files too).
+ * Separate opt-in from zealphp_oparray_cache() (pure-declaration skip).
+ * Returns the previous state. */
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_oparray_cache_full, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
+PHP_FUNCTION(zealphp_oparray_cache_full)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = zealphp_oparray_cache_full;
+    if (!on_is_null) {
+        zealphp_oparray_cache_full = (bool)on;
     }
     RETURN_BOOL(prev);
 }
@@ -5472,6 +5567,10 @@ PHP_MINIT_FUNCTION(zealphp)
      * (or "on"/"true"/"yes") turns it on at boot. The framework also flips it via
      * zealphp_oparray_cache(true). The skip hash itself is lazy-init'd on first record. */
     {
+        const char *ef = getenv("ZEALPHP_OPARRAY_CACHE_FULL");
+        if (ef && *ef && *ef != '0') {
+            zealphp_oparray_cache_full = true;
+        }
         const char *e = getenv("ZEALPHP_OPARRAY_CACHE");
         if (e && (e[0] == '1' || e[0] == 'o' || e[0] == 'O' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y')) {
             zealphp_reexec_skip_enabled = true;
@@ -6367,6 +6466,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_include_isolation,     arginfo_zealphp_include_isolation)
     PHP_FE(zealphp_include_isolation_reset, arginfo_zealphp_include_isolation_reset)
     PHP_FE(zealphp_oparray_cache,         arginfo_zealphp_oparray_cache)
+    PHP_FE(zealphp_oparray_cache_full,    arginfo_zealphp_oparray_cache_full)
     PHP_FE(zealphp_cwd_isolation,         arginfo_zealphp_cwd_isolation)
     PHP_FE(zealphp_locale_isolation,      arginfo_zealphp_locale_isolation)
     PHP_FE(zealphp_timezone_isolation,    arginfo_zealphp_timezone_isolation)
