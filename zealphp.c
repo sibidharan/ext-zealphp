@@ -6180,6 +6180,27 @@ static void zealphp_reset_class_statics_inplace(zend_class_entry *ce)
         if (Z_TYPE_P(tmpl) == IS_INDIRECT) {
             continue; /* defensive — template marks it inherited */
         }
+        /* ext#54: a CONSTANT-EXPRESSION static default (default references class
+         * constants / other constants) lives in default_static_members_table as
+         * an unresolved IS_CONSTANT_AST — the engine resolves it only into the
+         * LIVE static table (zend_update_class_constants), never back into the
+         * template. Both this per-request reset AND the per-coroutine
+         * snapshot-save re-park copy the template into the live slot; copying the
+         * raw AST leaves the static unresolved, which reads as IS_UNDEF /
+         * "unknown type" (Slim Response::$messages breaks on request #2 ->
+         * unmodified Shaarli 500). Resolve the template IN PLACE here, once: the
+         * reset runs in the request coroutine's normal PHP context, where
+         * evaluating a const-expr is safe (unlike the on_yield snapshot-save, a
+         * mid-switch C scheduler callback). Every subsequent reset and re-park
+         * then copies the RESOLVED default, matching a fresh process. Guarded to
+         * non-immutable classes — a runtime-declared class owns its template; an
+         * opcache-immutable class's default table is shared/read-only. */
+        if (Z_TYPE_P(tmpl) == IS_CONSTANT_AST && !(ce->ce_flags & ZEND_ACC_IMMUTABLE)) {
+            if (zval_update_constant_ex(tmpl, ce) != SUCCESS) {
+                if (EG(exception)) { zend_clear_exception(); }
+                continue;   /* unresolvable — leave the live slot untouched */
+            }
+        }
         zval fresh;
         ZVAL_COPY(&fresh, tmpl);   /* default copy (refcount-correct; UNDEF ok) */
         zval old = *dst;
