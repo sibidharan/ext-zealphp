@@ -6094,6 +6094,33 @@ static void zealphp_fn_statics_refresh_one(zend_op_array *opa, HashTable *live);
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_statics, 0, 0, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+/* ext#59-perf: is this op_array a BOOT/SNAPSHOT symbol? Mirrors the exemption the
+ * full-table reset applies by name — a global function tested against
+ * zealphp_snapshot_functions, a method against zealphp_snapshot_classes (both
+ * keyed by the lowercased CG-table name). Framework/boot statics must NOT be
+ * re-initialised per request (they persist per worker, e.g. one-time handler
+ * registration guards). Only reached from the registry-walk fast path. */
+static bool zealphp_opa_snapshot_exempt(zend_op_array *opa)
+{
+    if (!zealphp_state_snapshotted) return false;   /* matches the full-walk !snap branch */
+    zend_string *name = opa->scope ? opa->scope->name : opa->function_name;
+    if (!name) return false;
+    zend_string *lc = zend_string_tolower(name);
+    bool exempt = opa->scope
+        ? zend_hash_exists(&zealphp_snapshot_classes, lc)
+        : zend_hash_exists(&zealphp_snapshot_functions, lc);
+    zend_string_release(lc);
+    return exempt;
+}
+
+/* Registry-walk reset callback: re-init one non-exempt function-static table. */
+static void zealphp_fn_statics_reset_cb(zend_op_array *opa, HashTable *live, void *ctx)
+{
+    if (zealphp_opa_snapshot_exempt(opa)) return;
+    zealphp_fn_statics_refresh_one(opa, live);   /* #28: in-place (stable address) */
+    (*(zend_long *)ctx)++;
+}
+
 PHP_FUNCTION(zealphp_reset_request_statics)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -6109,6 +6136,23 @@ PHP_FUNCTION(zealphp_reset_request_statics)
     }
 
     zend_long count = 0;
+
+    /* ext#59-perf: when the BIND_STATIC registry is live (coroutine-legacy /
+     * statics isolation), walk ONLY the static-using op_arrays it recorded —
+     * the same set the per-yield save/restore uses — instead of sweeping the
+     * ENTIRE EG(function_table) + every class method table on every request.
+     * That full double-table sweep was the dominant coroutine-legacy
+     * per-request cost (measured ~4.5x /ping throughput on the framework's own
+     * symbol table). The registry is complete for this purpose: it is seeded by
+     * a full walk at activation and maintained by the BIND_STATIC hook, and the
+     * reset only ever acts on op_arrays with an instantiated (live != template)
+     * static — exactly the registry's membership. Falls back to the full walk
+     * when the registry isn't being maintained. */
+    if (zealphp_fn_statics_active) {
+        zealphp_walk_fn_statics_registry(zealphp_fn_statics_reset_cb, &count);
+        RETURN_LONG(count);
+    }
+
     bool snap = zealphp_state_snapshotted;
 
     /* Global user functions. */
@@ -6241,11 +6285,23 @@ PHP_FUNCTION(zealphp_reset_request_statics_begin)
      * yield) captures the template into its snapshot and restore re-asserts it across
      * peer interleaving; without it, save/restore skip the null-live slot and the
      * coroutine reads a peer's stale value — the wp_start_object_cache()
-     * `static $first_init` concurrent leak that left $wp_object_cache null (#28). */
+     * `static $first_init` concurrent leak that left $wp_object_cache null (#28).
+     *
+     * ext#59-perf: SKIP snapshot (boot/framework) symbols — same exemption the
+     * END reset applies. Without it, begin re-initialised the FRAMEWORK's own
+     * memoisation statics (ZealPHP\access_logging_enabled, resolve_log_dir with
+     * its filesystem probes, App::buildServerVars, log_file_for, …) to their
+     * `null`/`false` template EVERY request, forcing those functions to recompute
+     * their cached result on every request — the dominant coroutine-legacy
+     * per-request cost (~4.5x /ping throughput). Framework caches are per-worker
+     * state that MUST persist; only user-app request statics (the #28
+     * WordPress-class `static $first_init` guards, which are NOT snapshot symbols)
+     * need the begin-refresh. */
     zend_long count = 0;
     zend_op_array *opa;
     ZEND_HASH_FOREACH_PTR(&zealphp_fn_static_registry, opa) {
         if (!opa || !opa->static_variables) continue;
+        if (zealphp_opa_snapshot_exempt(opa)) continue;
         if (!ZEND_MAP_PTR(opa->static_variables_ptr)) continue;  /* slot unallocated — first BIND will dup the template */
         HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
         if (!live || live == opa->static_variables) {
