@@ -379,6 +379,38 @@ static zif_handler zealphp_orig_class_alias_handler = NULL;
  * array of (zend_long)(uintptr_t) zend_constant*. */
 static HashTable zealphp_coro_constant_deferred;
 
+/* ext#59: per-coroutine request-constant LANES — cid -> array(name => 1).
+ * The process-wide tracker above serves ONLY the sync path (no coroutine).
+ * Under coroutine interleaving a process-wide tracker crosses names between
+ * coroutines: a finished request's names linger until the NEXT resume of any
+ * coroutine, so a peer's yield parks (or its close frees) a constant it never
+ * owned — the #59 leak family and its UAF escalation. A lane belongs to
+ * exactly one coroutine, so save/restore/clear can only ever touch the
+ * running coroutine's own constants. */
+static HashTable zealphp_coro_reqconst_lanes;
+
+static long zealphp_reqconst_cid(void)
+{
+    return os_get_cid ? os_get_cid() : -1;
+}
+
+static HashTable *zealphp_reqconst_lane(long cid, bool create)
+{
+    if (cid <= 0) {
+        return &zealphp_request_constants;   /* sync / non-coroutine fallback */
+    }
+    zval *slot = zend_hash_index_find(&zealphp_coro_reqconst_lanes, (zend_ulong)cid);
+    if (!slot) {
+        if (!create) {
+            return NULL;
+        }
+        zval arr;
+        array_init(&arr);
+        slot = zend_hash_index_update(&zealphp_coro_reqconst_lanes, (zend_ulong)cid, &arr);
+    }
+    return Z_ARRVAL_P(slot);
+}
+
 /* ── Per-request $GLOBALS isolation ─────────────────────────────────── */
 
 /* Snapshot of EG(symbol_table) keys at boot. Keys added after the snapshot
@@ -433,13 +465,24 @@ static void zealphp_free_orphan_constant(zend_constant *c)
 
 static void zealphp_constants_snapshot_save(long cid)
 {
-    if (!zealphp_define_hooked || zend_hash_num_elements(&zealphp_request_constants) == 0) {
+    /* ext#59: park THIS coroutine's lane, not the process-wide tracker — the
+     * tracker crossed names between interleaved coroutines (a finished peer's
+     * names lingered until the next resume, so we parked/freed a struct we
+     * never owned). Lane cid is the REAL coroutine id (os_get_cid), reliable
+     * in on_yield; the snapshot key stays the caller-passed coroutine ptr. */
+    HashTable *zp_lane = zealphp_reqconst_lane(zealphp_reqconst_cid(), false);
+    if (!zealphp_define_hooked || !zp_lane || zend_hash_num_elements(zp_lane) == 0) {
+        /* Nothing this coroutine owns to orphan (no lane, or a post-clear
+         * teardown yield after constants_clear emptied the lane). Leave any
+         * existing snapshot pair intact — restore no longer reads its "names",
+         * and snapshot_delete at close owns the free of whatever orphaned
+         * "ptrs" remain, so dropping the pair here would leak them. */
         return;
     }
 
     zval ptrs;            /* name -> (zend_long)(uintptr_t) zend_constant* (orphaned) */
     array_init(&ptrs);
-    zval names_snapshot;  /* name -> 1 (the request-constant tracker) */
+    zval names_snapshot;  /* name -> 1 (this lane's names) */
     array_init(&names_snapshot);
 
     /* Suppress the constant destructor so zend_hash_del() REMOVES the bucket
@@ -448,7 +491,7 @@ static void zealphp_constants_snapshot_save(long cid)
     EG(zend_constants)->pDestructor = NULL;
 
     zend_string *name;
-    ZEND_HASH_FOREACH_STR_KEY(&zealphp_request_constants, name) {
+    ZEND_HASH_FOREACH_STR_KEY(zp_lane, name) {
         if (name) {
             zend_constant *c = zend_hash_find_ptr(EG(zend_constants), name);
             if (c) {
@@ -472,8 +515,15 @@ static void zealphp_constants_snapshot_save(long cid)
     zend_hash_str_update(Z_ARRVAL(pair), "names", sizeof("names") - 1, &names_snapshot);
     zend_hash_index_update(&zealphp_coro_constant_snapshots, (zend_ulong)cid, &pair);
 
-    /* Clear the process-wide tracker */
-    zend_hash_clean(&zealphp_request_constants);
+    /* ext#59: DO NOT clear the lane. The lane is this coroutine's authoritative
+     * list of names it define()'d this request; it must survive every yield so
+     * the request-end clear (which runs in-coroutine, where os_get_cid is
+     * reliable) can find the names to remove from EG. `os_get_cid()` is NOT
+     * reliable in on_resume (see zealphp_request_coro_ptrs comment), so restore
+     * can't refill a per-cid lane — hence the lane must persist here instead.
+     * Re-orphaning is idempotent: save only orphans names still present in EG,
+     * and restore re-installs them from the ptr-keyed snapshot before the next
+     * save, so each cycle re-orphans the same address. */
 }
 
 /* Restore this coroutine's request-scoped constants into EG(zend_constants) on
@@ -482,33 +532,21 @@ static void zealphp_constants_snapshot_save(long cid)
 static void zealphp_constants_snapshot_restore(long cid)
 {
     zval *pair  = zend_hash_index_find(&zealphp_coro_constant_snapshots, (zend_ulong)cid);
-    zval *names = (pair && Z_TYPE_P(pair) == IS_ARRAY)
-        ? zend_hash_str_find(Z_ARRVAL_P(pair), "names", sizeof("names") - 1) : NULL;
     zval *ptrs  = (pair && Z_TYPE_P(pair) == IS_ARRAY)
         ? zend_hash_str_find(Z_ARRVAL_P(pair), "ptrs", sizeof("ptrs") - 1) : NULL;
 
-    /* Reset the process-wide request-constant tracker to THIS coroutine's own
-     * names FIRST, unconditionally (empty if we have no snapshot). The tracker
-     * is process-wide; without this reset a coroutine that resumes WITHOUT its
-     * own snapshot (e.g. the Co::run main, or a service coroutine) would inherit
-     * the names a previously-resumed peer left here, and its next yield's
-     * snapshot_save would re-capture the PEER's constant pointer into its OWN
-     * snapshot. That same pointer then lives in two snapshots and is freed twice
-     * at coroutine close — an intermittent double-free / heap abort (caught by
-     * the ASAN gate on this fix). Resetting per resume keeps the tracker
-     * reflecting only the running coroutine, so save() never cross-captures. */
+    /* ext#59: restore is keyed by the coroutine POINTER (cid arg), which is
+     * reliable in on_resume — unlike os_get_cid(), which is NOT (see the
+     * zealphp_request_coro_ptrs comment). We therefore only re-install the
+     * orphaned constant STRUCTS here (from the ptr-keyed snapshot) and never
+     * touch the per-cid lane: the lane is owned by define()/save/clear, all of
+     * which run where os_get_cid() IS reliable. This is the crux of the #59
+     * fix — the previous code refilled the lane here using the unreliable
+     * resume-time os_get_cid(), so the real coroutine's lane stayed empty and
+     * the request-end clear removed nothing, leaving the constant stuck in EG
+     * for every later request to adopt. */
     zend_string *name;
     zval *val;
-    zend_hash_clean(&zealphp_request_constants);
-    if (names && Z_TYPE_P(names) == IS_ARRAY) {
-        ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(names), name, val) {
-            if (name) {
-                zval one;
-                ZVAL_LONG(&one, 1);
-                zend_hash_update(&zealphp_request_constants, name, &one);
-            }
-        } ZEND_HASH_FOREACH_END();
-    }
 
     if (!ptrs || Z_TYPE_P(ptrs) != IS_ARRAY) return;
 
@@ -2698,6 +2736,8 @@ static void zealphp_on_close(void *arg)
                 } ZEND_HASH_FOREACH_END();
             }
             zend_hash_index_del(&zealphp_coro_constant_deferred, (zend_ulong)zp_cc);
+            /* ext#59: drop this coroutine's request-constant lane. */
+            zend_hash_index_del(&zealphp_coro_reqconst_lanes, (zend_ulong)zp_cc);
         }
     }
     zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -4009,7 +4049,10 @@ static ZEND_NAMED_FUNCTION(zealphp_define_intercept)
         if (arg1 && Z_TYPE_P(arg1) == IS_STRING) {
             zval one;
             ZVAL_LONG(&one, 1);
-            zend_hash_update(&zealphp_request_constants, Z_STR_P(arg1), &one);
+            /* ext#59: track into the DEFINING coroutine's lane (process-wide
+             * table only in sync mode) so no peer can park/free it. */
+            zend_hash_update(zealphp_reqconst_lane(zealphp_reqconst_cid(), true),
+                             Z_STR_P(arg1), &one);
         }
     }
 }
@@ -4054,20 +4097,37 @@ PHP_FUNCTION(zealphp_constants_clear)
      * zealphp_constants_snapshot_save). */
     dtor_func_t orig_dtor = EG(zend_constants)->pDestructor;
     EG(zend_constants)->pDestructor = NULL;
-    ZEND_HASH_FOREACH_STR_KEY(&zealphp_request_constants, name) {
-        if (name) {
-            zend_constant *c = zend_hash_find_ptr(EG(zend_constants), name);
-            if (c) {
-                zend_hash_del(EG(zend_constants), name);   /* orphan (no free) */
-                zval p;
-                ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
-                zend_hash_next_index_insert(deferred, &p);
+    HashTable *zp_lane = zealphp_reqconst_lane(cid, false);   /* ext#59: our lane only */
+    if (zp_lane) {
+        ZEND_HASH_FOREACH_STR_KEY(zp_lane, name) {
+            if (name) {
+                zend_constant *c = zend_hash_find_ptr(EG(zend_constants), name);
+                if (c) {
+                    zend_hash_del(EG(zend_constants), name);   /* orphan (no free) */
+                    zval p;
+                    ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
+                    zend_hash_next_index_insert(deferred, &p);
+                }
             }
-        }
-    } ZEND_HASH_FOREACH_END();
+        } ZEND_HASH_FOREACH_END();
+    }
     EG(zend_constants)->pDestructor = orig_dtor;
 
-    zend_hash_clean(&zealphp_request_constants);
+    if (zp_lane) {
+        zend_hash_clean(zp_lane);
+    }
+    /* ext#59: the coroutine's snapshot pair is now stale — its "names" no
+     * longer describe anything live (cleared above) and any occupied-path
+     * "ptrs" entries were just moved to the deferred list (sole owner). If a
+     * teardown yield follows, a lingering pair would (a) refill the lane with
+     * dead names on resume — re-arming the cross-capture — and (b) double-free
+     * those "ptrs" structs at close (once via snapshot_delete, once via the
+     * deferred drain). Drop it via the cid→ptr bridge (recorded on yield; a
+     * coroutine that never yielded has no pair to drop). */
+    void *zp_coro_ptr = zend_hash_index_find_ptr(&zealphp_coro_cid_to_ptr, (zend_ulong)cid);
+    if (zp_coro_ptr) {
+        zend_hash_index_del(&zealphp_coro_constant_snapshots, (zend_ulong)(uintptr_t)zp_coro_ptr);
+    }
 }
 
 /* ── zealphp_ini_restore(): void ──────────────────────────────────── */
@@ -5549,6 +5609,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_adopted_coro_cids, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_reqconst_lanes,     64,  NULL, ZVAL_PTR_DTOR, 0);   /* ext#59 */
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_cwd_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_locale_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
