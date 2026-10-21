@@ -379,6 +379,22 @@ static zif_handler zealphp_orig_class_alias_handler = NULL;
  * array of (zend_long)(uintptr_t) zend_constant*. */
 static HashTable zealphp_coro_constant_deferred;
 
+/* Bug 2 (rtcache UAF): request constants were freed at coroutine CLOSE, but
+ * zealphp_reset_request_rtcaches() clears only top-level user functions and
+ * class methods PRESENT AFTER boot — it skips boot/snapshot symbols and never
+ * touches closures (whose run_time_cache is not in EG(function_table)). A cached
+ * FETCH_CONSTANT slot in such an op_array keeps pointing at the struct after the
+ * free -> a stale, process-shared slot reads freed memory on a later request.
+ * Conservative, provably-complete fix: don't free request constants mid-worker.
+ * The coroutine-close paths RETIRE each orphaned struct here instead; it is
+ * reclaimed at worker recycle / process exit (the same "OS reclaims on exit"
+ * contract PHP_MSHUTDOWN already relies on). A surviving cache slot then always
+ * resolves to valid, immutable memory. Bounded by the distinct request constants
+ * a worker defines before OpenSwoole recycles it. Value = (zend_long)(uintptr_t)
+ * zend_constant* (borrowed; no dtor — we free nothing during the worker's life). */
+static HashTable zealphp_retired_constants;
+static bool zealphp_retired_constants_live = false;
+
 /* ext#59: per-coroutine request-constant LANES — cid -> array(name => 1).
  * The process-wide tracker above serves ONLY the sync path (no coroutine).
  * Under coroutine interleaving a process-wide tracker crosses names between
@@ -461,6 +477,28 @@ static void zealphp_free_orphan_constant(zend_constant *c)
         zend_string_release_ex(c->name, 0);
     }
     efree(c);
+}
+
+/* Bug 2: retire (do NOT free) an orphaned request constant — park it for the
+ * worker's life so a stale FETCH_CONSTANT cache slot (a boot/snapshot function
+ * or a closure that zealphp_reset_request_rtcaches never clears) can never read
+ * freed memory. Called from the COROUTINE-close paths in place of the free; the
+ * sync path (no coroutine, per-request run_time_cache) still frees immediately.
+ * Persistent (engine/extension) constants are never ours — ignored. */
+static void zealphp_retire_orphan_constant(zend_constant *c)
+{
+    if (!c) {
+        return;
+    }
+    if (ZEND_CONSTANT_FLAGS(c) & CONST_PERSISTENT) {
+        return;
+    }
+    if (!zealphp_retired_constants_live) {
+        return;   /* MINIT not run (should not happen) — leak rather than crash */
+    }
+    zval p;
+    ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
+    zend_hash_next_index_insert(&zealphp_retired_constants, &p);
 }
 
 static void zealphp_constants_snapshot_save(long cid)
@@ -641,7 +679,7 @@ static void zealphp_constants_snapshot_delete(long cid)
                     if (name && zend_hash_find_ptr(EG(zend_constants), name) == c) {
                         zend_hash_del(EG(zend_constants), name);   /* detach ours, no free */
                     }
-                    zealphp_free_orphan_constant(c);
+                    zealphp_retire_orphan_constant(c);   /* bug 2: retire, don't free */
                 }
             } ZEND_HASH_FOREACH_END();
             EG(zend_constants)->pDestructor = orig_dtor;
@@ -2737,7 +2775,7 @@ static void zealphp_on_close(void *arg)
                 ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(cdef), cv) {
                     zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(cv);
                     if (c) {
-                        zealphp_free_orphan_constant(c);
+                        zealphp_retire_orphan_constant(c);   /* bug 2: retire, don't free */
                     }
                 } ZEND_HASH_FOREACH_END();
             }
@@ -5622,6 +5660,8 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_adopted_coro_cids, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_retired_constants,       64,  NULL, NULL, 0);   /* bug 2: borrowed ptrs, reclaimed at process exit */
+    zealphp_retired_constants_live = true;
     zend_hash_init(&zealphp_coro_reqconst_lanes,     64,  NULL, ZVAL_PTR_DTOR, 0);   /* ext#59 */
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_cwd_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
