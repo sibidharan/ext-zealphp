@@ -3308,6 +3308,13 @@ static void zealphp_set_superglobal(const char *name, size_t name_len, zval *val
 {
     zval *existing = zend_hash_str_find(&EG(symbol_table), name, name_len);
     if (existing) {
+        /* If the live slot is an IS_REFERENCE (a $g->get alias bound via
+         * &__get), write THROUGH the reference — same as zealphp_snapshot_restore.
+         * Overwriting the wrapper detached the alias, which kept serving the
+         * PREVIOUS request's array. */
+        if (Z_ISREF_P(existing)) {
+            existing = Z_REFVAL_P(existing);
+        }
         zval old;
         ZVAL_COPY_VALUE(&old, existing);
         ZVAL_DUP(existing, value);
