@@ -2573,6 +2573,15 @@ static void zealphp_on_yield(void *arg)
     if (zp_req_owner_ok) {
         zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
         zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
+        /* Bridge cid→ptr on EVERY request-owner yield, not only under $GLOBALS
+         * isolation: zealphp_constants_clear() (PHP context, cid only) uses it to
+         * drop this coroutine's pointer-keyed constant snapshot after moving its
+         * structs to the deferred list. Without it, define() isolation alone left
+         * the stale pair in place and on_close freed the same constant twice
+         * (snapshot_delete + deferred drain). os_get_cid() is reliable here. */
+        if (os_get_cid) {
+            zend_hash_index_update_ptr(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid(), arg);
+        }
     }
     zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_locale_snapshot_save((zend_long)(uintptr_t)arg);
@@ -2592,11 +2601,8 @@ static void zealphp_on_yield(void *arg)
      * 7 SG slots — those are owned by zealphp_snapshot_save above. */
     if (zealphp_coro_globals_hooks_active && zp_req_owner_ok) {
         zealphp_globals_snapshot_save((zend_long)(uintptr_t)arg);
-        /* Bridge cid→ptr so the PHP-context request-end drain can free this
-         * coroutine's (pointer-keyed) delta. os_get_cid() is reliable in on_yield. */
-        if (os_get_cid) {
-            zend_hash_index_update_ptr(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid(), arg);
-        }
+        /* (cid→ptr bridge recorded above — the request-end drain uses it to
+         * free this coroutine's pointer-keyed delta.) */
     }
     /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap */
     if (orig_on_yield) orig_on_yield(arg);
