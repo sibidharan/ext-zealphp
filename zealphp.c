@@ -379,6 +379,22 @@ static zif_handler zealphp_orig_class_alias_handler = NULL;
  * array of (zend_long)(uintptr_t) zend_constant*. */
 static HashTable zealphp_coro_constant_deferred;
 
+/* Bug 2 (rtcache UAF): request constants were freed at coroutine CLOSE, but
+ * zealphp_reset_request_rtcaches() clears only top-level user functions and
+ * class methods PRESENT AFTER boot — it skips boot/snapshot symbols and never
+ * touches closures (whose run_time_cache is not in EG(function_table)). A cached
+ * FETCH_CONSTANT slot in such an op_array keeps pointing at the struct after the
+ * free -> a stale, process-shared slot reads freed memory on a later request.
+ * Conservative, provably-complete fix: don't free request constants mid-worker.
+ * The coroutine-close paths RETIRE each orphaned struct here instead; it is
+ * reclaimed at worker recycle / process exit (the same "OS reclaims on exit"
+ * contract PHP_MSHUTDOWN already relies on). A surviving cache slot then always
+ * resolves to valid, immutable memory. Bounded by the distinct request constants
+ * a worker defines before OpenSwoole recycles it. Value = (zend_long)(uintptr_t)
+ * zend_constant* (borrowed; no dtor — we free nothing during the worker's life). */
+static HashTable zealphp_retired_constants;
+static bool zealphp_retired_constants_live = false;
+
 /* ext#59: per-coroutine request-constant LANES — cid -> array(name => 1).
  * The process-wide tracker above serves ONLY the sync path (no coroutine).
  * Under coroutine interleaving a process-wide tracker crosses names between
@@ -461,6 +477,28 @@ static void zealphp_free_orphan_constant(zend_constant *c)
         zend_string_release_ex(c->name, 0);
     }
     efree(c);
+}
+
+/* Bug 2: retire (do NOT free) an orphaned request constant — park it for the
+ * worker's life so a stale FETCH_CONSTANT cache slot (a boot/snapshot function
+ * or a closure that zealphp_reset_request_rtcaches never clears) can never read
+ * freed memory. Called from the COROUTINE-close paths in place of the free; the
+ * sync path (no coroutine, per-request run_time_cache) still frees immediately.
+ * Persistent (engine/extension) constants are never ours — ignored. */
+static void zealphp_retire_orphan_constant(zend_constant *c)
+{
+    if (!c) {
+        return;
+    }
+    if (ZEND_CONSTANT_FLAGS(c) & CONST_PERSISTENT) {
+        return;
+    }
+    if (!zealphp_retired_constants_live) {
+        return;   /* MINIT not run (should not happen) — leak rather than crash */
+    }
+    zval p;
+    ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
+    zend_hash_next_index_insert(&zealphp_retired_constants, &p);
 }
 
 static void zealphp_constants_snapshot_save(long cid)
@@ -641,7 +679,7 @@ static void zealphp_constants_snapshot_delete(long cid)
                     if (name && zend_hash_find_ptr(EG(zend_constants), name) == c) {
                         zend_hash_del(EG(zend_constants), name);   /* detach ours, no free */
                     }
-                    zealphp_free_orphan_constant(c);
+                    zealphp_retire_orphan_constant(c);   /* bug 2: retire, don't free */
                 }
             } ZEND_HASH_FOREACH_END();
             EG(zend_constants)->pDestructor = orig_dtor;
@@ -2573,6 +2611,15 @@ static void zealphp_on_yield(void *arg)
     if (zp_req_owner_ok) {
         zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
         zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
+        /* Bridge cid→ptr on EVERY request-owner yield, not only under $GLOBALS
+         * isolation: zealphp_constants_clear() (PHP context, cid only) uses it to
+         * drop this coroutine's pointer-keyed constant snapshot after moving its
+         * structs to the deferred list. Without it, define() isolation alone left
+         * the stale pair in place and on_close freed the same constant twice
+         * (snapshot_delete + deferred drain). os_get_cid() is reliable here. */
+        if (os_get_cid) {
+            zend_hash_index_update_ptr(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid(), arg);
+        }
     }
     zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_locale_snapshot_save((zend_long)(uintptr_t)arg);
@@ -2592,11 +2639,8 @@ static void zealphp_on_yield(void *arg)
      * 7 SG slots — those are owned by zealphp_snapshot_save above. */
     if (zealphp_coro_globals_hooks_active && zp_req_owner_ok) {
         zealphp_globals_snapshot_save((zend_long)(uintptr_t)arg);
-        /* Bridge cid→ptr so the PHP-context request-end drain can free this
-         * coroutine's (pointer-keyed) delta. os_get_cid() is reliable in on_yield. */
-        if (os_get_cid) {
-            zend_hash_index_update_ptr(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid(), arg);
-        }
+        /* (cid→ptr bridge recorded above — the request-end drain uses it to
+         * free this coroutine's pointer-keyed delta.) */
     }
     /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap */
     if (orig_on_yield) orig_on_yield(arg);
@@ -2731,7 +2775,7 @@ static void zealphp_on_close(void *arg)
                 ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(cdef), cv) {
                     zend_constant *c = (zend_constant *)(uintptr_t)Z_LVAL_P(cv);
                     if (c) {
-                        zealphp_free_orphan_constant(c);
+                        zealphp_retire_orphan_constant(c);   /* bug 2: retire, don't free */
                     }
                 } ZEND_HASH_FOREACH_END();
             }
@@ -3308,6 +3352,13 @@ static void zealphp_set_superglobal(const char *name, size_t name_len, zval *val
 {
     zval *existing = zend_hash_str_find(&EG(symbol_table), name, name_len);
     if (existing) {
+        /* If the live slot is an IS_REFERENCE (a $g->get alias bound via
+         * &__get), write THROUGH the reference — same as zealphp_snapshot_restore.
+         * Overwriting the wrapper detached the alias, which kept serving the
+         * PREVIOUS request's array. */
+        if (Z_ISREF_P(existing)) {
+            existing = Z_REFVAL_P(existing);
+        }
         zval old;
         ZVAL_COPY_VALUE(&old, existing);
         ZVAL_DUP(existing, value);
@@ -5609,6 +5660,8 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_adopted_coro_cids, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_retired_constants,       64,  NULL, NULL, 0);   /* bug 2: borrowed ptrs, reclaimed at process exit */
+    zealphp_retired_constants_live = true;
     zend_hash_init(&zealphp_coro_reqconst_lanes,     64,  NULL, ZVAL_PTR_DTOR, 0);   /* ext#59 */
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_cwd_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
