@@ -20,6 +20,7 @@
 #include "php_ini.h"
 #include "SAPI.h"
 #include "ext/standard/info.h"
+#include "ext/standard/php_filestat.h"
 #include "zend_exceptions.h"
 #include "zend_vm.h"
 #include "php_zealphp.h"
@@ -946,6 +947,20 @@ static int zealphp_process_state_owner_ok(void)
 
 /* ── Per-coroutine CWD isolation (framework #323) ─────────────────── */
 
+/* chdir() for the cwd stage. PHP's own chdir() drops the RELATIVE-path stat
+ * cache (BG(CurrentStatFile)/CurrentLStatFile) because a relative name now
+ * means a different file; a bare VCWD_CHDIR does not, so after a switch
+ * is_file('x') / filesize('x') could answer from the stat of another
+ * coroutine's 'x'. Clear the stat cache (not the realpath cache: it is keyed by
+ * absolute path) whenever the stage actually moves the process. */
+static void zealphp_cwd_switch(const char *dir)
+{
+    if (VCWD_CHDIR(dir) != 0) {
+        return;   /* dir gone — nothing to do mid-switch */
+    }
+    php_clear_stat_cache(0, NULL, 0);
+}
+
 static void zealphp_cwd_snapshot_save(zend_long cid)
 {
     if (!zealphp_cwd_isolation_active || zealphp_cwd_baseline[0] == '\0') return;
@@ -969,7 +984,7 @@ static void zealphp_cwd_snapshot_save(zend_long cid)
     zend_hash_index_update(&zealphp_coro_cwd_snapshots, (zend_ulong)cid, &z);
     /* Re-park the process at the baseline so peers — and brand-new coroutines,
      * which never pass through on_resume with an entry — start clean. */
-    if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do mid-switch */ }
+    zealphp_cwd_switch(zealphp_cwd_baseline);
 }
 
 static void zealphp_cwd_snapshot_restore(zend_long cid)
@@ -977,7 +992,7 @@ static void zealphp_cwd_snapshot_restore(zend_long cid)
     if (!zealphp_cwd_isolation_active) return;
     zval *z = zend_hash_index_find(&zealphp_coro_cwd_snapshots, (zend_ulong)cid);
     if (!z || Z_TYPE_P(z) != IS_STRING) return;
-    if (VCWD_CHDIR(Z_STRVAL_P(z)) != 0) { /* dir gone — nothing to do mid-switch */ }
+    zealphp_cwd_switch(Z_STRVAL_P(z));
 }
 
 static void zealphp_cwd_snapshot_delete(zend_long cid)
@@ -995,7 +1010,7 @@ static void zealphp_cwd_snapshot_delete(zend_long cid)
          * Re-park the process so the next request starts at the baseline. */
         char buf[MAXPATHLEN];
         if (VCWD_GETCWD(buf, sizeof(buf)) && strcmp(buf, zealphp_cwd_baseline) != 0) {
-            if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do mid-switch */ }
+            zealphp_cwd_switch(zealphp_cwd_baseline);
         }
     }
 }
@@ -1404,7 +1419,7 @@ static void zealphp_process_settings_repark(void)
     if (zealphp_cwd_isolation_active && zealphp_cwd_baseline[0] != '\0') {
         char zp_buf[MAXPATHLEN];
         if (VCWD_GETCWD(zp_buf, sizeof(zp_buf)) && strcmp(zp_buf, zealphp_cwd_baseline) != 0) {
-            if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do */ }
+            zealphp_cwd_switch(zealphp_cwd_baseline);
         }
     }
     if (zealphp_locale_isolation_active && zealphp_locale_baseline) {
