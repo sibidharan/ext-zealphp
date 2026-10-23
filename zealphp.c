@@ -2935,13 +2935,19 @@ enum {
     ZP_PROF_FSTAT_SAVE, ZP_PROF_FSTAT_RESTORE,
     ZP_PROF_GLOB_SAVE, ZP_PROF_GLOB_RESTORE,
     ZP_PROF_PARK_TOTAL, ZP_PROF_UNPARK_TOTAL,
+    ZP_PROF_REQ_RTCACHES, ZP_PROF_REQ_FSTAT_RESET, ZP_PROF_REQ_FSTAT_BEGIN, ZP_PROF_REQ_CSTAT_RESET,
+    ZP_PROF_REQ_GLOBALS_CLEAN, ZP_PROF_REQ_GLOBALS_END, ZP_PROF_REQ_CONST_CLEAR, ZP_PROF_REQ_INI_RESTORE,
+    ZP_PROF_REQ_INPUT_SET, ZP_PROF_REQ_SG_CLEAR, ZP_PROF_REQ_PSTATE_CLEAN,
     ZP_PROF_N
 };
 static const char *zealphp_prof_names[ZP_PROF_N] = {
     "sg_save", "sg_restore", "const_save", "const_restore", "ini_save", "ini_restore",
     "settings_save", "settings_restore", "class_statics_save", "class_statics_restore",
     "fn_statics_save", "fn_statics_restore", "globals_save", "globals_restore",
-    "park_total", "unpark_total"
+    "park_total", "unpark_total",
+    "req_rtcaches", "req_fn_statics_reset", "req_fn_statics_begin", "req_class_statics_reset",
+    "req_globals_clean", "req_globals_request_end", "req_constants_clear", "req_ini_restore",
+    "req_input_set", "req_superglobals_clear", "req_process_state_clean"
 };
 static uint64_t zealphp_prof_ns[ZP_PROF_N];
 static uint64_t zealphp_prof_calls[ZP_PROF_N];
@@ -3975,7 +3981,14 @@ PHP_FUNCTION(zealphp_superglobals_set)
  * the handler reads the wrong request's input. ZealPHP calls this in the HANDLER
  * coroutine, right before dispatch (no intervening yield), from the per-coroutine
  * OpenSwoole request — guaranteeing the handler sees its OWN input. */
+static void zealphp_request_input_set_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_request_input_set)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_INPUT_SET);
+    zealphp_request_input_set_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_INPUT_SET);
+}
+static void zealphp_request_input_set_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     zval *get, *post, *cookie, *server, *files, *request;
 
@@ -4060,7 +4073,14 @@ PHP_FUNCTION(zealphp_superglobals_adopt)
 /* zealphp_superglobals_clear(): void
  * Resets all superglobals to empty arrays. Called at request end
  * to prevent cross-request leakage in coroutine mode. */
+static void zealphp_superglobals_clear_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_superglobals_clear)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_SG_CLEAR);
+    zealphp_superglobals_clear_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_SG_CLEAR);
+}
+static void zealphp_superglobals_clear_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     /* Request end — release ownership so the next holder starts clean
      * (#32), but ONLY when this coroutine is the current owner (#40): a
@@ -4405,7 +4425,14 @@ PHP_FUNCTION(zealphp_process_state_snapshot)
     zealphp_state_snapshotted = true;
 }
 
+static void zealphp_process_state_clean_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_process_state_clean)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_PSTATE_CLEAN);
+    zealphp_process_state_clean_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_PSTATE_CLEAN);
+}
+static void zealphp_process_state_clean_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     zend_string *key;
     zval *val;
@@ -4569,7 +4596,14 @@ PHP_FUNCTION(zealphp_globals_snapshot)
 }
 
 /* zealphp_globals_clean(): void — remove keys not in the snapshot */
+static void zealphp_globals_clean_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_globals_clean)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_GLOBALS_CLEAN);
+    zealphp_globals_clean_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_GLOBALS_CLEAN);
+}
+static void zealphp_globals_clean_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     zend_string *key;
     zval *val;
@@ -4618,7 +4652,14 @@ PHP_FUNCTION(zealphp_globals_clean)
  * object's final ref, that ref is released in THIS coroutine and __destruct runs
  * here. No-op unless per-coroutine $GLOBALS isolation is active. Idempotent:
  * on_close's snapshot_delete then finds an already-freed delta. */
+static void zealphp_coroutine_globals_request_end_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_coroutine_globals_request_end)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_GLOBALS_END);
+    zealphp_coroutine_globals_request_end_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_GLOBALS_END);
+}
+static void zealphp_coroutine_globals_request_end_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
     if (!zealphp_coro_globals_hooks_active) return;
@@ -4770,7 +4811,14 @@ static void zealphp_clear_constant_cache_slots(void)
 
 /* ── zealphp_constants_clear(): void ─────────────────────────────── */
 
+static void zealphp_constants_clear_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_constants_clear)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_CONST_CLEAR);
+    zealphp_constants_clear_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_CONST_CLEAR);
+}
+static void zealphp_constants_clear_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     zend_string *name;
     long cid = os_get_cid ? os_get_cid() : -1;
@@ -4853,7 +4901,14 @@ PHP_FUNCTION(zealphp_constants_clear)
  * Called at request end from SessionManager/CoSessionManager. For
  * sequential requests (no yield), the coroutine hooks don't fire, so
  * this is the cleanup path. */
+static void zealphp_ini_restore_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_ini_restore)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_INI_RESTORE);
+    zealphp_ini_restore_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_INI_RESTORE);
+}
+static void zealphp_ini_restore_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
@@ -6820,7 +6875,14 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_rtcaches, 0, 0, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+static void zealphp_reset_request_rtcaches_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_reset_request_rtcaches)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_RTCACHES);
+    zealphp_reset_request_rtcaches_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_RTCACHES);
+}
+static void zealphp_reset_request_rtcaches_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
     zend_long count = 0;
@@ -6926,7 +6988,14 @@ static void zealphp_fn_statics_reset_cb(zend_op_array *opa, HashTable *live, voi
     (*(zend_long *)ctx)++;
 }
 
+static void zealphp_reset_request_statics_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_reset_request_statics)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_FSTAT_RESET);
+    zealphp_reset_request_statics_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_FSTAT_RESET);
+}
+static void zealphp_reset_request_statics_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
@@ -7068,7 +7137,14 @@ static void zealphp_fn_statics_refresh_one(zend_op_array *opa, HashTable *live)
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_statics_begin, 0, 0, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+static void zealphp_reset_request_statics_begin_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_reset_request_statics_begin)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_FSTAT_BEGIN);
+    zealphp_reset_request_statics_begin_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_FSTAT_BEGIN);
+}
+static void zealphp_reset_request_statics_begin_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
@@ -7250,7 +7326,14 @@ static void zealphp_reset_class_statics_inplace(zend_class_entry *ce, HashTable 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_class_statics, 0, 0, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+static void zealphp_reset_request_class_statics_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_reset_request_class_statics)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_CSTAT_RESET);
+    zealphp_reset_request_class_statics_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_CSTAT_RESET);
+}
+static void zealphp_reset_request_class_statics_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
