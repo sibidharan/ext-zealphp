@@ -137,7 +137,10 @@ cid→ptr bridge lookup on resume (O(live coroutines), ~50 at c=50).
 
 ## Correctness gates run
 
-- ext phpt suite: 48 pass / 0 fail (42 skip: coroutine-runtime tests on CLI).
+- ext phpt suite run the CI way (`php run-tests.php tests/`, OpenSwoole
+  loaded so the coroutine-runtime tests execute): 91 pass / 0 fail / 1 skip.
+  (`make test` runs `php -n` and silently skips the 42 coroutine tests — it
+  hid the BIND_GLOBAL bug below until CI ran.)
 - framework `TrustBarIsolationTest`, `CoroutineIsolationContractTest`,
   `CoroutineLegacyBehaviorTest`, `PhpInputIsolationTest`: 8/8, trust-bar at
   40-way concurrency with every primitive `iso`.
@@ -146,6 +149,17 @@ The first attempt captured boot baselines lazily at the first yield and the
 trust-bar caught it (`class_static=LEAK2`): the first request had already
 mutated the slot, so its view was never restored. Hence the end-of-boot
 capture.
+
+## Pitfall found by CI: repeatable opcodes
+
+`ZEND_BIND_GLOBAL` is a *repeatable* opcode: the engine's handler loops over
+the consecutive `BIND_GLOBAL`s of one `global $a, $b;` statement internally
+(`ZEND_VM_REPEAT_OPCODE`), so a user opcode handler runs once per statement,
+not once per name. The first version recorded only `$a`; `$b` was never
+saved or reset and a peer's value leaked into it (test 063 `A:A/B`, and the
+new test 055). The hook now records the whole consecutive run. The same
+applies to `ZEND_BIND_STATIC`, which is harmless there because the
+function-static hook records the op_array, not the variable.
 
 ## Not done / ideas
 

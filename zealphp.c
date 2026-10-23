@@ -455,9 +455,11 @@ static void zealphp_glob_touched_dtor(zval *zv)
     HashTable *ht = Z_PTR_P(zv);
     if (ht) { zend_hash_destroy(ht); efree(ht); }
 }
+static zend_always_inline bool zealphp_trace_match(zend_string *key);
 static void zealphp_glob_touch(zend_string *key)
 {
     if (!key) key = zealphp_glob_all_key;
+    if (zealphp_trace_match(key)) fprintf(stderr, "[ztrace cid=%lld] touch\n", os_get_cid ? (long long) os_get_cid() : -1);
     if (zealphp_glob_dirty_live) zend_hash_add_empty_element(&zealphp_glob_dirty, key);
     if (!zealphp_glob_touched_live || !os_get_cid) return;
     long cid = os_get_cid();
@@ -482,8 +484,16 @@ static int zealphp_glob_write_handler(zend_execute_data *execute_data)
     if (zealphp_glob_hooks_wanted) {
         const zend_op *opline = EX(opline);
         if (opline->opcode == ZEND_BIND_GLOBAL) {
-            zval *name = RT_CONSTANT(opline, opline->op2);
-            zealphp_glob_touch(Z_TYPE_P(name) == IS_STRING ? Z_STR_P(name) : NULL);
+            /* ZEND_BIND_GLOBAL is a REPEATABLE opcode: the engine's handler
+             * loops over the consecutive BIND_GLOBALs of one `global $a, $b;`
+             * statement internally (ZEND_VM_REPEAT_OPCODE), so this hook runs
+             * once per statement, not once per name. Record the whole run. */
+            const zend_op *zp_op = opline;
+            do {
+                zval *name = RT_CONSTANT(zp_op, zp_op->op2);
+                zealphp_glob_touch(Z_TYPE_P(name) == IS_STRING ? Z_STR_P(name) : NULL);
+                zp_op++;
+            } while (zp_op->opcode == ZEND_BIND_GLOBAL);
         } else {
             uint32_t ftype = opline->extended_value & ZEND_FETCH_TYPE_MASK;
             bool is_global = (ftype == ZEND_FETCH_GLOBAL || ftype == ZEND_FETCH_GLOBAL_LOCK)
