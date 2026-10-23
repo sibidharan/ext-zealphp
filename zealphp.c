@@ -5224,17 +5224,24 @@ static HashTable zealphp_file_decls;
 static bool zealphp_file_decls_initialized = false;
 
 
-/* Helper: extract a stable file-path key from a zend_file_handle.
- * ALWAYS prefers filename (set at hook entry, before the engine
- * resolves opened_path) for consistency between cache-save (cold
- * compile) and cache-lookup (warm compile). */
+/* Helper: extract a stable file-path key from a zend_file_handle — the
+ * RESOLVED path, never the include string. The hook runs before the engine
+ * opens the file, so for a plain include/require `filename` is still exactly
+ * what the script wrote: `include 'header.php'` from /admin/ and from / both
+ * keyed as "header.php", and the full op_array cache served whichever compiled
+ * first to both (an admin page could run the public header, or the reverse —
+ * skipping an auth check). include_once/require_once already arrive resolved
+ * (zend_include_or_eval resolves before opening), so resolving here with the
+ * same zend_resolve_path() keeps cold store and warm lookup on one key and
+ * matches the Stage-7 skip lookup. NULL (no caching) when the path does not
+ * resolve to a plain file. */
 static zend_string *zealphp_file_handle_path(zend_file_handle *file_handle)
 {
-    if (file_handle->filename) {
-        return zend_string_copy(file_handle->filename);
-    }
     if (file_handle->opened_path) {
         return zend_string_copy(file_handle->opened_path);
+    }
+    if (file_handle->filename) {
+        return zend_resolve_path(file_handle->filename);
     }
     return NULL;
 }
