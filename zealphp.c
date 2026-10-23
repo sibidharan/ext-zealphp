@@ -129,6 +129,17 @@ static bool zealphp_umask_isolation_active = false;
 static mode_t zealphp_umask_baseline = 0;
 static bool zealphp_umask_baseline_set = false;
 
+/* Per-coroutine error_get_last() isolation: PG(last_error_*) is process-
+ * global, and OpenSwoole never runs php_request_shutdown() between requests,
+ * so request A's last warning (message + file — often carrying paths, keys
+ * or user input) was readable by request B, sequentially AND while both were
+ * in flight. Same PHP2Shell family as CVE-2026-109619 (error state retained
+ * in a worker-lifetime global), minus the UAF. The baseline is "no error":
+ * yield moves the live error into the coroutine's lane and re-parks empty;
+ * resume restores only that coroutine's own error; close re-parks empty. */
+static HashTable zealphp_coro_lasterr_snapshots;
+static bool zealphp_lasterr_isolation_active = false;
+
 /* Per-coroutine static property snapshots: coro_id → HashTable(class_name → zval[]) */
 static HashTable zealphp_coro_static_snapshots;
 
@@ -965,6 +976,81 @@ static void zealphp_umask_snapshot_delete(zend_long cid)
         if (!zp_um_had_lane && !zealphp_process_state_owner_ok()) return;
         /* Re-park for the next request (a coroutine can end mid-umask). */
         umask(zealphp_umask_baseline);
+    }
+}
+
+/* ── Per-coroutine error_get_last() isolation ──────────────────────── */
+
+/* Equivalent of error_clear_last(): drop the live error, leave "no error". */
+static void zealphp_lasterr_park(void)
+{
+    PG(last_error_type) = 0;
+    PG(last_error_lineno) = 0;
+    if (PG(last_error_message)) {
+        zend_string_release(PG(last_error_message));
+        PG(last_error_message) = NULL;
+    }
+    if (PG(last_error_file)) {
+        zend_string_release(PG(last_error_file));
+        PG(last_error_file) = NULL;
+    }
+}
+
+static void zealphp_lasterr_snapshot_save(zend_long cid)
+{
+    if (!zealphp_lasterr_isolation_active) return;
+    /* Owner gate — same lane-symmetry rule as the umask stage. */
+    if (!zealphp_process_state_owner_ok()
+        && !zend_hash_index_exists(&zealphp_coro_lasterr_snapshots, (zend_ulong)cid)) return;
+    if (!PG(last_error_message)) {
+        zend_hash_index_del(&zealphp_coro_lasterr_snapshots, (zend_ulong)cid);
+        return;
+    }
+    /* Bailout-safe order: build the lane with its OWN references first, publish
+     * it, and only then release the live copy. An allocation failure at any
+     * point leaves PG(last_error_*) intact (worst case: the error is not
+     * isolated) — never a dangling pointer in either place. */
+    zval lane;
+    array_init_size(&lane, 4);
+    add_next_index_long(&lane, PG(last_error_type));
+    add_next_index_str(&lane, zend_string_copy(PG(last_error_message)));
+    if (PG(last_error_file)) {
+        add_next_index_str(&lane, zend_string_copy(PG(last_error_file)));
+    } else {
+        add_next_index_null(&lane);
+    }
+    add_next_index_long(&lane, PG(last_error_lineno));
+    zend_hash_index_update(&zealphp_coro_lasterr_snapshots, (zend_ulong)cid, &lane);
+    zealphp_lasterr_park();
+}
+
+static void zealphp_lasterr_snapshot_restore(zend_long cid)
+{
+    if (!zealphp_lasterr_isolation_active) return;
+    /* Whatever a peer or service coroutine left behind is not ours. */
+    zealphp_lasterr_park();
+    zval *lane = zend_hash_index_find(&zealphp_coro_lasterr_snapshots, (zend_ulong)cid);
+    if (!lane || Z_TYPE_P(lane) != IS_ARRAY) return;
+    zval *type = zend_hash_index_find(Z_ARRVAL_P(lane), 0);
+    zval *msg  = zend_hash_index_find(Z_ARRVAL_P(lane), 1);
+    zval *file = zend_hash_index_find(Z_ARRVAL_P(lane), 2);
+    zval *line = zend_hash_index_find(Z_ARRVAL_P(lane), 3);
+    if (!type || !msg || Z_TYPE_P(msg) != IS_STRING) return;
+    PG(last_error_type)    = (int)Z_LVAL_P(type);
+    PG(last_error_message) = zend_string_copy(Z_STR_P(msg));
+    PG(last_error_file)    = (file && Z_TYPE_P(file) == IS_STRING) ? zend_string_copy(Z_STR_P(file)) : NULL;
+    PG(last_error_lineno)  = line ? (int)Z_LVAL_P(line) : 0;
+}
+
+static void zealphp_lasterr_snapshot_delete(zend_long cid)
+{
+    bool zp_le_had_lane = zend_hash_index_exists(&zealphp_coro_lasterr_snapshots, (zend_ulong)cid);
+    zend_hash_index_del(&zealphp_coro_lasterr_snapshots, (zend_ulong)cid);
+    if (zealphp_lasterr_isolation_active) {
+        /* Lane-or-owner gate — see zealphp_cwd_snapshot_delete. */
+        if (!zp_le_had_lane && !zealphp_process_state_owner_ok()) return;
+        /* The next request must never inherit this coroutine's last error. */
+        zealphp_lasterr_park();
     }
 }
 
@@ -2066,6 +2152,21 @@ static void zealphp_globals_snapshot_save(long cid)
     zealphp_globals_reset_to_parent();
 }
 
+/* True when op_array binds CV slot `j` with `global $x` (ZEND_BIND_GLOBAL).
+ * Linear in the function's opcodes, but only reached for a by-ref CV that is
+ * named like a live array/object global and is not already canonical. */
+static bool zealphp_cv_is_bound_global(const zend_op_array *op_array, uint32_t j)
+{
+    for (uint32_t i = 0; i < op_array->last; i++) {
+        const zend_op *op = &op_array->opcodes[i];
+        if (op->opcode == ZEND_BIND_GLOBAL && op->op1_type == IS_CV
+            && EX_VAR_TO_NUM(op->op1.var) == j) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Restore EG(symbol_table) for coroutine `cid`:
  *   1. Reset to parent baseline.
  *   2. Apply delta overrides (writes).
@@ -2298,6 +2399,12 @@ static void zealphp_globals_snapshot_restore(long cid)
                     for (int c = 0; c < zp_nc; c++) {
                         if (!zend_string_equals(roa->vars[j], zp_canon[c].name)) continue;
                         if (cvref == zp_canon[c].ref) break;  /* already canonical — coherent */
+                        /* In a function frame a same-named reference is only a
+                         * `global $name` binding if the function says so — an
+                         * `array &$name` parameter or `foreach (.. as &$name)` is
+                         * a genuine local and must never be repointed at the
+                         * global (it silently redirected the caller's writes). */
+                        if (roa->function_name && !zealphp_cv_is_bound_global(roa, j)) break;
                         /* stale `global $name` binding: repoint at the canonical
                          * reference. Abandon the old ref (no read, no free). */
                         ZVAL_REF(cv, zp_canon[c].ref);
@@ -2624,6 +2731,7 @@ static void zealphp_on_yield(void *arg)
     zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_locale_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_umask_snapshot_save((zend_long)(uintptr_t)arg);
+    zealphp_lasterr_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_tz_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_mbenc_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_libxml_snapshot_save((zend_long)(uintptr_t)arg);
@@ -2705,6 +2813,7 @@ static void zealphp_on_resume(void *arg)
         zealphp_cwd_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_locale_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_umask_snapshot_restore((zend_long)(uintptr_t)arg);
+        zealphp_lasterr_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_tz_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_mbenc_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_libxml_snapshot_restore((zend_long)(uintptr_t)arg);
@@ -2788,6 +2897,7 @@ static void zealphp_on_close(void *arg)
     zealphp_cwd_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_locale_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_umask_snapshot_delete((zend_long)(uintptr_t)arg);
+    zealphp_lasterr_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_tz_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_mbenc_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_libxml_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -5298,6 +5408,10 @@ ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_umask_isolation, 0, 0, _
     ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_last_error_isolation, 0, 0, _IS_BOOL, 0)
+    ZEND_ARG_TYPE_INFO(0, on, _IS_BOOL, 1)
+ZEND_END_ARG_INFO()
+
 PHP_FUNCTION(zealphp_include_isolation)
 {
     zend_bool on = 1;
@@ -5481,6 +5595,39 @@ PHP_FUNCTION(zealphp_umask_isolation)
         zealphp_umask_isolation_active = (bool)on;
         if (!(bool)on) {
             zend_hash_clean(&zealphp_coro_umask_snapshots);
+        }
+    }
+    RETURN_BOOL(prev);
+}
+
+/* Per-coroutine error_get_last() isolation knob (see the stage block).
+ * Enabling also clears the live error so the first request starts clean. */
+PHP_FUNCTION(zealphp_last_error_isolation)
+{
+    zend_bool on = 1;
+    zend_bool on_is_null = 1;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL_OR_NULL(on, on_is_null)
+    ZEND_PARSE_PARAMETERS_END();
+
+    bool prev = zealphp_lasterr_isolation_active;
+    if (!on_is_null) {
+        if ((bool)on && !zealphp_lasterr_isolation_active) {
+            if (!os_set_on_yield || !os_set_on_resume || !os_set_on_close || !os_get_cid) {
+                php_error_docref(NULL, E_WARNING,
+                    "ext-zealphp: OpenSwoole coroutine scheduler hooks not found. "
+                    "Per-coroutine last-error isolation requires OpenSwoole.");
+                RETURN_BOOL(prev);
+            }
+            if (!zealphp_coro_wrappers_installed && !zealphp_install_coro_hooks()) {
+                RETURN_BOOL(prev);
+            }
+            zealphp_lasterr_park();
+        }
+        zealphp_lasterr_isolation_active = (bool)on;
+        if (!(bool)on) {
+            zend_hash_clean(&zealphp_coro_lasterr_snapshots);
         }
     }
     RETURN_BOOL(prev);
@@ -5670,6 +5817,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_mbenc_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_libxml_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_umask_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
+    zend_hash_init(&zealphp_coro_lasterr_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     /* ext#48: deferred-free list for object-bearing static snapshots whose
      * coroutine closed before the request-end drain (see snapshot_delete). */
@@ -6665,6 +6813,7 @@ static const zend_function_entry zealphp_functions[] = {
     PHP_FE(zealphp_mbenc_isolation,       arginfo_zealphp_mbenc_isolation)
     PHP_FE(zealphp_libxml_isolation,      arginfo_zealphp_libxml_isolation)
     PHP_FE(zealphp_umask_isolation,       arginfo_zealphp_umask_isolation)
+    PHP_FE(zealphp_last_error_isolation,  arginfo_zealphp_last_error_isolation)
     PHP_FE(zealphp_reset_request_rtcaches, arginfo_zealphp_reset_request_rtcaches)
     PHP_FE(zealphp_reset_request_statics,  arginfo_zealphp_reset_request_statics)
     PHP_FE(zealphp_reset_request_statics_begin, arginfo_zealphp_reset_request_statics_begin)
