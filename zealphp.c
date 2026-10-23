@@ -2638,6 +2638,70 @@ static void zealphp_snapshot_restore(long cid)
     }
 }
 
+/* ── OOM inside the scheduler callbacks (PHP2Shell CVE-2026-109618 class) ──
+ *
+ * on_yield / on_resume / on_close deep-copy request state ($GLOBALS deltas,
+ * superglobals, statics). If one of those allocations hits memory_limit, the
+ * engine's OOM bailout longjmp()s out of OpenSwoole's scheduler callback onto
+ * a bailout point that belongs to a different coroutine's C stack: observed as
+ * SIGSEGV in zend_mm_gc() under zealphp_globals_snapshot_save() (ext 6c0ad49)
+ * and as a scheduler deadlock + SIGKILL (b1275be), dropping every in-flight
+ * request. Never let the limit trip inside the callback: lift it for the
+ * switch (the copy is bounded by request data the limit already bounded, and
+ * a fixed headroom proved insufficient — the switch can need more than one
+ * extra limit's worth), then put it back. If the switch itself pushed usage
+ * past the limit, clamp the limit to current usage so the coroutine's NEXT
+ * allocation, in its own bailout-safe context, raises the ordinary "Allowed
+ * memory size exhausted" fatal; the next switch restores the exact limit. */
+
+static zend_always_inline bool zealphp_switch_limit_lend(void)
+{
+    if (PG(memory_limit) <= 0) {
+        return false;   /* unlimited: nothing can trip */
+    }
+    /* Same value PHP uses for memory_limit=-1. */
+    zend_set_memory_limit((size_t) Z_L(-1) >> (size_t) Z_L(1));
+    return true;
+}
+
+static zend_always_inline void zealphp_switch_limit_restore(void)
+{
+    /* Re-read: the ini stage may have switched memory_limit to the resumed
+     * coroutine's own value during the callback. */
+    zend_long lim = PG(memory_limit);
+    if (lim <= 0) {
+        return;
+    }
+    if (zend_set_memory_limit((size_t) lim) == FAILURE) {
+        zend_set_memory_limit(zend_memory_usage(true));
+    }
+}
+
+static void zealphp_on_yield_body(void *arg);
+static void zealphp_on_resume_body(void *arg);
+static void zealphp_on_close_body(void *arg);
+
+static void zealphp_on_yield(void *arg)
+{
+    bool lent = zealphp_switch_limit_lend();
+    zealphp_on_yield_body(arg);
+    if (lent) zealphp_switch_limit_restore();
+}
+
+static void zealphp_on_resume(void *arg)
+{
+    bool lent = zealphp_switch_limit_lend();
+    zealphp_on_resume_body(arg);
+    if (lent) zealphp_switch_limit_restore();
+}
+
+static void zealphp_on_close(void *arg)
+{
+    bool lent = zealphp_switch_limit_lend();
+    zealphp_on_close_body(arg);
+    if (lent) zealphp_switch_limit_restore();
+}
+
 /* OpenSwoole scheduler callbacks — called from C, no PHP stack needed.
  * Use the Coroutine* arg pointer itself as the unique key — guaranteed
  * unique per coroutine, no need to extract cid from the struct. */
@@ -2664,7 +2728,7 @@ static void zealphp_snapshot_restore(long cid)
  * is cleaned in on_close, where os_get_cid() is also reliable (see above). It can
  * only ever see os_get_cid(), never arg, so it consistently keys on cid — a
  * separate hash from the snapshots, so the two schemes never collide. */
-static void zealphp_on_yield(void *arg)
+static void zealphp_on_yield_body(void *arg)
 {
     if (!arg) return;
     /* HAZARD-2: if this coroutine is suspended mid-CG-swap, stash the swap and
@@ -2754,7 +2818,7 @@ static void zealphp_on_yield(void *arg)
     if (orig_on_yield) orig_on_yield(arg);
 }
 
-static void zealphp_on_resume(void *arg)
+static void zealphp_on_resume_body(void *arg)
 {
     /* Chain to OpenSwoole's PHPCoroutine::on_resume FIRST — restores EG/CG
      * so EG(symbol_table) is valid when we read/write superglobals */
@@ -2824,7 +2888,7 @@ static void zealphp_on_resume(void *arg)
     }
 }
 
-static void zealphp_on_close(void *arg)
+static void zealphp_on_close_body(void *arg)
 {
     /* Chain to OpenSwoole's PHPCoroutine::on_close FIRST */
     if (orig_on_close) orig_on_close(arg);
