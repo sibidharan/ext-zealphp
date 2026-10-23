@@ -1645,10 +1645,18 @@ static void zealphp_statics_snapshot_restore(long cid)
         zval *statics = CE_STATIC_MEMBERS(ce);
         if (!statics) continue;
 
+        /* Boot classes never snapshot objects (process-shared framework
+         * state). A boot-class slot that holds an object/resource NOW was set
+         * by a peer since our save; overwriting it would free the peer's object
+         * inside on_resume. Keep it shared, matching the save side. */
+        bool zp_boot_class = zealphp_state_snapshotted
+            && zend_hash_exists(&zealphp_snapshot_classes, class_name);
         zval *val;
         zend_ulong idx;
         ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(class_snapshot), idx, val) {
             if ((int)idx < ce->default_static_members_count) {
+                if (Z_TYPE(statics[idx]) == IS_INDIRECT) continue;   /* parent owns it */
+                if (zp_boot_class && !zealphp_globals_isolatable(&statics[idx])) continue;
                 zval_ptr_dtor(&statics[idx]);
                 ZVAL_DUP(&statics[idx], val);
             }
@@ -1830,6 +1838,12 @@ static void zealphp_fn_statics_restore_cb(zend_op_array *opa, HashTable *live, v
         /* Write THROUGH an IS_REFERENCE so the executing frame's CV (which
          * shares the reference) sees this coroutine's value. */
         zval *target = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot;
+        /* Objects/resources are never snapshotted (process-shared); if the live
+         * slot holds one now, a peer put it there — overwriting it would
+         * release the peer's object inside on_resume (its __destruct in the C
+         * callback; a destructor's first BIND_STATIC grows the registry this
+         * walk iterates). Leave it shared, as the save side does. */
+        if (!zealphp_globals_isolatable(target)) continue;
         zval old;
         ZVAL_COPY_VALUE(&old, target);
         ZVAL_DUP(target, val);
@@ -2087,6 +2101,11 @@ static void zealphp_globals_reset_to_parent(void)
      * and the owning coroutine's value is re-applied from its delta on resume. */
     zend_string *key;
     zval *rv;
+    /* Displaced values are released AFTER the walk: dropping the last ref of an
+     * object global runs its __destruct, and a destructor that writes globals
+     * grows (reallocates) the very table this loop is iterating. */
+    HashTable zp_dead;
+    zend_hash_init(&zp_dead, 8, NULL, ZVAL_PTR_DTOR, 0);
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, rv) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
@@ -2118,8 +2137,11 @@ static void zealphp_globals_reset_to_parent(void)
         } else {
             ZVAL_NULL(target);
         }
-        zval_ptr_dtor(&old);
+        if (Z_REFCOUNTED(old)) {
+            zend_hash_next_index_insert(&zp_dead, &old);   /* released below */
+        }
     } ZEND_HASH_FOREACH_END();
+    zend_hash_destroy(&zp_dead);
 
     /* Reinstall parent keys not present (e.g. userland unset() removed one). */
     if (zealphp_coro_globals_parent_set) {
@@ -7084,7 +7106,7 @@ PHP_FUNCTION(zealphp_reset_request_statics_begin)
  * skipped — they point at the parent's live slot, which the parent's own
  * in-place reset restores; the indirect pointer stays valid because the parent
  * table's address is likewise stable. */
-static void zealphp_reset_class_statics_inplace(zend_class_entry *ce)
+static void zealphp_reset_class_statics_inplace(zend_class_entry *ce, HashTable *dead)
 {
     zval *live = CE_STATIC_MEMBERS(ce);
     if (!live) {
@@ -7138,7 +7160,12 @@ static void zealphp_reset_class_statics_inplace(zend_class_entry *ce)
         }
         zval old = *dst;
         ZVAL_COPY_VALUE(dst, &fresh);
-        zval_ptr_dtor(&old);       /* release prior value (runs object __destruct) */
+        /* Release the prior value (may run an object __destruct) only after
+         * the caller's walk of EG(class_table): a destructor can autoload or
+         * declare a class and grow the table being iterated. */
+        if (Z_REFCOUNTED(old)) {
+            zend_hash_next_index_insert(dead, &old);
+        }
     }
 }
 
@@ -7164,6 +7191,8 @@ PHP_FUNCTION(zealphp_reset_request_class_statics)
 
     zend_string *cname;
     zend_class_entry *ce;
+    HashTable zp_dead;
+    zend_hash_init(&zp_dead, 8, NULL, ZVAL_PTR_DTOR, 0);
     ZEND_HASH_FOREACH_STR_KEY_PTR(EG(class_table), cname, ce) {
         if (cname && ce && ce->type == ZEND_USER_CLASS
             && ce->default_static_members_count > 0
@@ -7174,11 +7203,12 @@ PHP_FUNCTION(zealphp_reset_request_class_statics)
              * so a cached ZEND_FETCH_STATIC_PROP slot (incl. a snapshot function's,
              * which the rtcache reset skips) can't dangle into freed memory. */
             if (ZEND_MAP_PTR(ce->static_members_table) && CE_STATIC_MEMBERS(ce)) {
-                zealphp_reset_class_statics_inplace(ce);
+                zealphp_reset_class_statics_inplace(ce, &zp_dead);
                 count++;
             }
         }
     } ZEND_HASH_FOREACH_END();
+    zend_hash_destroy(&zp_dead);   /* destructors run here, after the walk */
 
     RETURN_LONG(count);
 }
