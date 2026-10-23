@@ -2707,21 +2707,27 @@ static void zealphp_on_close(void *arg)
  * Use the Coroutine* arg pointer itself as the unique key — guaranteed
  * unique per coroutine, no need to extract cid from the struct. */
 /* Per-coroutine identity in the scheduler callbacks: we key every snapshot hash
- * on (uintptr_t)arg — the OpenSwoole Coroutine* pointer passed to the callback —
- * NOT os_get_cid(). This is deliberate and load-bearing, not an oversight:
+ * on (uintptr_t)arg — the task pointer OpenSwoole passes to the callback (its
+ * PHPContext*, one per coroutine) — NOT os_get_cid(). This is deliberate and
+ * load-bearing, not an oversight. OpenSwoole (src/coroutine/base.cc) calls
+ * on_resume BEFORE it installs the resumed coroutine as "current", on_yield and
+ * on_close BEFORE it switches "current" back to the origin. So:
  *
- *   EMPIRICALLY VERIFIED (cid-probe, 3 concurrent coroutines, HOOK_ALL):
  *     on_yield : os_get_cid() == the yielding coroutine's cid   (reliable)
- *     on_resume: os_get_cid() == -1  ON EVERY RESUME            (UNRELIABLE)
+ *     on_resume: os_get_cid() == the RESUMER's cid              (NOT the resumed one)
  *     on_close : os_get_cid() == the closing coroutine's cid    (reliable)
  *
- * on_resume fires BEFORE the scheduler has installed the resuming coroutine as
- * "current", so os_get_cid() returns -1 there. Keying the snapshot RESTORE on
- * os_get_cid() would therefore look up hash[-1] for every resume and silently
- * restore nothing — cross-coroutine state corruption. The Coroutine* arg is the
- * ONLY identity that is correct in all three callbacks, so the snapshots use it.
- * Pointer reuse is not a hazard: on_close(arg) deletes this coroutine's snapshot
- * as part of teardown, before the engine can free and reassign the struct.
+ * The resumer is the event loop (os_get_cid() == -1) for every timer / socket /
+ * sleep wakeup — that is what the original cid probe saw. But Channel::push()
+ * and pop() (and anything else that calls Coroutine::resume() from coroutine
+ * context) resume a waiter INLINE, on the running coroutine's C stack, and then
+ * os_get_cid() is that live coroutine's cid. Either way it never names the
+ * coroutine being resumed, so a restore keyed on os_get_cid() would replay the
+ * wrong lane. The task arg is the ONLY identity that is correct in all three
+ * callbacks, so the snapshots use it. Pointer reuse is not a hazard: on_close(arg)
+ * deletes this coroutine's snapshot as part of teardown, before the engine can
+ * free and reassign the struct. The inline case additionally needs the RESUMER
+ * parked and re-applied around the resumed slice — see zealphp_inline_park().
  *
  * Stage 7's reincluded set is the deliberate exception — it is populated from the
  * ZEND_INCLUDE_OR_EVAL opcode handler, which runs in PHP-execution context (NOT a
@@ -2729,9 +2735,13 @@ static void zealphp_on_close(void *arg)
  * is cleaned in on_close, where os_get_cid() is also reliable (see above). It can
  * only ever see os_get_cid(), never arg, so it consistently keys on cid — a
  * separate hash from the snapshots, so the two schemes never collide. */
-static void zealphp_on_yield_body(void *arg)
+/* Park the LIVE request state under `arg` and re-park the process at the
+ * baseline — the yield side of a switch. `arg` must be the task of the
+ * coroutine whose PHP context is live right now (os_get_cid() names it): the
+ * yielding coroutine in on_yield, or the inline resumer in on_resume (see
+ * zealphp_inline_park). */
+static void zealphp_state_park(void *arg)
 {
-    if (!arg) return;
     /* HAZARD-2: if this coroutine is suspended mid-CG-swap, stash the swap and
      * restore the real (EG) tables so peers don't see our stack-local scratch. */
     if (CG(class_table) != EG(class_table)) {
@@ -2815,16 +2825,14 @@ static void zealphp_on_yield_body(void *arg)
         /* (cid→ptr bridge recorded above — the request-end drain uses it to
          * free this coroutine's pointer-keyed delta.) */
     }
-    /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap */
-    if (orig_on_yield) orig_on_yield(arg);
 }
 
-static void zealphp_on_resume_body(void *arg)
+/* Re-apply the state parked under `arg` — the resume side of a switch. Runs
+ * after OpenSwoole has installed `arg`'s engine context (EG(current_execute_data)
+ * etc. are `arg`'s), in on_resume or, for an inline resumer, after the resumed
+ * coroutine's yield/close handed control back (zealphp_inline_return). */
+static void zealphp_state_unpark(void *arg)
 {
-    /* Chain to OpenSwoole's PHPCoroutine::on_resume FIRST — restores EG/CG
-     * so EG(symbol_table) is valid when we read/write superglobals */
-    if (orig_on_resume) orig_on_resume(arg);
-    if (!arg) return;
     /* HAZARD-2: re-apply this coroutine's in-progress CG-swap (stashed on yield)
      * so its compile continues against its own scratch where it left off. */
     {
@@ -2850,11 +2858,12 @@ static void zealphp_on_resume_body(void *arg)
             zend_hash_index_del(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg);
         }
     }
-    /* NB: os_get_cid() == -1 here (see the identity-rationale comment on
-     * zealphp_on_yield) — we MUST key on arg, never os_get_cid(), in this path. */
+    /* NB: os_get_cid() never names `arg` here (it is the resumer's cid, -1 from
+     * the event loop — see the identity-rationale comment above) — we MUST key
+     * on arg, never os_get_cid(), in this path. */
     /* #37 restore gate: in framework mode (claim set non-empty) only KNOWN
-     * request coroutines (ptr recorded at save time — os_get_cid is -1 here,
-     * so cid can't be consulted) may replay request-state snapshots. Gated
+     * request coroutines (ptr recorded at save time — os_get_cid is not
+     * arg's cid here, so cid can't be consulted) may replay request-state snapshots. Gated
      * children never saved (natural no-ops), and a service runner that
      * saved during the pre-claim legacy era keeps its STALE snapshots
      * parked instead of reset_to_parent-ing the live request's $GLOBALS /
@@ -2887,6 +2896,95 @@ static void zealphp_on_resume_body(void *arg)
             zealphp_fn_statics_snapshot_restore((zend_long)(uintptr_t)arg);
         }
     }
+}
+
+/* ── Inline resumes (Channel::push / pop on a coroutine's own stack) ──
+ *
+ * A request releasing a pooled connection (`$pool->push($conn)`) while another
+ * request waits in `$pool->pop()` resumes the waiter INLINE: on_resume(B) runs
+ * while A is still the live coroutine, B runs on top of A's C stack, and B's
+ * next yield (or its close) returns straight into A — no event-loop hop, so no
+ * on_resume(A) ever fires. OpenSwoole's own PHPCoroutine callbacks handle this
+ * for the engine context (on_resume saves the CURRENT task, on_yield/on_close
+ * restore the ORIGIN task); our layer used to treat every resume as coming
+ * from the event loop. B's restore then ran over A's live superglobals,
+ * statics, constants, ini, cwd and $GLOBALS without parking them, B's yield
+ * captured whatever of A's state B had no snapshot for into B's lane, and A
+ * continued on the baseline B's yield re-parked — its $_SESSION empty, so the
+ * session write-back deleted the user's keys.
+ *
+ * Fix: model the inline resume as the switch it is. on_resume(B) with a live
+ * resumer A runs A's full yield-side park under A's own task key (os_get_cid()
+ * is A's cid there, so every owner gate decides for A exactly as on A's own
+ * yield) and records B → A. B's yield / close, once OpenSwoole has handed the
+ * engine back to A, re-applies A's lane — the resume side, as if the event
+ * loop had resumed A. Nesting (B pushes and resumes C inline) needs no stack:
+ * each resumed coroutine records its own resumer, and coroutine switching is
+ * strictly LIFO along the origin chain.
+ *
+ * The resumer's task pointer is not reachable through any exported OpenSwoole
+ * symbol, so we keep cid → task ourselves: recorded when a coroutine starts
+ * (OSW_GLOBAL_HOOK_ON_CORO_START, which passes the task) and on every yield
+ * (covers coroutines that started before the hook was registered), dropped at
+ * close. A resumer we never saw (started before activation and has not yielded
+ * since — so it owns no lane yet) keeps the pre-fix behaviour. */
+static HashTable zealphp_coro_cid_task;       /* cid → task ptr (borrowed, no dtor) */
+static HashTable zealphp_inline_resumers;     /* resumed task → resumer task (borrowed) */
+
+static void zealphp_on_coro_start(void *task)
+{
+    if (!task || !os_get_cid) return;
+    long zp_cid = os_get_cid();
+    if (zp_cid > 0) {
+        zend_hash_index_update_ptr(&zealphp_coro_cid_task, (zend_ulong)zp_cid, task);
+    }
+}
+
+static void zealphp_inline_park(void *arg)
+{
+    if (!arg || !os_get_cid) return;
+    long zp_rc = os_get_cid();
+    if (zp_rc <= 0) return;                     /* resumed by the event loop */
+    void *zp_resumer = zend_hash_index_find_ptr(&zealphp_coro_cid_task, (zend_ulong)zp_rc);
+    if (!zp_resumer || zp_resumer == arg) return;
+    zealphp_state_park(zp_resumer);
+    zend_hash_index_update_ptr(&zealphp_inline_resumers, (zend_ulong)(uintptr_t)arg, zp_resumer);
+}
+
+static void zealphp_inline_return(void *arg)
+{
+    void *zp_resumer = zend_hash_index_find_ptr(&zealphp_inline_resumers, (zend_ulong)(uintptr_t)arg);
+    if (!zp_resumer) return;
+    zend_hash_index_del(&zealphp_inline_resumers, (zend_ulong)(uintptr_t)arg);
+    zealphp_state_unpark(zp_resumer);
+}
+
+static void zealphp_on_yield_body(void *arg)
+{
+    if (!arg) return;
+    if (os_get_cid) {
+        long zp_yc = os_get_cid();
+        if (zp_yc > 0) {
+            zend_hash_index_update_ptr(&zealphp_coro_cid_task, (zend_ulong)zp_yc, arg);
+        }
+    }
+    zealphp_state_park(arg);
+    /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap
+     * (back to the origin task: the event loop, or an inline resumer). */
+    if (orig_on_yield) orig_on_yield(arg);
+    zealphp_inline_return(arg);
+}
+
+static void zealphp_on_resume_body(void *arg)
+{
+    /* An inline resumer's state is still live: park it first, while its
+     * engine context (current_execute_data — the Stage-8 frame walk) is too. */
+    zealphp_inline_park(arg);
+    /* Chain to OpenSwoole's PHPCoroutine::on_resume — restores EG/CG so
+     * EG(symbol_table) is valid when we read/write superglobals */
+    if (orig_on_resume) orig_on_resume(arg);
+    if (!arg) return;
+    zealphp_state_unpark(arg);
 }
 
 static void zealphp_on_close_body(void *arg)
@@ -2978,7 +3076,12 @@ static void zealphp_on_close_body(void *arg)
         /* Drop the cid→ptr bridge entry (request-end drain usually removed it
          * already; this covers coroutines closed without a request-end drain). */
         zend_hash_index_del(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid());
+        zend_hash_index_del(&zealphp_coro_cid_task, (zend_ulong)os_get_cid());
     }
+    /* A coroutine that was resumed inline and runs to completion hands
+     * control straight back to its resumer (OpenSwoole's on_close restored
+     * the resumer's engine context above): re-apply the resumer's lane. */
+    zealphp_inline_return(arg);
 }
 
 /* Resolve OpenSwoole's current Coroutine::on_yield/on_resume/on_close
@@ -3218,6 +3321,20 @@ static bool zealphp_install_coro_hooks(void)
     os_set_on_resume(zealphp_on_resume);
     os_set_on_close(zealphp_on_close);
     zealphp_coro_wrappers_installed = true;
+    /* Inline-resume support: learn each coroutine's task at its start (see
+     * zealphp_inline_park). Optional — on_yield records it too, so an API
+     * without the hook only loses the never-yielded-resumer case. Both forks
+     * keep ON_CORO_START at index 3 of their global hook enum. */
+    {
+        typedef int (*zp_add_hook_fn_t)(int type, void (*func)(void *), int push_back);
+        void *zp_h = dlopen(NULL, RTLD_LAZY);
+        if (zp_h) {
+            zp_add_hook_fn_t zp_add = (zp_add_hook_fn_t)dlsym(zp_h, "openswoole_add_hook");
+            if (!zp_add) zp_add = (zp_add_hook_fn_t)dlsym(zp_h, "swoole_add_hook");
+            if (zp_add) zp_add(3 /* *_GLOBAL_HOOK_ON_CORO_START */, zealphp_on_coro_start, 1);
+            dlclose(zp_h);
+        }
+    }
 #ifdef ZEALPHP_HAVE_MYSQLND_HEADERS
     /* ext#44 — the orig_path mismatch only exists under hooked transports,
      * so the vio shim rides the same activation. */
@@ -5988,6 +6105,9 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_indirect_objs,      256, NULL, ZVAL_PTR_DTOR, 0);
     /* cid→Coroutine* bridge (raw pointers, NULL dtor — the deltas own the zvals). */
     zend_hash_init(&zealphp_coro_cid_to_ptr, 64, NULL, NULL, 0);
+    /* Inline-resume bookkeeping (borrowed task pointers, NULL dtor). */
+    zend_hash_init(&zealphp_coro_cid_task, 64, NULL, NULL, 0);
+    zend_hash_init(&zealphp_inline_resumers, 16, NULL, NULL, 0);
     /* persistent=0 — parent snapshot contents come from the per-request heap.
      * Cleared explicitly via zealphp_globals_parent_clear() on disable. */
     zend_hash_init(&zealphp_coro_globals_parent, 128, NULL, ZVAL_PTR_DTOR, 0);
