@@ -1,5 +1,5 @@
 --TEST--
-091: an object global whose __destruct adds globals does not run inside the request-end reset's walk of the symbol table (no use-after-free of the resized table)
+091: a __destruct that grows the symbol table / class table never runs inside the request-end reset's walk of that table (no use-after-free of the resized table)
 --EXTENSIONS--
 zealphp
 --SKIPIF--
@@ -42,9 +42,26 @@ Co::run(function () {
     });
 });
 zealphp_coroutine_globals(false);
+
+// Same shape for the per-request class-static reset: its walk of
+// EG(class_table) released each static in place, and a destructor that
+// declares classes grows the class table mid-walk.
+$decl = sys_get_temp_dir() . '/zp091_' . getmypid() . '.php';
+$src = '<?php ';
+for ($i = 0; $i < 200; $i++) { $src .= "class Zp091Decl$i {} "; }
+file_put_contents($decl, $src);
+class Zp091Declarer { public function __destruct() { require $GLOBALS['zp091_decl']; echo "declared\n"; } }
+class Zp091Holder { public static $h = null; }
+$GLOBALS['zp091_decl'] = $decl;
+Zp091Holder::$h = new Zp091Declarer();
+zealphp_reset_request_class_statics();
+@unlink($decl);
+echo "classes: ", class_exists('Zp091Decl199', false) ? 'yes' : 'no', "\n";
 echo "survived\n";
 ?>
 --EXPECT--
 destructed
 request end done
+declared
+classes: yes
 survived
