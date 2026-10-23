@@ -1826,8 +1826,10 @@ static void zealphp_statics_snapshot_save_ex(long cid, bool repark)
                 if (zealphp_static_slot_same(slot, bv)) continue; /* unchanged since boot */
                 if (!zealphp_globals_isolatable(slot)) continue;
                 if (!any) { array_init_size(&class_snapshot, ce->default_static_members_count); any = true; }
+                /* Share, don't deep-copy: a refcount >= 2 payload COW-separates on
+                 * any write, so the lane can never observe a later mutation. */
                 zval copy;
-                ZVAL_DUP(&copy, slot);
+                ZVAL_COPY(&copy, slot);
                 zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
                 continue;
             }
@@ -1850,10 +1852,10 @@ static void zealphp_statics_snapshot_save_ex(long cid, bool repark)
             }
             if (Z_TYPE_P(slot) == IS_RESOURCE) continue;       /* resources stay shared */
 
-            /* 1. snapshot (objects = +1 ref-hold; scalars/arrays = deep copy) */
+            /* 1. snapshot (+1 ref-hold; arrays/strings COW-separate on a later write) */
             if (!any) { array_init_size(&class_snapshot, ce->default_static_members_count); any = true; }
             zval copy;
-            ZVAL_DUP(&copy, slot);
+            ZVAL_COPY(&copy, slot);
             zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
 
             /* A constant-expression default is still an unresolved AST in the
@@ -1928,12 +1930,14 @@ static void zealphp_statics_snapshot_restore(long cid)
             if ((int)idx < ce->default_static_members_count) {
                 if (Z_TYPE(statics[idx]) == IS_INDIRECT) continue;   /* parent owns it */
                 if (zp_boot_class && !zealphp_globals_isolatable(&statics[idx])) continue;
+                if (Z_REFCOUNTED_P(val) && Z_REFCOUNTED(statics[idx])
+                    && Z_COUNTED_P(val) == Z_COUNTED(statics[idx])) continue;   /* already ours */
                 /* B1: the displaced value may be the last reference to an
                  * object a non-owner coroutine stored here (its writes are
                  * never parked) — never release it inside on_resume. */
                 zval zp_old;
                 ZVAL_COPY_VALUE(&zp_old, &statics[idx]);
-                ZVAL_DUP(&statics[idx], val);
+                ZVAL_COPY(&statics[idx], val);   /* share; COW on write */
                 zealphp_release(&zp_old);
             }
         } ZEND_HASH_FOREACH_END();
@@ -2100,7 +2104,7 @@ static void zealphp_fn_statics_save_cb(zend_op_array *opa, HashTable *live, void
          * avoids a __destruct firing inside zealphp_on_resume. */
         if (!zealphp_globals_isolatable(src)) continue;
         zval copy;
-        ZVAL_DUP(&copy, src);
+        ZVAL_COPY(&copy, src);   /* share; COW on write */
         zend_hash_update(Z_ARRVAL(inner), vn, &copy);
     } ZEND_HASH_FOREACH_END();
     /* update (not add_new): an op_array may be reached twice via inheritance. */
@@ -2122,7 +2126,7 @@ static void zealphp_fn_statics_restore_cb(zend_op_array *opa, HashTable *live, v
         zval *slot = zend_hash_find(live, vn);
         if (!slot) {
             zval copy;
-            ZVAL_DUP(&copy, val);
+            ZVAL_COPY(&copy, val);
             zend_hash_add(live, vn, &copy);
             continue;
         }
@@ -2135,10 +2139,12 @@ static void zealphp_fn_statics_restore_cb(zend_op_array *opa, HashTable *live, v
          * callback; a destructor's first BIND_STATIC grows the registry this
          * walk iterates). Leave it shared, as the save side does. */
         if (!zealphp_globals_isolatable(target)) continue;
+        if (Z_REFCOUNTED_P(val) && Z_REFCOUNTED_P(target)
+            && Z_COUNTED_P(val) == Z_COUNTED_P(target)) continue;   /* unchanged since our restore */
         zval old;
         ZVAL_COPY_VALUE(&old, target);
-        ZVAL_DUP(target, val);
-        zealphp_release(&old);   /* an array may still hold the last ref to an object */
+        ZVAL_COPY(target, val);   /* share; COW on write */
+        zealphp_release(&old);    /* an array may still hold the last ref to an object */
     } ZEND_HASH_FOREACH_END();
 }
 
@@ -2970,6 +2976,7 @@ static void zealphp_globals_snapshot_delete(long cid)
 /* Defined below (~1713); forward-declared so snapshot_save()/snapshot_restore()
  * can reuse the CV-cache-safe in-place superglobal write for the #15 reset/clear. */
 static void zealphp_set_superglobal(const char *name, size_t name_len, zval *value);
+static int zealphp_track_vars_index(const char *name);
 
 /* Superglobal OWNERSHIP gating (the go()-child steal — zealphp#332 / #2
  * residual): the live superglobals belong to ONE coroutine — the request
@@ -3048,40 +3055,35 @@ static void zealphp_snapshot_save(long cid)
          * referenced superglobal entirely, dropping it on resume (the
          * "$_GET cleared after yield once code touches $g->get" leak). */
         zval *arr = Z_ISREF_P(sg) ? Z_REFVAL_P(sg) : sg;
-        if (Z_TYPE_P(arr) == IS_ARRAY) {
-            /* B3: hold a reference instead of a deep copy. The live slot is
-             * replaced by a fresh empty array right below (or, capture-only,
-             * shared copy-on-write with the parent), so the snapshot is the
-             * array's owner and no request data is copied per switch. The
-             * deep copy made every yield duplicate e.g. an 8 MB $_POST and
-             * $_REQUEST, with memory_limit lifted, and the clamp afterwards
-             * made the NEXT coroutine's allocation fatal. */
+        if (Z_TYPE_P(arr) != IS_ARRAY) continue;
+        if (zp_capture_only) {
+            /* Adopted child: inherit a (COW-shared) view, leave the live table. */
             zval copy;
             ZVAL_COPY(&copy, arr);
             add_assoc_zval(&snapshot, *n, &copy);
+            continue;
+        }
+        /* MOVE the array into the lane (O(1), no copy) and park the live slot
+         * at the immutable empty array (#15: a suspended coroutine's values
+         * must not stay live, or the next coroutine's save captures them as
+         * its own — the cross-coroutine $_SESSION leak). The slot keeps its
+         * zval address and reference wrapper (CV-cache / $g alias safe). The
+         * owner's array comes back untouched on resume — refcount unchanged,
+         * so its first write after the resume separates nothing. */
+        zval moved;
+        ZVAL_COPY_VALUE(&moved, arr);
+        ZVAL_EMPTY_ARRAY(arr);
+        add_assoc_zval(&snapshot, *n, &moved);
+        /* Keep PG(http_globals) (the auto-global JIT source) in step. */
+        int zp_idx = zealphp_track_vars_index(*n);
+        if (zp_idx >= 0) {
+            if (Z_TYPE(PG(http_globals)[zp_idx]) != IS_UNDEF) {
+                zval_ptr_dtor(&PG(http_globals)[zp_idx]);
+            }
+            ZVAL_EMPTY_ARRAY(&PG(http_globals)[zp_idx]);
         }
     }
     zend_hash_index_update(&zealphp_coro_snapshots, (zend_ulong)cid, &snapshot);
-
-    /* #15: AFTER snapshotting this coroutine's superglobals, reset the live EG
-     * slots to empty — the same post-save reset $GLOBALS isolation does via
-     * reset_to_parent. Without this, a value this coroutine left in the
-     * process-shared symbol table (e.g. $_SESSION) stays live while it is
-     * suspended, so the NEXT coroutine's snapshot_save captures it as ITS OWN →
-     * cross-coroutine session leak. This coroutine's values are re-applied from
-     * the snapshot on its resume, so the round-trip is preserved; peers running
-     * in between start from a clean slate. Superglobals are per-request, so the
-     * clean baseline is "empty" (each request repopulates its own). */
-    if (!zp_capture_only) {
-        for (const char **n = sg_names; *n; n++) {
-            if (zend_hash_str_find(&EG(symbol_table), *n, strlen(*n))) {
-                zval empty;
-                array_init(&empty);
-                zealphp_set_superglobal(*n, strlen(*n), &empty);
-                zval_ptr_dtor(&empty);
-            }
-        }
-    }
 
     /* Record which cid owns this snapshot (restore can't ask os_get_cid —
      * there it names the resumer: -1 for the event loop, the pusher for an
@@ -3147,10 +3149,11 @@ static void zealphp_snapshot_restore(long cid)
     for (const char **n = sg_names; *n; n++) {
         zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
         if (val) {
-            /* In-place zval swap with ZVAL_DUP: same pattern as
-             * zealphp_set_superglobal. Preserves the zval memory address
-             * (CV cache compatible) AND creates a full copy with refcount=1
-             * (no COW separation on write). */
+            /* MOVE the lane's array back into the live slot (O(1)): the slot
+             * keeps its zval address (CV cache compatible) and the array keeps
+             * its refcount — the owner writes to it with no COW separation. The
+             * lane entry is left as NULL so the snapshot's dtor frees nothing
+             * we handed back. */
             zval *existing = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
             if (existing) {
                 /* If the live slot is an IS_REFERENCE (a $g->get alias bound
@@ -3160,13 +3163,18 @@ static void zealphp_snapshot_restore(long cid)
                 zval *slot = Z_ISREF_P(existing) ? Z_REFVAL_P(existing) : existing;
                 zval old;
                 ZVAL_COPY_VALUE(&old, slot);
-                /* B3: share with the snapshot (copy-on-write) — a request that
-                 * only reads its input never copies it. */
-                ZVAL_COPY(slot, val);
-                zealphp_release(&old);
+                ZVAL_COPY_VALUE(slot, val);
+                ZVAL_NULL(val);
+                zealphp_release(&old);   /* B1: may be a non-owner's last object ref */
+                /* PG(http_globals) is left at the empty array the save parked
+                 * there: sharing the owner's array into it would raise its
+                 * refcount and force a COW copy on the owner's first write.
+                 * The auto-global JIT only reads PG once per worker (the
+                 * "armed" flag), so the symbol table is the live source. */
             } else {
                 zval copy;
-                ZVAL_COPY(&copy, val);
+                ZVAL_COPY_VALUE(&copy, val);
+                ZVAL_NULL(val);
                 zend_hash_str_add_new(&EG(symbol_table), *n, strlen(*n), &copy);
             }
         } else if (zend_hash_str_find(&EG(symbol_table), *n, strlen(*n))) {
