@@ -18,6 +18,7 @@
 
 #include "php.h"
 #include "php_ini.h"
+#include "SAPI.h"
 #include "ext/standard/info.h"
 #include "zend_exceptions.h"
 #include "zend_vm.h"
