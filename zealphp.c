@@ -4623,6 +4623,15 @@ static void zealphp_clear_const_slots_in(zend_op_array *opa)
         if ((op->opcode == ZEND_FETCH_CONSTANT || op->opcode == ZEND_DEFINED)
             && (size_t) op->extended_value + sizeof(void *) <= (size_t) opa->cache_size) {
             *(void **) ((char *) rtc + op->extended_value) = NULL;
+        } else if (op->opcode == ZEND_RECV_INIT && op->op2_type == IS_CONST) {
+            /* `function f($t = TENANT)`: RECV_INIT caches the evaluated
+             * default (when not refcounted) in a zval slot — a request
+             * constant's value would otherwise stick for every later call. */
+            const zval *zp_def = RT_CONSTANT(op, op->op2);
+            if (Z_TYPE_P(zp_def) == IS_CONSTANT_AST
+                && (size_t) Z_CACHE_SLOT_P(zp_def) + sizeof(zval) <= (size_t) opa->cache_size) {
+                ZVAL_UNDEF((zval *) ((char *) rtc + Z_CACHE_SLOT_P(zp_def)));
+            }
         }
     }
 }
