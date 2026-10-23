@@ -64,6 +64,7 @@ Co::run(function () use (&$out) {
 // Nested + never-yielded resumer: carol pushes before her first yield (her
 // task is known only from the coroutine-start hook), dave resumed inline
 // pushes on to erin inline; each returns to its own resumer intact.
+Zp080Auth::$user = null;   // the framework's request-end statics reset
 Co::run(function () use (&$out) {
     $c1 = new Channel(1);
     $c2 = new Channel(1);
