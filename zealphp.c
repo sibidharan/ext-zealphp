@@ -2549,6 +2549,13 @@ static void zealphp_globals_snapshot_restore(long cid)
                          * a genuine local and must never be repointed at the
                          * global (it silently redirected the caller's writes). */
                         if (roa->function_name && !zealphp_cv_is_bound_global(roa, j)) break;
+                        /* File-scope code is only a global frame when it runs
+                         * on the global symbol table; an include/eval inside a
+                         * function or method attaches to THAT function's local
+                         * table (a template's `foreach (.. as &$row)`). */
+                        if (!roa->function_name
+                            && (!(ZEND_CALL_INFO(rx) & ZEND_CALL_HAS_SYMBOL_TABLE)
+                                || rx->symbol_table != &EG(symbol_table))) break;
                         /* stale `global $name` binding: repoint at the canonical
                          * reference. Abandon the old ref (no read, no free). */
                         ZVAL_REF(cv, zp_canon[c].ref);
