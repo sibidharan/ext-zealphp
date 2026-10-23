@@ -109,14 +109,14 @@ deep-copied on every yield and copied back on every resume.
 
 ## Results
 
-Framework only (no app symbols), per switch: **70 µs → 2.6 µs**; per request
-resets: 60 µs → ~9 µs.
+Framework only (no app symbols), per switch: **70 µs → 1.8 µs** (1.1 park +
+0.75 unpark); per request resets: 60 µs → ~2 µs.
 
 | route (c=50, 1 worker) | coroutine | coroutine-legacy before | after |
 |---|---|---|---|
 | /ping (no yield) | 11.3k | 5.4k | 9.2k |
 | /yield/5 | 13.1k | 1.4k | 9.3k |
-| /yield/20 | 12.6k | 0.52k | 6.8k |
+| /yield/20 | 12.6k | 0.52k | 7.2k |
 
 Synthetic app size (2000 classes with statics + 2000 static-using functions +
 2000 globals, all instantiated at boot), per switch:
@@ -124,15 +124,16 @@ Synthetic app size (2000 classes with statics + 2000 static-using functions +
 | stage | before | after |
 |---|---|---|
 | fn statics save + restore | 142 + 125 µs | 0.23 + 0.23 µs |
-| $GLOBALS save + restore | 66 + 34 µs | 0.18 + 1.2 µs |
+| $GLOBALS save + restore | 66 + 34 µs | 0.25 + 0.25 µs |
 | class statics save | 27 µs | 0.14 µs |
 | request-end: fn reset / class reset / globals end | 30 / 29 / 33 µs | 0.3 / 0.4 / 0.3 µs |
-| **/yield/20 throughput** | **115 req/s** | **6,036 req/s** |
+| **/yield/20 throughput** | **115 req/s** | **6,821 req/s** |
 
 Per-switch cost no longer grows with the number of declared functions,
 classes or globals; it grows with what the coroutine wrote since its last
-yield. The remaining sub-µs linear term is the Phase R frame walk
-(O(frames × CVs)).
+yield. At N=2000 the switch is 1.24 + 0.90 µs, within noise of N=0. The
+remaining linear terms are the Phase R frame walk (O(frames × CVs)) and the
+cid→ptr bridge lookup on resume (O(live coroutines), ~50 at c=50).
 
 ## Correctness gates run
 
