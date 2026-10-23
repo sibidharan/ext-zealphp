@@ -402,11 +402,20 @@ static HashTable zealphp_coro_constant_deferred;
  * The coroutine-close paths RETIRE each orphaned struct here instead; it is
  * reclaimed at worker recycle / process exit (the same "OS reclaims on exit"
  * contract PHP_MSHUTDOWN already relies on). A surviving cache slot then always
- * resolves to valid, immutable memory. Bounded by the distinct request constants
- * a worker defines before OpenSwoole recycles it. Value = (zend_long)(uintptr_t)
- * zend_constant* (borrowed; no dtor — we free nothing during the worker's life). */
+ * resolves to valid memory. Every request allocates NEW structs for the names it
+ * define()s, so retiring alone grew with requests served, not with distinct
+ * names (F7: ~17 KB per request for 50 short string constants, unbounded). A
+ * retired struct is therefore REUSED by the next define() of the same name
+ * (zealphp_retired_constant_reuse): the new constant's value and name move into
+ * the retired struct, so a stale cache slot that still points at it reads the
+ * live value of that same name, and the retained set is bounded by distinct
+ * names × request concurrency. Key = the struct pointer (dedupes a double
+ * retire), value unused. No dtor — nothing here is freed during the worker's
+ * life except the transient struct a reuse replaces. */
 static HashTable zealphp_retired_constants;
 static bool zealphp_retired_constants_live = false;
+/* name (EG key form) → array of (zend_long)(uintptr_t) retired zend_constant*. */
+static HashTable zealphp_retired_by_name;
 
 /* ext#59: per-coroutine request-constant LANES — cid -> array(name => 1).
  * The process-wide tracker above serves ONLY the sync path (no coroutine).
@@ -477,6 +486,19 @@ static bool zealphp_globals_snapshotted = false;
  * Request constants come from runtime define() and are therefore always
  * non-persistent; we mirror free_zend_constant's non-persistent branch and
  * defensively refuse to free a persistent (engine/extension) constant. */
+/* EG(zend_constants) key for a constant name, as zend_register_constant()
+ * builds it: the namespace part lowercased, the short name kept as written. */
+static zend_string *zealphp_constant_key(zend_string *name)
+{
+    const char *zp_slash = zend_memrchr(ZSTR_VAL(name), '\\', ZSTR_LEN(name));
+    if (!zp_slash) {
+        return zend_string_copy(name);
+    }
+    zend_string *zp_key = zend_string_init(ZSTR_VAL(name), ZSTR_LEN(name), 0);
+    zend_str_tolower(ZSTR_VAL(zp_key), (size_t)(zp_slash - ZSTR_VAL(name)));
+    return zp_key;
+}
+
 static void zealphp_free_orphan_constant(zend_constant *c)
 {
     if (!c) {
@@ -509,9 +531,65 @@ static void zealphp_retire_orphan_constant(zend_constant *c)
     if (!zealphp_retired_constants_live) {
         return;   /* MINIT not run (should not happen) — leak rather than crash */
     }
+    if (!c->name || zend_hash_index_exists(&zealphp_retired_constants, (zend_ulong)(uintptr_t)c)) {
+        return;   /* already retired (or nameless: never reusable, just kept) */
+    }
     zval p;
     ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
-    zend_hash_next_index_insert(&zealphp_retired_constants, &p);
+    zend_hash_index_add_new(&zealphp_retired_constants, (zend_ulong)(uintptr_t)c, &p);
+    zend_string *zp_key = zealphp_constant_key(c->name);
+    zval *zp_list = zend_hash_find(&zealphp_retired_by_name, zp_key);
+    if (!zp_list) {
+        zval arr;
+        array_init(&arr);
+        zp_list = zend_hash_add_new(&zealphp_retired_by_name, zp_key, &arr);
+    }
+    zend_hash_next_index_insert(Z_ARRVAL_P(zp_list), &p);
+    zend_string_release(zp_key);
+}
+
+/* F7: hand a retired struct of this name to the constant define() just
+ * registered. Called right after a successful define(), before any opcode can
+ * have cached the fresh struct: move its value (flags ride in value.u2) and name
+ * into the retired struct, point the EG bucket at it and free the fresh shell.
+ * Coroutine mode only — the sync path frees request constants at clear and never
+ * retires. */
+static void zealphp_retired_constant_reuse(zend_string *name)
+{
+    if (!zealphp_retired_constants_live || zend_hash_num_elements(&zealphp_retired_by_name) == 0) {
+        return;
+    }
+    zend_string *zp_key = zealphp_constant_key(name);
+    zval *zp_list = zend_hash_find(&zealphp_retired_by_name, zp_key);
+    zval *zp_bucket = zp_list ? zend_hash_find(EG(zend_constants), zp_key) : NULL;
+    zend_string_release(zp_key);
+    if (!zp_bucket || Z_TYPE_P(zp_list) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(zp_list)) == 0) {
+        return;
+    }
+    zend_constant *zp_fresh = Z_PTR_P(zp_bucket);
+    if (!zp_fresh || (ZEND_CONSTANT_FLAGS(zp_fresh) & CONST_PERSISTENT)) {
+        return;
+    }
+    zend_ulong zp_idx = 0;
+    zval *zp_pv = NULL, *zp_it;
+    zend_string *zp_skey;
+    ZEND_HASH_REVERSE_FOREACH_KEY_VAL(Z_ARRVAL_P(zp_list), zp_idx, zp_skey, zp_it) {
+        (void)zp_skey;
+        zp_pv = zp_it;
+        break;
+    } ZEND_HASH_FOREACH_END();
+    if (!zp_pv) return;
+    zend_constant *zp_husk = (zend_constant *)(uintptr_t)Z_LVAL_P(zp_pv);
+    zend_hash_index_del(Z_ARRVAL_P(zp_list), zp_idx);
+    zend_hash_index_del(&zealphp_retired_constants, (zend_ulong)(uintptr_t)zp_husk);
+    if (!zp_husk || zp_husk == zp_fresh) return;
+    zval_ptr_dtor_nogc(&zp_husk->value);
+    if (zp_husk->name) {
+        zend_string_release(zp_husk->name);
+    }
+    memcpy(zp_husk, zp_fresh, sizeof(zend_constant));
+    ZVAL_PTR(zp_bucket, zp_husk);
+    efree(zp_fresh);   /* runtime define(): non-persistent (checked above) */
 }
 
 static void zealphp_constants_snapshot_save(long cid)
@@ -4475,6 +4553,9 @@ static ZEND_NAMED_FUNCTION(zealphp_define_intercept)
              * table only in sync mode) so no peer can park/free it. */
             zend_hash_update(zealphp_reqconst_lane(zealphp_reqconst_cid(), true),
                              Z_STR_P(arg1), &one);
+            if (zealphp_reqconst_cid() > 0) {
+                zealphp_retired_constant_reuse(Z_STR_P(arg1));   /* F7 */
+            }
         }
     }
 }
@@ -6158,6 +6239,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_retired_constants,       64,  NULL, NULL, 0);   /* bug 2: borrowed ptrs, reclaimed at process exit */
+    zend_hash_init(&zealphp_retired_by_name,         64,  NULL, ZVAL_PTR_DTOR, 0);   /* F7: per-name reuse pool */
     zealphp_retired_constants_live = true;
     zend_hash_init(&zealphp_coro_reqconst_lanes,     64,  NULL, ZVAL_PTR_DTOR, 0);   /* ext#59 */
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
