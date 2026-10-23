@@ -21,7 +21,10 @@ file_put_contents("$dir/inc.php", '<?php function zp084_inc() { return 1; } clas
 file_put_contents("$dir/r.php", <<<'PHP'
 <?php
 if (($_GET['s'] ?? '') === 'arm') {
-    set_error_handler(function ($n, $m) { echo "warn: ", substr($m, 0, 60), "\n"; return true; });
+    set_error_handler(function ($n, $m) {
+        echo "refused: ", strstr($m, '(', true), str_contains($m, 'only available under the CLI SAPI') ? '' : " ($m)", "\n";
+        return true;
+    });
     zealphp_process_state_snapshot();
     var_dump(zealphp_include_isolation(true), zealphp_silent_redeclare(true), zealphp_oparray_cache_full(true));
     var_dump(zealphp_include_isolation(), zealphp_silent_redeclare(), zealphp_oparray_cache_full());
@@ -65,10 +68,10 @@ proc_close($proc);
 @unlink("$dir/inc.php"); @unlink("$dir/r.php"); @rmdir($dir);
 ?>
 --EXPECTF--
-warn: zealphp_process_state_snapshot() is only available under th
-warn: zealphp_include_isolation() is only available under the CLI
-warn: zealphp_silent_redeclare() is only available under the CLI 
-warn: zealphp_oparray_cache_full() is only available under the CL
+refused: zealphp_process_state_snapshot
+refused: zealphp_include_isolation
+refused: zealphp_silent_redeclare
+refused: zealphp_oparray_cache_full
 bool(false)
 bool(false)
 bool(false)

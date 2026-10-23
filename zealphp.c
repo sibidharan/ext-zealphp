@@ -4139,9 +4139,10 @@ static bool zealphp_sapi_allows_worker_state(const char *fname)
         && (strcmp(sapi_module.name, "cli") == 0 || strcmp(sapi_module.name, "phpdbg") == 0)) {
         return true;
     }
+    (void)fname;   /* php_error_docref prefixes the active function's name */
     php_error_docref(NULL, E_WARNING,
-        "%s() is only available under the CLI SAPI (long-running workers); "
-        "under the %s SAPI its state would outlive this request", fname,
+        "is only available under the CLI SAPI (long-running workers); "
+        "under the %s SAPI its state would outlive this request",
         sapi_module.name ? sapi_module.name : "unknown");
     return false;
 }
