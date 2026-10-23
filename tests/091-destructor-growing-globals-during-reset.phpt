@@ -48,15 +48,18 @@ zealphp_coroutine_globals(false);
 // declares classes grows the class table mid-walk.
 $decl = sys_get_temp_dir() . '/zp091_' . getmypid() . '.php';
 $src = '<?php ';
-for ($i = 0; $i < 200; $i++) { $src .= "class Zp091Decl$i {} "; }
+for ($i = 0; $i < 3000; $i++) { $src .= "class Zp091Decl$i {} "; }
 file_put_contents($decl, $src);
 class Zp091Declarer { public function __destruct() { require $GLOBALS['zp091_decl']; echo "declared\n"; } }
 class Zp091Holder { public static $h = null; }
 $GLOBALS['zp091_decl'] = $decl;
+for ($i = 0; $i < 50; $i++) {                 // the walk continues past the holder
+    eval("class Zp091After$i { public static \$v = $i; }");
+}
 Zp091Holder::$h = new Zp091Declarer();
 zealphp_reset_request_class_statics();
 @unlink($decl);
-echo "classes: ", class_exists('Zp091Decl199', false) ? 'yes' : 'no', "\n";
+echo "classes: ", class_exists('Zp091Decl2999', false) ? 'yes' : 'no', "\n";
 echo "survived\n";
 ?>
 --EXPECT--
