@@ -11,6 +11,7 @@ if (!function_exists('opcache_get_status')) die('skip needs opcache (immutable c
 opcache.enable=1
 opcache.enable_cli=1
 opcache.file_cache_only=0
+opcache.jit=disable
 --FILE--
 <?php
 // Under opcache a class from a cached file is IMMUTABLE: its

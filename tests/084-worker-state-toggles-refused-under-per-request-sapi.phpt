@@ -35,13 +35,21 @@ require_once __DIR__ . '/inc.php';
 echo "later request ok\n";
 PHP);
 
-$args = [PHP_BINARY];
-if (getenv('PHP_INI_SCAN_DIR') === false) {
-    $args[] = '-n';
+// The child must load the SAME zealphp.so this test runs under: CI loads the
+// fresh build with `-d extension=<modules/zealphp.so>`, which a nested php
+// doesn't inherit (and the system ini may point at an older build). Read the
+// mapped path from /proc and start the child with -n plus exactly that file.
+$so = null;
+foreach (@file('/proc/self/maps') ?: [] as $line) {
+    if (preg_match('#\s(/\S*zealphp\.so)$#', rtrim($line), $m)) {
+        $so = $m[1];
+        break;
+    }
+}
+$args = [PHP_BINARY, '-n', '-d', 'extension=' . ($so ?? 'zealphp')];
+if ($so === null) {
     $args[] = '-d';
     $args[] = 'extension_dir=' . ini_get('extension_dir');
-    $args[] = '-d';
-    $args[] = 'extension=zealphp';
 }
 $port = 0;
 for ($try = 0; $try < 20 && !$port; $try++) {
