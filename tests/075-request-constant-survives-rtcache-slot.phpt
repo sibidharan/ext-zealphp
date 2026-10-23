@@ -11,15 +11,13 @@ if (!extension_loaded('openswoole')) {
 --FILE--
 <?php
 // zealphp_reset_request_rtcaches() skips boot/snapshot functions and closures,
-// so a FETCH_CONSTANT cache slot in such an op_array survives a request and
-// keeps resolving to r1's constant (the #59-wave perf contract — snapshot
-// symbols keep process-stable cached targets). On main that struct is freed at
-// coroutine close, so r2's cached read is a use-after-free (valgrind: "Invalid
-// read" in the FETCH_CONSTANT handler). The fix RETIRES request constants to
-// worker recycle instead of freeing them at close, so the retained read stays
-// memory-safe. This is a regression guard: a plain run prints the same either
-// way (the UAF does not crash without a sanitizer); the ext's valgrind/ASAN CI
-// is what catches it — clean after the fix, "Invalid read" before.
+// so a FETCH_CONSTANT cache slot in such an op_array used to survive a request
+// and keep resolving to r1's constant: first a use-after-free (the struct was
+// freed at coroutine close), then, once constants were retired instead of
+// freed, a stale read: r2 defined 'two' and still read 'one'.
+// zealphp_constants_clear() now nulls the constant-lookup slots of every
+// surviving op_array when the request defined constants, so r2 re-resolves
+// and reads its own value (and valgrind/ASAN stays clean).
 use OpenSwoole\Coroutine;
 use OpenSwoole\Coroutine\Channel;
 use OpenSwoole\Timer;
@@ -66,6 +64,6 @@ echo "exit-clean\n";
 ?>
 --EXPECT--
 r1: one
-r2: one
+r2: two
 DONE
 exit-clean
