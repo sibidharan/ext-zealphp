@@ -22,6 +22,7 @@
 #include "zend_exceptions.h"
 #include "zend_vm.h"
 #include "php_zealphp.h"
+#include "zend_closures.h"
 #include <dlfcn.h>
 #include <stdio.h>
 /* ext#44 — mysqlnd vio shim needs the mysqlnd structs; absent headers (a PHP
@@ -4282,12 +4283,85 @@ static ZEND_NAMED_FUNCTION(zealphp_define_intercept)
     }
 }
 
+/* ── Request constants vs cached constant lookups ──────────────────────
+ *
+ * ZEND_FETCH_CONSTANT and ZEND_DEFINED cache the resolved zend_constant* in the
+ * op_array's run_time_cache. zealphp_reset_request_rtcaches() skips boot /
+ * snapshot symbols (their usual targets are process-stable) and never touches
+ * closures, so with defineIsolation a boot-time function or a route closure
+ * that read a REQUEST constant kept pointing at that request's struct: the next
+ * request read the previous request's value (and still did after redefining
+ * it), and on the sync path, which frees immediately, the slot dangled. When a
+ * request defined constants, null exactly those slots everywhere code can
+ * survive a request (user functions, methods, live closures) so they
+ * re-resolve against the live table. Only requests that called define() pay
+ * for the sweep. */
+static void zealphp_clear_const_slots_in(zend_op_array *opa)
+{
+    if (!opa->opcodes || opa->cache_size <= 0) {
+        return;
+    }
+    void *rtc = ZEND_MAP_PTR_GET(opa->run_time_cache);
+    if (!rtc) {
+        return;   /* never executed: no cached lookups */
+    }
+    for (uint32_t i = 0; i < opa->last; i++) {
+        const zend_op *op = &opa->opcodes[i];
+        if ((op->opcode == ZEND_FETCH_CONSTANT || op->opcode == ZEND_DEFINED)
+            && (size_t) op->extended_value + sizeof(void *) <= (size_t) opa->cache_size) {
+            *(void **) ((char *) rtc + op->extended_value) = NULL;
+        }
+    }
+}
+
+static void zealphp_clear_constant_cache_slots(void)
+{
+    zend_function *fn;
+    ZEND_HASH_FOREACH_PTR(EG(function_table), fn) {
+        if (fn && fn->type == ZEND_USER_FUNCTION) {
+            zealphp_clear_const_slots_in(&fn->op_array);
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    zend_class_entry *ce;
+    ZEND_HASH_FOREACH_PTR(EG(class_table), ce) {
+        if (ce && ce->type == ZEND_USER_CLASS) {
+            zend_function *m;
+            ZEND_HASH_FOREACH_PTR(&ce->function_table, m) {
+                if (m && m->type == ZEND_USER_FUNCTION) {
+                    zealphp_clear_const_slots_in(&m->op_array);
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    /* Closures carry their own run_time_cache; route handlers are usually
+     * closures created at boot. */
+    for (uint32_t i = 1; i < EG(objects_store).top; i++) {
+        zend_object *obj = EG(objects_store).object_buckets[i];
+        if (!IS_OBJ_VALID(obj) || obj->ce != zend_ce_closure) {
+            continue;
+        }
+        const zend_function *f = zend_get_closure_method_def(obj);
+        if (f && f->type == ZEND_USER_FUNCTION) {
+            zealphp_clear_const_slots_in((zend_op_array *) &f->op_array);
+        }
+    }
+}
+
 /* ── zealphp_constants_clear(): void ─────────────────────────────── */
 
 PHP_FUNCTION(zealphp_constants_clear)
 {
     zend_string *name;
     long cid = os_get_cid ? os_get_cid() : -1;
+
+    /* Before any request constant is orphaned or freed: no cached lookup may
+     * keep pointing at it (see zealphp_clear_constant_cache_slots). */
+    HashTable *zp_defined = zealphp_reqconst_lane(cid, false);
+    if (zp_defined && zend_hash_num_elements(zp_defined) > 0) {
+        zealphp_clear_constant_cache_slots();
+    }
 
     if (cid < 0) {
         /* Sync / non-coroutine mode: no coroutine close to defer to, and no
