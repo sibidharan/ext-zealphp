@@ -2236,7 +2236,7 @@ static void zealphp_statics_snapshot_save_ex(long cid, bool repark)
         ZEND_HASH_FOREACH_NUM_KEY(touched, cek) {
             zval *pos = zend_hash_index_find(&zealphp_static_classes_by_ce, cek);
             if (!pos) continue;   /* class without statics / unknown — nothing to isolate */
-            zealphp_statics_save_class(&zealphp_static_classes[Z_LVAL_P(pos)], zp_v2_disabled, &snapshot, &snapshot_init, repark);
+            zealphp_statics_save_class(&zealphp_static_classes[Z_LVAL_P(pos) - 1], zp_v2_disabled, &snapshot, &snapshot_init, repark);
         } ZEND_HASH_FOREACH_END();
     }
 
@@ -8779,7 +8779,7 @@ static void zealphp_reset_request_class_statics_impl(INTERNAL_FUNCTION_PARAMETER
         } else {
             zval *pos = zend_hash_index_find(&zealphp_static_classes_by_ce, zp_dirty_keys[ci]);
             if (!pos) continue;
-            ref = &zealphp_static_classes[Z_LVAL_P(pos)];
+            ref = &zealphp_static_classes[Z_LVAL_P(pos) - 1];
         }
         zend_class_entry *ce = ref->ce;
         if (ref->shared) continue;
