@@ -1555,6 +1555,7 @@ static void zealphp_statics_snapshot_save(long cid)
 
             zval *tmpl = &ce->default_static_members_table[i];
             if (Z_TYPE_P(tmpl) == IS_INDIRECT) continue;   /* defensive (inherited) */
+            bool zp_ast_default = (Z_TYPE_P(tmpl) == IS_CONSTANT_AST);
 
             /* Fast same-as-template checks — untouched slots cost ~nothing. */
             if (Z_TYPE_P(slot) == Z_TYPE_P(tmpl)) {
@@ -1575,6 +1576,19 @@ static void zealphp_statics_snapshot_save(long cid)
             ZVAL_DUP(&copy, slot);
             zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
             any = true;
+
+            /* A constant-expression default is still an unresolved AST in the
+             * template (always for an opcache-immutable class; for a runtime
+             * class until the #54 reset resolved it). The engine resolves it
+             * only into the live table, once — re-parking the raw AST left a
+             * live slot it never resolves again ("unknown type"; UB on string
+             * conversion). Resolving it here could autoload (user code inside
+             * the scheduler callback), so keep the live value: the snapshot
+             * above still gives the owner its own value back on resume, and
+             * the per-request reset (PHP context) resolves a fresh default.
+             * Residual: a peer running while the owner is suspended can read
+             * the owner's value of such a slot. */
+            if (zp_ast_default) continue;
 
             /* 2. re-park the live slot to the template (S11c discipline). The
              * dtor of the displaced value cannot fire __destruct here: our
@@ -7080,6 +7094,17 @@ static void zealphp_reset_class_statics_inplace(zend_class_entry *ce)
         }
         zval fresh;
         ZVAL_COPY(&fresh, tmpl);   /* default copy (refcount-correct; UNDEF ok) */
+        if (Z_TYPE(fresh) == IS_CONSTANT_AST) {
+            /* Immutable class: its shared template keeps the AST. Evaluate a
+             * COPY (what zend_update_class_constants does for the live table)
+             * — never store the raw AST in the live slot, the engine will not
+             * resolve it again. */
+            if (zval_update_constant_ex(&fresh, ce) != SUCCESS) {
+                zval_ptr_dtor(&fresh);
+                if (EG(exception)) { zend_clear_exception(); }
+                continue;   /* unresolvable — leave the live slot untouched */
+            }
+        }
         zval old = *dst;
         ZVAL_COPY_VALUE(dst, &fresh);
         zval_ptr_dtor(&old);       /* release prior value (runs object __destruct) */
