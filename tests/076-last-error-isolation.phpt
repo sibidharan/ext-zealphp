@@ -50,9 +50,9 @@ Co::run(function () use (&$seen, $done) {
 // A later request: in the server a new request coroutine is started by the
 // reactor only after the previous ones yielded (re-parked) or closed. Model
 // that with a fresh scheduler run once both peers have closed. (A coroutine
-// resumed DIRECTLY by a request via Channel::push, or go()'d from such a
-// non-request coroutine, observes live state — the same boundary as every
-// other isolation stage; the framework also clears the last error per request.)
+// resumed inline by a request's Channel::push gets the pusher's state parked
+// first — test 080. The framework does NOT clear the last error per request
+// itself; the closing request's re-park in on_close does — test 082.)
 Co::run(function () use (&$seen) {
     go(function () use (&$seen) {
         zealphp_superglobals_owner();

@@ -41,7 +41,8 @@ L2267/L2351). So under `coroutine-legacy` (which calls
 returns **false for `IS_OBJECT` and `IS_RESOURCE`** (deref'ing `IS_REFERENCE`
 first). The in-code rationale (~L1138): deep-copying an object on save would
 `ZVAL_DUP`/incref it, and dropping its last ref on restore would fire
-`__destruct` **inside the C `on_resume` callback** (where `os_get_cid() == -1`),
+`__destruct` **inside the C `on_resume` callback** (where `os_get_cid()` names the
+resumer — `-1` for the event loop, the pushing coroutine for an inline Channel resume),
 which can re-enter the executor / yield mid-resume and corrupt the scheduler —
 the same hazard the object-**globals** stage solved with the in-coroutine
 request-end drain (0.3.23 / 0.3.47). For class statics that drain contract was

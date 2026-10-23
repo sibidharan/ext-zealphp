@@ -2716,7 +2716,8 @@ static void zealphp_snapshot_save(long cid)
     }
 
     /* Record which cid owns this snapshot (restore can't ask os_get_cid —
-     * it returns -1 there) — BOTH paths: the adopted child's resume uses
+     * there it names the resumer: -1 for the event loop, the pusher for an
+     * inline Channel resume) — BOTH paths: the adopted child's resume uses
      * this to re-claim the live table for ITS slice. Release the live-state
      * ownership only on the owner path (#42: capture-only must leave the
      * parent's claim intact — the live slots still hold the parent's data). */
@@ -6355,10 +6356,13 @@ PHP_MINIT_FUNCTION(zealphp)
     /* persistent=0 — parent snapshot contents come from the per-request heap.
      * Cleared explicitly via zealphp_globals_parent_clear() on disable. */
     zend_hash_init(&zealphp_coro_globals_parent, 128, NULL, ZVAL_PTR_DTOR, 0);
-    /* The three *_snapshot tables below capture name SETS (no request-heap
-     * zvals — value is IS_LONG 1 throughout). Keys are zend_string* that
-     * get persistently-dup'd into the bucket arena by the persistent=1
-     * hash. Safe as-is. */
+    /* The three *_snapshot tables below capture name SETS (value is IS_LONG 1
+     * throughout). They are persistent=1 tables, but zend_hash_update() does
+     * NOT duplicate a non-interned key — it stores the caller's (request-heap)
+     * zend_string with an extra ref. That is only sound while the request that
+     * took the snapshot is still running: the OpenSwoole worker's one CLI
+     * request. zealphp_process_state_snapshot() is therefore refused under
+     * per-request SAPIs (zealphp_sapi_allows_worker_state). */
     zend_hash_init(&zealphp_snapshot_files, 256, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_classes, 256, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_functions, 256, NULL, ZVAL_PTR_DTOR, 1);
