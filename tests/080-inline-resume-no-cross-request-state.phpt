@@ -61,8 +61,42 @@ Co::run(function () use (&$out) {
     $done->pop(5.0);
     $done->pop(5.0);
 });
+// Nested + never-yielded resumer: carol pushes before her first yield (her
+// task is known only from the coroutine-start hook), dave resumed inline
+// pushes on to erin inline; each returns to its own resumer intact.
+Co::run(function () use (&$out) {
+    $c1 = new Channel(1);
+    $c2 = new Channel(1);
+    $done = new Channel(3);
+    go(function () use (&$out, $c2, $done) {                   // request "erin"
+        zealphp_request_input_set(['who' => 'erin'], [], [], [], [], []);
+        $c2->pop(2.0);
+        $out['erin_get'] = $_GET['who'] ?? 'MISSING';
+        $out['erin_user'] = Zp080Auth::$user;
+        $done->push(1);
+    });
+    go(function () use (&$out, $c1, $c2, $done) {              // request "dave"
+        zealphp_request_input_set(['who' => 'dave'], [], [], [], [], []);
+        $c1->pop(2.0);
+        Zp080Auth::$user = 'dave';
+        $c2->push(1);                                           // erin inline, on top of carol's stack
+        $out['dave_get'] = $_GET['who'] ?? 'MISSING';
+        $out['dave_user'] = Zp080Auth::$user;
+        $done->push(1);
+    });
+    go(function () use (&$out, $c1, $done) {                   // request "carol"
+        zealphp_request_input_set(['who' => 'carol'], [], [], [], [], []);
+        Zp080Auth::$user = 'carol';
+        $c1->push(1);                                           // dave inline, before carol ever yielded
+        $out['carol_get'] = $_GET['who'] ?? 'MISSING';
+        $out['carol_user'] = Zp080Auth::$user;
+        $done->push(1);
+    });
+    $done->pop(5.0); $done->pop(5.0); $done->pop(5.0);
+});
 foreach (['bob_inline_user', 'bob_inline_get', 'bob_inline_sess', 'bob_later_user', 'bob_get',
-          'alice_get', 'alice_user', 'alice_sess', 'alice_sess_later'] as $k) {
+          'alice_get', 'alice_user', 'alice_sess', 'alice_sess_later',
+          'erin_get', 'erin_user', 'dave_get', 'dave_user', 'carol_get', 'carol_user'] as $k) {
     echo $k, ': ', var_export(array_key_exists($k, $out) ? $out[$k] : 'UNSET', true), "\n";
 }
 ?>
@@ -76,3 +110,9 @@ alice_get: 'alice'
 alice_user: 'alice'
 alice_sess: 'alice'
 alice_sess_later: 'alice'
+erin_get: 'erin'
+erin_user: NULL
+dave_get: 'dave'
+dave_user: 'dave'
+carol_get: 'carol'
+carol_user: 'carol'
