@@ -4122,9 +4122,36 @@ PHP_FUNCTION(zealphp_protect_classes)
     } ZEND_HASH_FOREACH_END();
 }
 
+/* Long-running-worker gate for the process-lifetime toggles (S11 snapshot,
+ * Stage 7 include isolation, silent redeclare, full op_array cache). Their flags
+ * and tables are worker-lifetime by design — never reset in RSHUTDOWN — and the
+ * tables hold request-heap keys/op_arrays. Under a per-request SAPI (Apache
+ * mod_php, FPM, CGI, the built-in server) one script arming them changes every
+ * later request in that process, from any vhost, and those requests read freed
+ * memory (measured on the built-in server: S11 snapshot + include isolation, or
+ * silent redeclare + full cache, kill the process on the next request). They
+ * exist for OpenSwoole workers, which run under the CLI SAPI, so refuse
+ * everywhere else. */
+static bool zealphp_sapi_allows_worker_state(const char *fname)
+{
+    if (sapi_module.name
+        && (strcmp(sapi_module.name, "cli") == 0 || strcmp(sapi_module.name, "phpdbg") == 0)) {
+        return true;
+    }
+    php_error_docref(NULL, E_WARNING,
+        "%s() is only available under the CLI SAPI (long-running workers); "
+        "under the %s SAPI its state would outlive this request", fname,
+        sapi_module.name ? sapi_module.name : "unknown");
+    return false;
+}
+
 PHP_FUNCTION(zealphp_process_state_snapshot)
 {
     zend_string *key;
+
+    if (!zealphp_sapi_allows_worker_state("zealphp_process_state_snapshot")) {
+        return;
+    }
 
     if (zealphp_state_snapshotted) {
         zend_hash_clean(&zealphp_snapshot_files);
@@ -5649,6 +5676,9 @@ PHP_FUNCTION(zealphp_silent_redeclare)
     ZEND_PARSE_PARAMETERS_END();
 
     bool prev = zealphp_silent_redeclare_enabled;
+    if (!on_is_null && on && !zealphp_sapi_allows_worker_state("zealphp_silent_redeclare")) {
+        RETURN_BOOL(prev);
+    }
     if (!on_is_null) {
         zealphp_silent_redeclare_enabled = (bool)on;
 
@@ -5727,6 +5757,9 @@ PHP_FUNCTION(zealphp_include_isolation)
     ZEND_PARSE_PARAMETERS_END();
 
     bool prev = zealphp_include_isolation_enabled;
+    if (!on_is_null && on && !zealphp_sapi_allows_worker_state("zealphp_include_isolation")) {
+        RETURN_BOOL(prev);
+    }
     if (!on_is_null) {
         zealphp_include_isolation_enabled = (bool)on;
     }
@@ -5777,6 +5810,9 @@ PHP_FUNCTION(zealphp_oparray_cache_full)
     ZEND_PARSE_PARAMETERS_END();
 
     bool prev = zealphp_oparray_cache_full;
+    if (!on_is_null && on && !zealphp_sapi_allows_worker_state("zealphp_oparray_cache_full")) {
+        RETURN_BOOL(prev);
+    }
     if (!on_is_null) {
         zealphp_oparray_cache_full = (bool)on;
     }
@@ -6281,6 +6317,30 @@ PHP_MINIT_FUNCTION(zealphp)
 
 PHP_MSHUTDOWN_FUNCTION(zealphp)
 {
+    /* Unhook the engine-level entry points that point into this image — but
+     * only the ones still ours (another extension may have chained on top).
+     * A SAPI that keeps libphp mapped across a module reload (an Apache
+     * graceful restart) would otherwise call into an unloaded image. Pointer
+     * writes only; no table is touched (see below). */
+    if (zend_compile_file == zealphp_compile_file_hook && zealphp_original_compile_file) {
+        zend_compile_file = zealphp_original_compile_file;
+    }
+#define ZEALPHP_UNHOOK_OPCODE(op, ours, prev) \
+    if (zend_get_user_opcode_handler(op) == (ours)) zend_set_user_opcode_handler((op), (prev))
+    ZEALPHP_UNHOOK_OPCODE(ZEND_DECLARE_FUNCTION, zealphp_declare_function_handler, zealphp_prev_declare_function);
+    ZEALPHP_UNHOOK_OPCODE(ZEND_DECLARE_CLASS, zealphp_declare_class_handler, zealphp_prev_declare_class);
+    ZEALPHP_UNHOOK_OPCODE(ZEND_DECLARE_CLASS_DELAYED, zealphp_declare_class_delayed_handler, zealphp_prev_declare_class_delayed);
+    ZEALPHP_UNHOOK_OPCODE(ZEND_BIND_STATIC, zealphp_bind_static_handler, zealphp_prev_bind_static);
+#ifdef ZEND_BIND_INIT_STATIC_OR_JMP
+    ZEALPHP_UNHOOK_OPCODE(ZEND_BIND_INIT_STATIC_OR_JMP, zealphp_bind_static_handler, zealphp_prev_bind_init_static);
+#endif
+    ZEALPHP_UNHOOK_OPCODE(ZEND_INCLUDE_OR_EVAL, zealphp_include_eval_handler, zealphp_prev_include_eval);
+#if PHP_VERSION_ID < 80400 && defined(ZEND_EXIT)
+    if (zealphp_exit_opcode_hooked) {
+        ZEALPHP_UNHOOK_OPCODE(ZEND_EXIT, zealphp_exit_opcode_handler, zealphp_orig_exit_opcode_handler);
+    }
+#endif
+#undef ZEALPHP_UNHOOK_OPCODE
     /* Process is exiting — skip ALL cleanup. On PHP 8.5+ the shutdown order
      * changed: CG(function_table) and refcounted objects (Closures stored in
      * zealphp_callbacks) may already be freed by the time MSHUTDOWN runs.
