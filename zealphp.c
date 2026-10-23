@@ -3242,19 +3242,49 @@ static void zealphp_globals_snapshot_restore(long cid)
         int zp_nc = 0;
         zend_string *gk;
         zval *gv;
-        ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), gk, gv) {
-            if (!gk) continue;
-            if (zp_nc >= (int)(sizeof(zp_canon) / sizeof(zp_canon[0]))) break;
-            if (zealphp_globals_is_superglobal_key(ZSTR_VAL(gk), ZSTR_LEN(gk))) continue;
-            zval *slot = gv;
-            if (Z_TYPE_P(slot) == IS_INDIRECT) slot = Z_INDIRECT_P(slot);
-            zval *dv = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot;
-            if (Z_TYPE_P(dv) != IS_OBJECT && Z_TYPE_P(dv) != IS_ARRAY) continue;  /* repair only toward a live object/array */
-            if (!Z_ISREF_P(slot)) ZVAL_MAKE_REF(slot);               /* establish a shareable canonical reference */
-            zp_canon[zp_nc].name = gk;
-            zp_canon[zp_nc].ref  = Z_REF_P(slot);
-            zp_nc++;
-        } ZEND_HASH_FOREACH_END();
+        /* perf: a frame can only hold a `global $K` binding for a key its own
+         * coroutine touched (ZEND_BIND_GLOBAL is a recorded write), so when
+         * every write was recorded the canon set is this coroutine's touched
+         * keys, not the whole table. os_get_cid() is NOT the resumed
+         * coroutine here (see the identity note above zealphp_on_yield), so the
+         * touched set is found through the cid → ptr bridge instead. */
+        HashTable *zp_tset = NULL;
+        if (zealphp_glob_hooks_wanted && zealphp_glob_touched_live) {
+            zend_ulong zp_tcid;
+            void *zp_tptr;
+            ZEND_HASH_FOREACH_NUM_KEY_PTR(&zealphp_coro_cid_to_ptr, zp_tcid, zp_tptr) {
+                if ((zend_long)(uintptr_t)zp_tptr == cid) {
+                    zp_tset = zend_hash_index_find_ptr(&zealphp_glob_touched, zp_tcid);
+                    break;
+                }
+            } ZEND_HASH_FOREACH_END();
+            if (zp_tset && zend_hash_exists(zp_tset, zealphp_glob_all_key)) zp_tset = NULL;   /* unknown keys: full scan */
+        }
+#define ZP_CANON_CONSIDER(gk, gv) do { \
+            if (!(gk)) break; \
+            if (zp_nc >= (int)(sizeof(zp_canon) / sizeof(zp_canon[0]))) break; \
+            if (zealphp_globals_is_superglobal_key(ZSTR_VAL(gk), ZSTR_LEN(gk))) break; \
+            zval *slot = (gv); \
+            if (Z_TYPE_P(slot) == IS_INDIRECT) slot = Z_INDIRECT_P(slot); \
+            zval *dv = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot; \
+            if (Z_TYPE_P(dv) != IS_OBJECT && Z_TYPE_P(dv) != IS_ARRAY) break;  /* repair only toward a live object/array */ \
+            if (!Z_ISREF_P(slot)) ZVAL_MAKE_REF(slot);               /* establish a shareable canonical reference */ \
+            zp_canon[zp_nc].name = (gk); \
+            zp_canon[zp_nc].ref  = Z_REF_P(slot); \
+            zp_nc++; \
+        } while (0)
+        if (zp_tset) {
+            ZEND_HASH_FOREACH_STR_KEY(zp_tset, gk) {
+                gv = gk ? zend_hash_find(&EG(symbol_table), gk) : NULL;
+                if (!gv) continue;
+                ZP_CANON_CONSIDER(gk, gv);
+            } ZEND_HASH_FOREACH_END();
+        } else {
+            ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), gk, gv) {
+                ZP_CANON_CONSIDER(gk, gv);
+            } ZEND_HASH_FOREACH_END();
+        }
+#undef ZP_CANON_CONSIDER
 
         if (zp_nc > 0) {
             zend_execute_data *rx = EG(current_execute_data);
@@ -3341,11 +3371,24 @@ static int zealphp_sg_dbg(void) {
 /* snapshot key (coroutine ptr cast) → IS_LONG owner cid, written at save time. */
 static HashTable zealphp_coro_sg_owner_cids;
 
+/* perf: the seven superglobal names as interned strings with a cached hash,
+ * so the per-switch lookups are zend_hash_find (no strlen/rehash). */
+static zend_string *zealphp_sg_keys[8];
+static int zealphp_sg_keys_n = 0;
+static void zealphp_sg_keys_init(void)
+{
+    if (zealphp_sg_keys_n) return;
+    for (const char **n = sg_names; *n && zealphp_sg_keys_n < 8; n++) {
+        zealphp_sg_keys[zealphp_sg_keys_n++] = zend_string_init_interned(*n, strlen(*n), 1);
+    }
+}
+
 static void zealphp_snapshot_save(long cid)
 {
     /* Guard: EG(symbol_table) may be invalid during coroutine teardown.
      * Check that the table has a valid nTableMask (non-zero when initialized). */
     if (!EG(symbol_table).nTableMask) return;
+    zealphp_sg_keys_init();
 
     /* Owner gate: a non-owner coroutine (a go() child) yielding must leave
      * the live superglobals alone — they belong to its parent request. #42:
@@ -3378,8 +3421,9 @@ static void zealphp_snapshot_save(long cid)
 
     zval snapshot;
     array_init(&snapshot);
-    for (const char **n = sg_names; *n; n++) {
-        zval *sg = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
+    for (int zp_si = 0; zp_si < zealphp_sg_keys_n; zp_si++) {
+        const char *const *n = &sg_names[zp_si];
+        zval *sg = zend_hash_find(&EG(symbol_table), zealphp_sg_keys[zp_si]);
         if (!sg) continue;
         /* $_GET et al. may be wrapped in IS_REFERENCE — ZealPHP's
          * RequestContext &__get() hands back $GLOBALS['_GET'] BY REFERENCE,
@@ -3479,15 +3523,17 @@ static void zealphp_snapshot_restore(long cid)
         }
     }
 
-    for (const char **n = sg_names; *n; n++) {
-        zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
+    zealphp_sg_keys_init();
+    for (int zp_si = 0; zp_si < zealphp_sg_keys_n; zp_si++) {
+        const char *const *n = &sg_names[zp_si];
+        zval *val = zend_hash_find(Z_ARRVAL_P(snapshot), zealphp_sg_keys[zp_si]);
         if (val) {
             /* MOVE the lane's array back into the live slot (O(1)): the slot
              * keeps its zval address (CV cache compatible) and the array keeps
              * its refcount — the owner writes to it with no COW separation. The
              * lane entry is left as NULL so the snapshot's dtor frees nothing
              * we handed back. */
-            zval *existing = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
+            zval *existing = zend_hash_find(&EG(symbol_table), zealphp_sg_keys[zp_si]);
             if (existing) {
                 /* If the live slot is an IS_REFERENCE (a $g->get alias bound
                  * via &__get), update the value the reference points at rather
@@ -3510,7 +3556,7 @@ static void zealphp_snapshot_restore(long cid)
                 ZVAL_NULL(val);
                 zend_hash_str_add_new(&EG(symbol_table), *n, strlen(*n), &copy);
             }
-        } else if (zend_hash_str_find(&EG(symbol_table), *n, strlen(*n))) {
+        } else if (zend_hash_find(&EG(symbol_table), zealphp_sg_keys[zp_si])) {
             /* #15 safety net: this superglobal is NOT in our snapshot but a value
              * is live in EG — a peer set it and finished without yielding (so the
              * post-save reset never ran for it). Clear it so we don't inherit the
