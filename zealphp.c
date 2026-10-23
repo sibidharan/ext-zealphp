@@ -2921,6 +2921,48 @@ static void zealphp_on_close(void *arg)
  * coroutine whose PHP context is live right now (os_get_cid() names it): the
  * yielding coroutine in on_yield, or the inline resumer in on_resume (see
  * zealphp_inline_park). */
+/* ── Switch profiler (ZEALPHP_SWITCH_PROF=1) ──────────────────────────
+ * Per-stage wall-clock accumulators for the yield/resume path. Off by default
+ * (one static branch per stage); when on, each stage costs two clock_gettime
+ * calls. Read from PHP via zealphp_switch_profile(): [stage => [calls, ns]]. */
+#include <time.h>
+enum {
+    ZP_PROF_SG_SAVE, ZP_PROF_SG_RESTORE,
+    ZP_PROF_CONST_SAVE, ZP_PROF_CONST_RESTORE,
+    ZP_PROF_INI_SAVE, ZP_PROF_INI_RESTORE,
+    ZP_PROF_SETTINGS_SAVE, ZP_PROF_SETTINGS_RESTORE,
+    ZP_PROF_CSTAT_SAVE, ZP_PROF_CSTAT_RESTORE,
+    ZP_PROF_FSTAT_SAVE, ZP_PROF_FSTAT_RESTORE,
+    ZP_PROF_GLOB_SAVE, ZP_PROF_GLOB_RESTORE,
+    ZP_PROF_PARK_TOTAL, ZP_PROF_UNPARK_TOTAL,
+    ZP_PROF_N
+};
+static const char *zealphp_prof_names[ZP_PROF_N] = {
+    "sg_save", "sg_restore", "const_save", "const_restore", "ini_save", "ini_restore",
+    "settings_save", "settings_restore", "class_statics_save", "class_statics_restore",
+    "fn_statics_save", "fn_statics_restore", "globals_save", "globals_restore",
+    "park_total", "unpark_total"
+};
+static uint64_t zealphp_prof_ns[ZP_PROF_N];
+static uint64_t zealphp_prof_calls[ZP_PROF_N];
+static int zealphp_prof_on = -1;
+static zend_always_inline int zealphp_prof_enabled(void)
+{
+    if (zealphp_prof_on == -1) {
+        const char *e = getenv("ZEALPHP_SWITCH_PROF");
+        zealphp_prof_on = (e && *e == '1') ? 1 : 0;
+    }
+    return zealphp_prof_on;
+}
+static zend_always_inline uint64_t zealphp_prof_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#define ZP_PROF_BEGIN(id) uint64_t zp_t_##id = zealphp_prof_enabled() ? zealphp_prof_now() : 0
+#define ZP_PROF_END(id)   do { if (zp_t_##id) { zealphp_prof_ns[id] += zealphp_prof_now() - zp_t_##id; zealphp_prof_calls[id]++; } } while (0)
+
 static void zealphp_state_park(void *arg)
 {
     /* HAZARD-2: if this coroutine is suspended mid-CG-swap, stash the swap and
@@ -2970,10 +3012,17 @@ static void zealphp_state_park(void *arg)
     if (zealphp_sg_dbg()) fprintf(stderr, "[GDBG] yield key=%ld cur=%ld reqset_n=%d save_ok=%d\n",
         (long)(uintptr_t)arg, os_get_cid ? os_get_cid() : -99,
         (int)zend_hash_num_elements(&zealphp_request_coro_cids), zp_req_owner_ok);
+    ZP_PROF_BEGIN(ZP_PROF_PARK_TOTAL);
+    ZP_PROF_BEGIN(ZP_PROF_SG_SAVE);
     zealphp_snapshot_save((zend_long)(uintptr_t)arg);
+    ZP_PROF_END(ZP_PROF_SG_SAVE);
     if (zp_req_owner_ok) {
+        ZP_PROF_BEGIN(ZP_PROF_CONST_SAVE);
         zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_CONST_SAVE);
+        ZP_PROF_BEGIN(ZP_PROF_INI_SAVE);
         zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_INI_SAVE);
         /* Bridge cid→ptr on EVERY request-owner yield, not only under $GLOBALS
          * isolation: zealphp_constants_clear() (PHP context, cid only) uses it to
          * drop this coroutine's pointer-keyed constant snapshot after moving its
@@ -2984,6 +3033,7 @@ static void zealphp_state_park(void *arg)
             zend_hash_index_update_ptr(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid(), arg);
         }
     }
+    ZP_PROF_BEGIN(ZP_PROF_SETTINGS_SAVE);
     zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_locale_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_umask_snapshot_save((zend_long)(uintptr_t)arg);
@@ -2991,10 +3041,15 @@ static void zealphp_state_park(void *arg)
     zealphp_tz_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_mbenc_snapshot_save((zend_long)(uintptr_t)arg);
     zealphp_libxml_snapshot_save((zend_long)(uintptr_t)arg);
+    ZP_PROF_END(ZP_PROF_SETTINGS_SAVE);
     if (zp_req_owner_ok) {
+        ZP_PROF_BEGIN(ZP_PROF_CSTAT_SAVE);
         zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_CSTAT_SAVE);
         if (zealphp_fn_statics_active) {
+            ZP_PROF_BEGIN(ZP_PROF_FSTAT_SAVE);
             zealphp_fn_statics_snapshot_save((zend_long)(uintptr_t)arg);
+            ZP_PROF_END(ZP_PROF_FSTAT_SAVE);
         }
     }
     /* Full $GLOBALS snapshot: runs AFTER superglobals save so the
@@ -3002,10 +3057,13 @@ static void zealphp_state_park(void *arg)
      * is_superglobal_key filter inside this call deliberately skips the
      * 7 SG slots — those are owned by zealphp_snapshot_save above. */
     if (zealphp_coro_globals_hooks_active && zp_req_owner_ok) {
+        ZP_PROF_BEGIN(ZP_PROF_GLOB_SAVE);
         zealphp_globals_snapshot_save((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_GLOB_SAVE);
         /* (cid→ptr bridge recorded above — the request-end drain uses it to
          * free this coroutine's pointer-keyed delta.) */
     }
+    ZP_PROF_END(ZP_PROF_PARK_TOTAL);
 }
 
 /* Re-apply the state parked under `arg` — the resume side of a switch. Runs
@@ -3058,13 +3116,23 @@ static void zealphp_state_unpark(void *arg)
     /* Full $GLOBALS restore runs BEFORE superglobals restore so that
      * the superglobals layer can overwrite the 7 SG slots last and win
      * any race against stale snapshot data. */
+    ZP_PROF_BEGIN(ZP_PROF_UNPARK_TOTAL);
     if (zealphp_coro_globals_hooks_active && zp_restore_ok) {
+        ZP_PROF_BEGIN(ZP_PROF_GLOB_RESTORE);
         zealphp_globals_snapshot_restore((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_GLOB_RESTORE);
     }
+    ZP_PROF_BEGIN(ZP_PROF_SG_RESTORE);
     zealphp_snapshot_restore((zend_long)(uintptr_t)arg);
+    ZP_PROF_END(ZP_PROF_SG_RESTORE);
     if (zp_restore_ok) {
+        ZP_PROF_BEGIN(ZP_PROF_CONST_RESTORE);
         zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_CONST_RESTORE);
+        ZP_PROF_BEGIN(ZP_PROF_INI_RESTORE);
         zealphp_ini_snapshot_restore((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_INI_RESTORE);
+        ZP_PROF_BEGIN(ZP_PROF_SETTINGS_RESTORE);
         zealphp_cwd_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_locale_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_umask_snapshot_restore((zend_long)(uintptr_t)arg);
@@ -3072,11 +3140,17 @@ static void zealphp_state_unpark(void *arg)
         zealphp_tz_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_mbenc_snapshot_restore((zend_long)(uintptr_t)arg);
         zealphp_libxml_snapshot_restore((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_SETTINGS_RESTORE);
+        ZP_PROF_BEGIN(ZP_PROF_CSTAT_RESTORE);
         zealphp_statics_snapshot_restore((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_CSTAT_RESTORE);
         if (zealphp_fn_statics_active) {
+            ZP_PROF_BEGIN(ZP_PROF_FSTAT_RESTORE);
             zealphp_fn_statics_snapshot_restore((zend_long)(uintptr_t)arg);
+            ZP_PROF_END(ZP_PROF_FSTAT_RESTORE);
         }
     }
+    ZP_PROF_END(ZP_PROF_UNPARK_TOTAL);
 }
 
 /* ── Inline resumes (Channel::push / pop on a coroutine's own stack) ──
@@ -7325,7 +7399,40 @@ PHP_FUNCTION(zealphp_require_global)
     RETURN_NULL();
 }
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_switch_profile, 0, 0, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO(0, reset, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
+/* zealphp_switch_profile(bool $reset = false): array
+ * Per-stage accumulated wall time of the coroutine switch path (requires
+ * ZEALPHP_SWITCH_PROF=1 in the environment at worker start; otherwise all
+ * zero). Returns [stage => ['calls' => n, 'ns' => total, 'avg_ns' => f]]. */
+PHP_FUNCTION(zealphp_switch_profile)
+{
+    bool reset = 0;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL(reset)
+    ZEND_PARSE_PARAMETERS_END();
+    array_init(return_value);
+    for (int i = 0; i < ZP_PROF_N; i++) {
+        zval row;
+        array_init(&row);
+        add_assoc_long(&row, "calls", (zend_long)zealphp_prof_calls[i]);
+        add_assoc_long(&row, "ns", (zend_long)zealphp_prof_ns[i]);
+        add_assoc_double(&row, "avg_ns", zealphp_prof_calls[i]
+            ? (double)zealphp_prof_ns[i] / (double)zealphp_prof_calls[i] : 0.0);
+        add_assoc_zval(return_value, zealphp_prof_names[i], &row);
+    }
+    add_assoc_bool(return_value, "enabled", zealphp_prof_enabled());
+    if (reset) {
+        memset(zealphp_prof_ns, 0, sizeof(zealphp_prof_ns));
+        memset(zealphp_prof_calls, 0, sizeof(zealphp_prof_calls));
+    }
+}
+
 static const zend_function_entry zealphp_functions[] = {
+    PHP_FE(zealphp_switch_profile,         arginfo_zealphp_switch_profile)
     PHP_FE(zealphp_override,               arginfo_zealphp_override)
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
     PHP_FE(zealphp_restore_all,            arginfo_zealphp_restore_all)
