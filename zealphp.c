@@ -723,6 +723,27 @@ static bool zealphp_ini_isolatable(zend_string *name)
     return true;
 }
 
+/* memory_limit is switched WITHOUT its on_modify handler. OnChangeMemoryLimit
+ * calls zend_set_memory_limit(), and the ini stages run inside the scheduler
+ * callbacks, where the limit is deliberately lifted (zealphp_switch_limit_lend)
+ * so a snapshot copy can never hit it and bailout off a foreign C stack. Going
+ * through zend_alter_ini_entry put the real limit back mid-callback for every
+ * stage after this one (statics, $GLOBALS), and a failed alter (usage above the
+ * value being set) raised E_WARNING — running the user error handler inside the
+ * callback. Here we only swap the entry's value string and PG(memory_limit);
+ * the callback wrapper applies PG(memory_limit) to the allocator when the
+ * switch is over (zealphp_switch_limit_restore re-reads it). The value was
+ * accepted by ini_set() when the request set it, so parsing cannot warn. */
+static void zealphp_memory_limit_switch(zend_ini_entry *ini_entry, zend_string *value)
+{
+    if (!ini_entry || !value || ini_entry->value == value) return;
+    zend_long zp_lim = (zend_long) zend_ini_parse_uquantity_warn(value, ini_entry->name);
+    zend_string *zp_old = ini_entry->value;
+    ini_entry->value = zend_string_copy(value);
+    if (zp_old) zend_string_release(zp_old);
+    PG(memory_limit) = zp_lim;
+}
+
 /* Save modified ini entries for this coroutine and restore originals.
  * EG(modified_ini_directives) tracks entries changed via ini_set().
  * We save the current values and restore orig_value so the next
@@ -744,6 +765,12 @@ static void zealphp_ini_snapshot_save(long cid)
             zval val;
             ZVAL_STR_COPY(&val, ini_entry->value);
             zend_hash_update(Z_ARRVAL(snapshot), name, &val);
+            if (zend_string_equals_literal(name, "memory_limit")) {
+                if (ini_entry->orig_value) {
+                    zealphp_memory_limit_switch(ini_entry, ini_entry->orig_value);
+                }
+                continue;
+            }
             /* Restore original value. zend_alter_ini_entry_ex's first arg is
              * the entry name (zend_string*), not the entry pointer — older
              * code accidentally passed the entry struct, which was emitting
@@ -771,6 +798,11 @@ static void zealphp_ini_snapshot_restore(long cid)
     ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(snapshot), name, val) {
         if (name && Z_TYPE_P(val) == IS_STRING && zealphp_ini_isolatable(name)) {
             zend_string *value = Z_STR_P(val);
+            if (zend_string_equals_literal(name, "memory_limit")) {
+                zealphp_memory_limit_switch(
+                    zend_hash_find_ptr(EG(ini_directives), name), value);
+                continue;
+            }
             zend_alter_ini_entry(name, value,
                 ZEND_INI_USER, ZEND_INI_STAGE_RUNTIME);
         }
@@ -1328,6 +1360,9 @@ static void zealphp_process_settings_repark(void)
         if (zp_cur >= 0 && zp_cur != zealphp_libxml_baseline) {
             zealphp_libxml_flag_set(zealphp_libxml_baseline);
         }
+    }
+    if (zealphp_lasterr_isolation_active) {
+        zealphp_lasterr_park();   /* the next request never reads this one's last error */
     }
 }
 
@@ -2668,7 +2703,9 @@ static zend_always_inline bool zealphp_switch_limit_lend(void)
 static zend_always_inline void zealphp_switch_limit_restore(void)
 {
     /* Re-read: the ini stage may have switched memory_limit to the resumed
-     * coroutine's own value during the callback. */
+     * coroutine's own value during the callback. It only updates
+     * PG(memory_limit) (zealphp_memory_limit_switch) — applying it to the
+     * allocator is this function's job. */
     zend_long lim = PG(memory_limit);
     if (lim <= 0) {
         return;
@@ -2686,21 +2723,27 @@ static void zealphp_on_yield(void *arg)
 {
     bool lent = zealphp_switch_limit_lend();
     zealphp_on_yield_body(arg);
-    if (lent) zealphp_switch_limit_restore();
+    /* (!lent but now limited: the ini stage switched to a coroutine with a
+     * finite memory_limit — apply it, see zealphp_memory_limit_switch.) */
+    if (lent || PG(memory_limit) > 0) zealphp_switch_limit_restore();
 }
 
 static void zealphp_on_resume(void *arg)
 {
     bool lent = zealphp_switch_limit_lend();
     zealphp_on_resume_body(arg);
-    if (lent) zealphp_switch_limit_restore();
+    /* (!lent but now limited: the ini stage switched to a coroutine with a
+     * finite memory_limit — apply it, see zealphp_memory_limit_switch.) */
+    if (lent || PG(memory_limit) > 0) zealphp_switch_limit_restore();
 }
 
 static void zealphp_on_close(void *arg)
 {
     bool lent = zealphp_switch_limit_lend();
     zealphp_on_close_body(arg);
-    if (lent) zealphp_switch_limit_restore();
+    /* (!lent but now limited: the ini stage switched to a coroutine with a
+     * finite memory_limit — apply it, see zealphp_memory_limit_switch.) */
+    if (lent || PG(memory_limit) > 0) zealphp_switch_limit_restore();
 }
 
 /* OpenSwoole scheduler callbacks — called from C, no PHP stack needed.
@@ -3017,15 +3060,6 @@ static void zealphp_on_close_body(void *arg)
     }
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_sg_owner_cids, (zend_ulong)(uintptr_t)arg);
-    /* #37: a request coroutine closing without reaching superglobals_clear
-     * (fatal, early return) must not stay in the request set forever. */
-    if (os_get_cid) {
-        long zp_c = os_get_cid();
-        if (zp_c > 0) {
-            zend_hash_index_del(&zealphp_request_coro_cids, (zend_ulong)zp_c);
-            zend_hash_index_del(&zealphp_adopted_coro_cids, (zend_ulong)zp_c);
-        }
-    }
     zend_hash_index_del(&zealphp_request_coro_ptrs, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
     /* #9: free the request constants that zealphp_constants_clear() ORPHANED on
@@ -3077,6 +3111,22 @@ static void zealphp_on_close_body(void *arg)
          * already; this covers coroutines closed without a request-end drain). */
         zend_hash_index_del(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid());
         zend_hash_index_del(&zealphp_coro_cid_task, (zend_ulong)os_get_cid());
+    }
+    /* #37: a request coroutine closing without reaching superglobals_clear
+     * (fatal, early return — or the normal path, the framework never calls
+     * it) must not stay in the request set forever. Deregister LAST: the
+     * *_snapshot_delete re-parks above are lane-or-owner gated, and the
+     * closing request coroutine IS the live owner of the process settings at
+     * this point. Dropping it from the set first made every one of them skip
+     * whenever another request was in flight, so a warning, setlocale(),
+     * chdir(), tz/umask/mb/libxml change made after the request's last yield
+     * survived into the next fresh request. */
+    if (os_get_cid) {
+        long zp_c = os_get_cid();
+        if (zp_c > 0) {
+            zend_hash_index_del(&zealphp_request_coro_cids, (zend_ulong)zp_c);
+            zend_hash_index_del(&zealphp_adopted_coro_cids, (zend_ulong)zp_c);
+        }
     }
     /* A coroutine that was resumed inline and runs to completion hands
      * control straight back to its resumer (OpenSwoole's on_close restored
