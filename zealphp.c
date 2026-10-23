@@ -18,7 +18,9 @@
 
 #include "php.h"
 #include "php_ini.h"
+#include "SAPI.h"
 #include "ext/standard/info.h"
+#include "ext/standard/php_filestat.h"
 #include "zend_exceptions.h"
 #include "zend_vm.h"
 #include "php_zealphp.h"
@@ -401,11 +403,20 @@ static HashTable zealphp_coro_constant_deferred;
  * The coroutine-close paths RETIRE each orphaned struct here instead; it is
  * reclaimed at worker recycle / process exit (the same "OS reclaims on exit"
  * contract PHP_MSHUTDOWN already relies on). A surviving cache slot then always
- * resolves to valid, immutable memory. Bounded by the distinct request constants
- * a worker defines before OpenSwoole recycles it. Value = (zend_long)(uintptr_t)
- * zend_constant* (borrowed; no dtor — we free nothing during the worker's life). */
+ * resolves to valid memory. Every request allocates NEW structs for the names it
+ * define()s, so retiring alone grew with requests served, not with distinct
+ * names (F7: ~17 KB per request for 50 short string constants, unbounded). A
+ * retired struct is therefore REUSED by the next define() of the same name
+ * (zealphp_retired_constant_reuse): the new constant's value and name move into
+ * the retired struct, so a stale cache slot that still points at it reads the
+ * live value of that same name, and the retained set is bounded by distinct
+ * names × request concurrency. Key = the struct pointer (dedupes a double
+ * retire), value unused. No dtor — nothing here is freed during the worker's
+ * life except the transient struct a reuse replaces. */
 static HashTable zealphp_retired_constants;
 static bool zealphp_retired_constants_live = false;
+/* name (EG key form) → array of (zend_long)(uintptr_t) retired zend_constant*. */
+static HashTable zealphp_retired_by_name;
 
 /* ext#59: per-coroutine request-constant LANES — cid -> array(name => 1).
  * The process-wide tracker above serves ONLY the sync path (no coroutine).
@@ -476,6 +487,19 @@ static bool zealphp_globals_snapshotted = false;
  * Request constants come from runtime define() and are therefore always
  * non-persistent; we mirror free_zend_constant's non-persistent branch and
  * defensively refuse to free a persistent (engine/extension) constant. */
+/* EG(zend_constants) key for a constant name, as zend_register_constant()
+ * builds it: the namespace part lowercased, the short name kept as written. */
+static zend_string *zealphp_constant_key(zend_string *name)
+{
+    const char *zp_slash = zend_memrchr(ZSTR_VAL(name), '\\', ZSTR_LEN(name));
+    if (!zp_slash) {
+        return zend_string_copy(name);
+    }
+    zend_string *zp_key = zend_string_init(ZSTR_VAL(name), ZSTR_LEN(name), 0);
+    zend_str_tolower(ZSTR_VAL(zp_key), (size_t)(zp_slash - ZSTR_VAL(name)));
+    return zp_key;
+}
+
 static void zealphp_free_orphan_constant(zend_constant *c)
 {
     if (!c) {
@@ -508,9 +532,65 @@ static void zealphp_retire_orphan_constant(zend_constant *c)
     if (!zealphp_retired_constants_live) {
         return;   /* MINIT not run (should not happen) — leak rather than crash */
     }
+    if (!c->name || zend_hash_index_exists(&zealphp_retired_constants, (zend_ulong)(uintptr_t)c)) {
+        return;   /* already retired (or nameless: never reusable, just kept) */
+    }
     zval p;
     ZVAL_LONG(&p, (zend_long)(uintptr_t)c);
-    zend_hash_next_index_insert(&zealphp_retired_constants, &p);
+    zend_hash_index_add_new(&zealphp_retired_constants, (zend_ulong)(uintptr_t)c, &p);
+    zend_string *zp_key = zealphp_constant_key(c->name);
+    zval *zp_list = zend_hash_find(&zealphp_retired_by_name, zp_key);
+    if (!zp_list) {
+        zval arr;
+        array_init(&arr);
+        zp_list = zend_hash_add_new(&zealphp_retired_by_name, zp_key, &arr);
+    }
+    zend_hash_next_index_insert(Z_ARRVAL_P(zp_list), &p);
+    zend_string_release(zp_key);
+}
+
+/* F7: hand a retired struct of this name to the constant define() just
+ * registered. Called right after a successful define(), before any opcode can
+ * have cached the fresh struct: move its value (flags ride in value.u2) and name
+ * into the retired struct, point the EG bucket at it and free the fresh shell.
+ * Coroutine mode only — the sync path frees request constants at clear and never
+ * retires. */
+static void zealphp_retired_constant_reuse(zend_string *name)
+{
+    if (!zealphp_retired_constants_live || zend_hash_num_elements(&zealphp_retired_by_name) == 0) {
+        return;
+    }
+    zend_string *zp_key = zealphp_constant_key(name);
+    zval *zp_list = zend_hash_find(&zealphp_retired_by_name, zp_key);
+    zval *zp_bucket = zp_list ? zend_hash_find(EG(zend_constants), zp_key) : NULL;
+    zend_string_release(zp_key);
+    if (!zp_bucket || Z_TYPE_P(zp_list) != IS_ARRAY || zend_hash_num_elements(Z_ARRVAL_P(zp_list)) == 0) {
+        return;
+    }
+    zend_constant *zp_fresh = Z_PTR_P(zp_bucket);
+    if (!zp_fresh || (ZEND_CONSTANT_FLAGS(zp_fresh) & CONST_PERSISTENT)) {
+        return;
+    }
+    zend_ulong zp_idx = 0;
+    zval *zp_pv = NULL, *zp_it;
+    zend_string *zp_skey;
+    ZEND_HASH_REVERSE_FOREACH_KEY_VAL(Z_ARRVAL_P(zp_list), zp_idx, zp_skey, zp_it) {
+        (void)zp_skey;
+        zp_pv = zp_it;
+        break;
+    } ZEND_HASH_FOREACH_END();
+    if (!zp_pv) return;
+    zend_constant *zp_husk = (zend_constant *)(uintptr_t)Z_LVAL_P(zp_pv);
+    zend_hash_index_del(Z_ARRVAL_P(zp_list), zp_idx);
+    zend_hash_index_del(&zealphp_retired_constants, (zend_ulong)(uintptr_t)zp_husk);
+    if (!zp_husk || zp_husk == zp_fresh) return;
+    zval_ptr_dtor_nogc(&zp_husk->value);
+    if (zp_husk->name) {
+        zend_string_release(zp_husk->name);
+    }
+    memcpy(zp_husk, zp_fresh, sizeof(zend_constant));
+    ZVAL_PTR(zp_bucket, zp_husk);
+    efree(zp_fresh);   /* runtime define(): non-persistent (checked above) */
 }
 
 static void zealphp_constants_snapshot_save(long cid)
@@ -723,6 +803,27 @@ static bool zealphp_ini_isolatable(zend_string *name)
     return true;
 }
 
+/* memory_limit is switched WITHOUT its on_modify handler. OnChangeMemoryLimit
+ * calls zend_set_memory_limit(), and the ini stages run inside the scheduler
+ * callbacks, where the limit is deliberately lifted (zealphp_switch_limit_lend)
+ * so a snapshot copy can never hit it and bailout off a foreign C stack. Going
+ * through zend_alter_ini_entry put the real limit back mid-callback for every
+ * stage after this one (statics, $GLOBALS), and a failed alter (usage above the
+ * value being set) raised E_WARNING — running the user error handler inside the
+ * callback. Here we only swap the entry's value string and PG(memory_limit);
+ * the callback wrapper applies PG(memory_limit) to the allocator when the
+ * switch is over (zealphp_switch_limit_restore re-reads it). The value was
+ * accepted by ini_set() when the request set it, so parsing cannot warn. */
+static void zealphp_memory_limit_switch(zend_ini_entry *ini_entry, zend_string *value)
+{
+    if (!ini_entry || !value || ini_entry->value == value) return;
+    zend_long zp_lim = (zend_long) zend_ini_parse_uquantity_warn(value, ini_entry->name);
+    zend_string *zp_old = ini_entry->value;
+    ini_entry->value = zend_string_copy(value);
+    if (zp_old) zend_string_release(zp_old);
+    PG(memory_limit) = zp_lim;
+}
+
 /* Save modified ini entries for this coroutine and restore originals.
  * EG(modified_ini_directives) tracks entries changed via ini_set().
  * We save the current values and restore orig_value so the next
@@ -744,6 +845,12 @@ static void zealphp_ini_snapshot_save(long cid)
             zval val;
             ZVAL_STR_COPY(&val, ini_entry->value);
             zend_hash_update(Z_ARRVAL(snapshot), name, &val);
+            if (zend_string_equals_literal(name, "memory_limit")) {
+                if (ini_entry->orig_value) {
+                    zealphp_memory_limit_switch(ini_entry, ini_entry->orig_value);
+                }
+                continue;
+            }
             /* Restore original value. zend_alter_ini_entry_ex's first arg is
              * the entry name (zend_string*), not the entry pointer — older
              * code accidentally passed the entry struct, which was emitting
@@ -771,6 +878,11 @@ static void zealphp_ini_snapshot_restore(long cid)
     ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(snapshot), name, val) {
         if (name && Z_TYPE_P(val) == IS_STRING && zealphp_ini_isolatable(name)) {
             zend_string *value = Z_STR_P(val);
+            if (zend_string_equals_literal(name, "memory_limit")) {
+                zealphp_memory_limit_switch(
+                    zend_hash_find_ptr(EG(ini_directives), name), value);
+                continue;
+            }
             zend_alter_ini_entry(name, value,
                 ZEND_INI_USER, ZEND_INI_STAGE_RUNTIME);
         }
@@ -835,6 +947,20 @@ static int zealphp_process_state_owner_ok(void)
 
 /* ── Per-coroutine CWD isolation (framework #323) ─────────────────── */
 
+/* chdir() for the cwd stage. PHP's own chdir() drops the RELATIVE-path stat
+ * cache (BG(CurrentStatFile)/CurrentLStatFile) because a relative name now
+ * means a different file; a bare VCWD_CHDIR does not, so after a switch
+ * is_file('x') / filesize('x') could answer from the stat of another
+ * coroutine's 'x'. Clear the stat cache (not the realpath cache: it is keyed by
+ * absolute path) whenever the stage actually moves the process. */
+static void zealphp_cwd_switch(const char *dir)
+{
+    if (VCWD_CHDIR(dir) != 0) {
+        return;   /* dir gone — nothing to do mid-switch */
+    }
+    php_clear_stat_cache(0, NULL, 0);
+}
+
 static void zealphp_cwd_snapshot_save(zend_long cid)
 {
     if (!zealphp_cwd_isolation_active || zealphp_cwd_baseline[0] == '\0') return;
@@ -858,7 +984,7 @@ static void zealphp_cwd_snapshot_save(zend_long cid)
     zend_hash_index_update(&zealphp_coro_cwd_snapshots, (zend_ulong)cid, &z);
     /* Re-park the process at the baseline so peers — and brand-new coroutines,
      * which never pass through on_resume with an entry — start clean. */
-    if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do mid-switch */ }
+    zealphp_cwd_switch(zealphp_cwd_baseline);
 }
 
 static void zealphp_cwd_snapshot_restore(zend_long cid)
@@ -866,7 +992,7 @@ static void zealphp_cwd_snapshot_restore(zend_long cid)
     if (!zealphp_cwd_isolation_active) return;
     zval *z = zend_hash_index_find(&zealphp_coro_cwd_snapshots, (zend_ulong)cid);
     if (!z || Z_TYPE_P(z) != IS_STRING) return;
-    if (VCWD_CHDIR(Z_STRVAL_P(z)) != 0) { /* dir gone — nothing to do mid-switch */ }
+    zealphp_cwd_switch(Z_STRVAL_P(z));
 }
 
 static void zealphp_cwd_snapshot_delete(zend_long cid)
@@ -884,7 +1010,7 @@ static void zealphp_cwd_snapshot_delete(zend_long cid)
          * Re-park the process so the next request starts at the baseline. */
         char buf[MAXPATHLEN];
         if (VCWD_GETCWD(buf, sizeof(buf)) && strcmp(buf, zealphp_cwd_baseline) != 0) {
-            if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do mid-switch */ }
+            zealphp_cwd_switch(zealphp_cwd_baseline);
         }
     }
 }
@@ -1293,7 +1419,7 @@ static void zealphp_process_settings_repark(void)
     if (zealphp_cwd_isolation_active && zealphp_cwd_baseline[0] != '\0') {
         char zp_buf[MAXPATHLEN];
         if (VCWD_GETCWD(zp_buf, sizeof(zp_buf)) && strcmp(zp_buf, zealphp_cwd_baseline) != 0) {
-            if (VCWD_CHDIR(zealphp_cwd_baseline) != 0) { /* dir gone — nothing to do */ }
+            zealphp_cwd_switch(zealphp_cwd_baseline);
         }
     }
     if (zealphp_locale_isolation_active && zealphp_locale_baseline) {
@@ -1328,6 +1454,9 @@ static void zealphp_process_settings_repark(void)
         if (zp_cur >= 0 && zp_cur != zealphp_libxml_baseline) {
             zealphp_libxml_flag_set(zealphp_libxml_baseline);
         }
+    }
+    if (zealphp_lasterr_isolation_active) {
+        zealphp_lasterr_park();   /* the next request never reads this one's last error */
     }
 }
 
@@ -1441,6 +1570,7 @@ static void zealphp_statics_snapshot_save(long cid)
 
             zval *tmpl = &ce->default_static_members_table[i];
             if (Z_TYPE_P(tmpl) == IS_INDIRECT) continue;   /* defensive (inherited) */
+            bool zp_ast_default = (Z_TYPE_P(tmpl) == IS_CONSTANT_AST);
 
             /* Fast same-as-template checks — untouched slots cost ~nothing. */
             if (Z_TYPE_P(slot) == Z_TYPE_P(tmpl)) {
@@ -1461,6 +1591,19 @@ static void zealphp_statics_snapshot_save(long cid)
             ZVAL_DUP(&copy, slot);
             zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
             any = true;
+
+            /* A constant-expression default is still an unresolved AST in the
+             * template (always for an opcache-immutable class; for a runtime
+             * class until the #54 reset resolved it). The engine resolves it
+             * only into the live table, once — re-parking the raw AST left a
+             * live slot it never resolves again ("unknown type"; UB on string
+             * conversion). Resolving it here could autoload (user code inside
+             * the scheduler callback), so keep the live value: the snapshot
+             * above still gives the owner its own value back on resume, and
+             * the per-request reset (PHP context) resolves a fresh default.
+             * Residual: a peer running while the owner is suspended can read
+             * the owner's value of such a slot. */
+            if (zp_ast_default) continue;
 
             /* 2. re-park the live slot to the template (S11c discipline). The
              * dtor of the displaced value cannot fire __destruct here: our
@@ -1502,10 +1645,18 @@ static void zealphp_statics_snapshot_restore(long cid)
         zval *statics = CE_STATIC_MEMBERS(ce);
         if (!statics) continue;
 
+        /* Boot classes never snapshot objects (process-shared framework
+         * state). A boot-class slot that holds an object/resource NOW was set
+         * by a peer since our save; overwriting it would free the peer's object
+         * inside on_resume. Keep it shared, matching the save side. */
+        bool zp_boot_class = zealphp_state_snapshotted
+            && zend_hash_exists(&zealphp_snapshot_classes, class_name);
         zval *val;
         zend_ulong idx;
         ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(class_snapshot), idx, val) {
             if ((int)idx < ce->default_static_members_count) {
+                if (Z_TYPE(statics[idx]) == IS_INDIRECT) continue;   /* parent owns it */
+                if (zp_boot_class && !zealphp_globals_isolatable(&statics[idx])) continue;
                 zval_ptr_dtor(&statics[idx]);
                 ZVAL_DUP(&statics[idx], val);
             }
@@ -1687,6 +1838,12 @@ static void zealphp_fn_statics_restore_cb(zend_op_array *opa, HashTable *live, v
         /* Write THROUGH an IS_REFERENCE so the executing frame's CV (which
          * shares the reference) sees this coroutine's value. */
         zval *target = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot;
+        /* Objects/resources are never snapshotted (process-shared); if the live
+         * slot holds one now, a peer put it there — overwriting it would
+         * release the peer's object inside on_resume (its __destruct in the C
+         * callback; a destructor's first BIND_STATIC grows the registry this
+         * walk iterates). Leave it shared, as the save side does. */
+        if (!zealphp_globals_isolatable(target)) continue;
         zval old;
         ZVAL_COPY_VALUE(&old, target);
         ZVAL_DUP(target, val);
@@ -1944,6 +2101,11 @@ static void zealphp_globals_reset_to_parent(void)
      * and the owning coroutine's value is re-applied from its delta on resume. */
     zend_string *key;
     zval *rv;
+    /* Displaced values are released AFTER the walk: dropping the last ref of an
+     * object global runs its __destruct, and a destructor that writes globals
+     * grows (reallocates) the very table this loop is iterating. */
+    HashTable zp_dead;
+    zend_hash_init(&zp_dead, 8, NULL, ZVAL_PTR_DTOR, 0);
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, rv) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
@@ -1975,8 +2137,11 @@ static void zealphp_globals_reset_to_parent(void)
         } else {
             ZVAL_NULL(target);
         }
-        zval_ptr_dtor(&old);
+        if (Z_REFCOUNTED(old)) {
+            zend_hash_next_index_insert(&zp_dead, &old);   /* released below */
+        }
     } ZEND_HASH_FOREACH_END();
+    zend_hash_destroy(&zp_dead);
 
     /* Reinstall parent keys not present (e.g. userland unset() removed one). */
     if (zealphp_coro_globals_parent_set) {
@@ -2406,6 +2571,13 @@ static void zealphp_globals_snapshot_restore(long cid)
                          * a genuine local and must never be repointed at the
                          * global (it silently redirected the caller's writes). */
                         if (roa->function_name && !zealphp_cv_is_bound_global(roa, j)) break;
+                        /* File-scope code is only a global frame when it runs
+                         * on the global symbol table; an include/eval inside a
+                         * function or method attaches to THAT function's local
+                         * table (a template's `foreach (.. as &$row)`). */
+                        if (!roa->function_name
+                            && (!(ZEND_CALL_INFO(rx) & ZEND_CALL_HAS_SYMBOL_TABLE)
+                                || rx->symbol_table != &EG(symbol_table))) break;
                         /* stale `global $name` binding: repoint at the canonical
                          * reference. Abandon the old ref (no read, no free). */
                         ZVAL_REF(cv, zp_canon[c].ref);
@@ -2544,7 +2716,8 @@ static void zealphp_snapshot_save(long cid)
     }
 
     /* Record which cid owns this snapshot (restore can't ask os_get_cid —
-     * it returns -1 there) — BOTH paths: the adopted child's resume uses
+     * there it names the resumer: -1 for the event loop, the pusher for an
+     * inline Channel resume) — BOTH paths: the adopted child's resume uses
      * this to re-claim the live table for ITS slice. Release the live-state
      * ownership only on the owner path (#42: capture-only must leave the
      * parent's claim intact — the live slots still hold the parent's data). */
@@ -2668,7 +2841,9 @@ static zend_always_inline bool zealphp_switch_limit_lend(void)
 static zend_always_inline void zealphp_switch_limit_restore(void)
 {
     /* Re-read: the ini stage may have switched memory_limit to the resumed
-     * coroutine's own value during the callback. */
+     * coroutine's own value during the callback. It only updates
+     * PG(memory_limit) (zealphp_memory_limit_switch) — applying it to the
+     * allocator is this function's job. */
     zend_long lim = PG(memory_limit);
     if (lim <= 0) {
         return;
@@ -2686,42 +2861,54 @@ static void zealphp_on_yield(void *arg)
 {
     bool lent = zealphp_switch_limit_lend();
     zealphp_on_yield_body(arg);
-    if (lent) zealphp_switch_limit_restore();
+    /* (!lent but now limited: the ini stage switched to a coroutine with a
+     * finite memory_limit — apply it, see zealphp_memory_limit_switch.) */
+    if (lent || PG(memory_limit) > 0) zealphp_switch_limit_restore();
 }
 
 static void zealphp_on_resume(void *arg)
 {
     bool lent = zealphp_switch_limit_lend();
     zealphp_on_resume_body(arg);
-    if (lent) zealphp_switch_limit_restore();
+    /* (!lent but now limited: the ini stage switched to a coroutine with a
+     * finite memory_limit — apply it, see zealphp_memory_limit_switch.) */
+    if (lent || PG(memory_limit) > 0) zealphp_switch_limit_restore();
 }
 
 static void zealphp_on_close(void *arg)
 {
     bool lent = zealphp_switch_limit_lend();
     zealphp_on_close_body(arg);
-    if (lent) zealphp_switch_limit_restore();
+    /* (!lent but now limited: the ini stage switched to a coroutine with a
+     * finite memory_limit — apply it, see zealphp_memory_limit_switch.) */
+    if (lent || PG(memory_limit) > 0) zealphp_switch_limit_restore();
 }
 
 /* OpenSwoole scheduler callbacks — called from C, no PHP stack needed.
  * Use the Coroutine* arg pointer itself as the unique key — guaranteed
  * unique per coroutine, no need to extract cid from the struct. */
 /* Per-coroutine identity in the scheduler callbacks: we key every snapshot hash
- * on (uintptr_t)arg — the OpenSwoole Coroutine* pointer passed to the callback —
- * NOT os_get_cid(). This is deliberate and load-bearing, not an oversight:
+ * on (uintptr_t)arg — the task pointer OpenSwoole passes to the callback (its
+ * PHPContext*, one per coroutine) — NOT os_get_cid(). This is deliberate and
+ * load-bearing, not an oversight. OpenSwoole (src/coroutine/base.cc) calls
+ * on_resume BEFORE it installs the resumed coroutine as "current", on_yield and
+ * on_close BEFORE it switches "current" back to the origin. So:
  *
- *   EMPIRICALLY VERIFIED (cid-probe, 3 concurrent coroutines, HOOK_ALL):
  *     on_yield : os_get_cid() == the yielding coroutine's cid   (reliable)
- *     on_resume: os_get_cid() == -1  ON EVERY RESUME            (UNRELIABLE)
+ *     on_resume: os_get_cid() == the RESUMER's cid              (NOT the resumed one)
  *     on_close : os_get_cid() == the closing coroutine's cid    (reliable)
  *
- * on_resume fires BEFORE the scheduler has installed the resuming coroutine as
- * "current", so os_get_cid() returns -1 there. Keying the snapshot RESTORE on
- * os_get_cid() would therefore look up hash[-1] for every resume and silently
- * restore nothing — cross-coroutine state corruption. The Coroutine* arg is the
- * ONLY identity that is correct in all three callbacks, so the snapshots use it.
- * Pointer reuse is not a hazard: on_close(arg) deletes this coroutine's snapshot
- * as part of teardown, before the engine can free and reassign the struct.
+ * The resumer is the event loop (os_get_cid() == -1) for every timer / socket /
+ * sleep wakeup — that is what the original cid probe saw. But Channel::push()
+ * and pop() (and anything else that calls Coroutine::resume() from coroutine
+ * context) resume a waiter INLINE, on the running coroutine's C stack, and then
+ * os_get_cid() is that live coroutine's cid. Either way it never names the
+ * coroutine being resumed, so a restore keyed on os_get_cid() would replay the
+ * wrong lane. The task arg is the ONLY identity that is correct in all three
+ * callbacks, so the snapshots use it. Pointer reuse is not a hazard: on_close(arg)
+ * deletes this coroutine's snapshot as part of teardown, before the engine can
+ * free and reassign the struct. The inline case additionally needs the RESUMER
+ * parked and re-applied around the resumed slice — see zealphp_inline_park().
  *
  * Stage 7's reincluded set is the deliberate exception — it is populated from the
  * ZEND_INCLUDE_OR_EVAL opcode handler, which runs in PHP-execution context (NOT a
@@ -2729,9 +2916,13 @@ static void zealphp_on_close(void *arg)
  * is cleaned in on_close, where os_get_cid() is also reliable (see above). It can
  * only ever see os_get_cid(), never arg, so it consistently keys on cid — a
  * separate hash from the snapshots, so the two schemes never collide. */
-static void zealphp_on_yield_body(void *arg)
+/* Park the LIVE request state under `arg` and re-park the process at the
+ * baseline — the yield side of a switch. `arg` must be the task of the
+ * coroutine whose PHP context is live right now (os_get_cid() names it): the
+ * yielding coroutine in on_yield, or the inline resumer in on_resume (see
+ * zealphp_inline_park). */
+static void zealphp_state_park(void *arg)
 {
-    if (!arg) return;
     /* HAZARD-2: if this coroutine is suspended mid-CG-swap, stash the swap and
      * restore the real (EG) tables so peers don't see our stack-local scratch. */
     if (CG(class_table) != EG(class_table)) {
@@ -2815,16 +3006,14 @@ static void zealphp_on_yield_body(void *arg)
         /* (cid→ptr bridge recorded above — the request-end drain uses it to
          * free this coroutine's pointer-keyed delta.) */
     }
-    /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap */
-    if (orig_on_yield) orig_on_yield(arg);
 }
 
-static void zealphp_on_resume_body(void *arg)
+/* Re-apply the state parked under `arg` — the resume side of a switch. Runs
+ * after OpenSwoole has installed `arg`'s engine context (EG(current_execute_data)
+ * etc. are `arg`'s), in on_resume or, for an inline resumer, after the resumed
+ * coroutine's yield/close handed control back (zealphp_inline_return). */
+static void zealphp_state_unpark(void *arg)
 {
-    /* Chain to OpenSwoole's PHPCoroutine::on_resume FIRST — restores EG/CG
-     * so EG(symbol_table) is valid when we read/write superglobals */
-    if (orig_on_resume) orig_on_resume(arg);
-    if (!arg) return;
     /* HAZARD-2: re-apply this coroutine's in-progress CG-swap (stashed on yield)
      * so its compile continues against its own scratch where it left off. */
     {
@@ -2850,11 +3039,12 @@ static void zealphp_on_resume_body(void *arg)
             zend_hash_index_del(&zealphp_coro_in_autoload, (zend_ulong)(uintptr_t)arg);
         }
     }
-    /* NB: os_get_cid() == -1 here (see the identity-rationale comment on
-     * zealphp_on_yield) — we MUST key on arg, never os_get_cid(), in this path. */
+    /* NB: os_get_cid() never names `arg` here (it is the resumer's cid, -1 from
+     * the event loop — see the identity-rationale comment above) — we MUST key
+     * on arg, never os_get_cid(), in this path. */
     /* #37 restore gate: in framework mode (claim set non-empty) only KNOWN
-     * request coroutines (ptr recorded at save time — os_get_cid is -1 here,
-     * so cid can't be consulted) may replay request-state snapshots. Gated
+     * request coroutines (ptr recorded at save time — os_get_cid is not
+     * arg's cid here, so cid can't be consulted) may replay request-state snapshots. Gated
      * children never saved (natural no-ops), and a service runner that
      * saved during the pre-claim legacy era keeps its STALE snapshots
      * parked instead of reset_to_parent-ing the live request's $GLOBALS /
@@ -2889,6 +3079,95 @@ static void zealphp_on_resume_body(void *arg)
     }
 }
 
+/* ── Inline resumes (Channel::push / pop on a coroutine's own stack) ──
+ *
+ * A request releasing a pooled connection (`$pool->push($conn)`) while another
+ * request waits in `$pool->pop()` resumes the waiter INLINE: on_resume(B) runs
+ * while A is still the live coroutine, B runs on top of A's C stack, and B's
+ * next yield (or its close) returns straight into A — no event-loop hop, so no
+ * on_resume(A) ever fires. OpenSwoole's own PHPCoroutine callbacks handle this
+ * for the engine context (on_resume saves the CURRENT task, on_yield/on_close
+ * restore the ORIGIN task); our layer used to treat every resume as coming
+ * from the event loop. B's restore then ran over A's live superglobals,
+ * statics, constants, ini, cwd and $GLOBALS without parking them, B's yield
+ * captured whatever of A's state B had no snapshot for into B's lane, and A
+ * continued on the baseline B's yield re-parked — its $_SESSION empty, so the
+ * session write-back deleted the user's keys.
+ *
+ * Fix: model the inline resume as the switch it is. on_resume(B) with a live
+ * resumer A runs A's full yield-side park under A's own task key (os_get_cid()
+ * is A's cid there, so every owner gate decides for A exactly as on A's own
+ * yield) and records B → A. B's yield / close, once OpenSwoole has handed the
+ * engine back to A, re-applies A's lane — the resume side, as if the event
+ * loop had resumed A. Nesting (B pushes and resumes C inline) needs no stack:
+ * each resumed coroutine records its own resumer, and coroutine switching is
+ * strictly LIFO along the origin chain.
+ *
+ * The resumer's task pointer is not reachable through any exported OpenSwoole
+ * symbol, so we keep cid → task ourselves: recorded when a coroutine starts
+ * (OSW_GLOBAL_HOOK_ON_CORO_START, which passes the task) and on every yield
+ * (covers coroutines that started before the hook was registered), dropped at
+ * close. A resumer we never saw (started before activation and has not yielded
+ * since — so it owns no lane yet) keeps the pre-fix behaviour. */
+static HashTable zealphp_coro_cid_task;       /* cid → task ptr (borrowed, no dtor) */
+static HashTable zealphp_inline_resumers;     /* resumed task → resumer task (borrowed) */
+
+static void zealphp_on_coro_start(void *task)
+{
+    if (!task || !os_get_cid) return;
+    long zp_cid = os_get_cid();
+    if (zp_cid > 0) {
+        zend_hash_index_update_ptr(&zealphp_coro_cid_task, (zend_ulong)zp_cid, task);
+    }
+}
+
+static void zealphp_inline_park(void *arg)
+{
+    if (!arg || !os_get_cid) return;
+    long zp_rc = os_get_cid();
+    if (zp_rc <= 0) return;                     /* resumed by the event loop */
+    void *zp_resumer = zend_hash_index_find_ptr(&zealphp_coro_cid_task, (zend_ulong)zp_rc);
+    if (!zp_resumer || zp_resumer == arg) return;
+    zealphp_state_park(zp_resumer);
+    zend_hash_index_update_ptr(&zealphp_inline_resumers, (zend_ulong)(uintptr_t)arg, zp_resumer);
+}
+
+static void zealphp_inline_return(void *arg)
+{
+    void *zp_resumer = zend_hash_index_find_ptr(&zealphp_inline_resumers, (zend_ulong)(uintptr_t)arg);
+    if (!zp_resumer) return;
+    zend_hash_index_del(&zealphp_inline_resumers, (zend_ulong)(uintptr_t)arg);
+    zealphp_state_unpark(zp_resumer);
+}
+
+static void zealphp_on_yield_body(void *arg)
+{
+    if (!arg) return;
+    if (os_get_cid) {
+        long zp_yc = os_get_cid();
+        if (zp_yc > 0) {
+            zend_hash_index_update_ptr(&zealphp_coro_cid_task, (zend_ulong)zp_yc, arg);
+        }
+    }
+    zealphp_state_park(arg);
+    /* Chain to OpenSwoole's PHPCoroutine::on_yield — handles EG/CG swap
+     * (back to the origin task: the event loop, or an inline resumer). */
+    if (orig_on_yield) orig_on_yield(arg);
+    zealphp_inline_return(arg);
+}
+
+static void zealphp_on_resume_body(void *arg)
+{
+    /* An inline resumer's state is still live: park it first, while its
+     * engine context (current_execute_data — the Stage-8 frame walk) is too. */
+    zealphp_inline_park(arg);
+    /* Chain to OpenSwoole's PHPCoroutine::on_resume — restores EG/CG so
+     * EG(symbol_table) is valid when we read/write superglobals */
+    if (orig_on_resume) orig_on_resume(arg);
+    if (!arg) return;
+    zealphp_state_unpark(arg);
+}
+
 static void zealphp_on_close_body(void *arg)
 {
     /* Chain to OpenSwoole's PHPCoroutine::on_close FIRST */
@@ -2919,15 +3198,6 @@ static void zealphp_on_close_body(void *arg)
     }
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_sg_owner_cids, (zend_ulong)(uintptr_t)arg);
-    /* #37: a request coroutine closing without reaching superglobals_clear
-     * (fatal, early return) must not stay in the request set forever. */
-    if (os_get_cid) {
-        long zp_c = os_get_cid();
-        if (zp_c > 0) {
-            zend_hash_index_del(&zealphp_request_coro_cids, (zend_ulong)zp_c);
-            zend_hash_index_del(&zealphp_adopted_coro_cids, (zend_ulong)zp_c);
-        }
-    }
     zend_hash_index_del(&zealphp_request_coro_ptrs, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
     /* #9: free the request constants that zealphp_constants_clear() ORPHANED on
@@ -2978,7 +3248,28 @@ static void zealphp_on_close_body(void *arg)
         /* Drop the cid→ptr bridge entry (request-end drain usually removed it
          * already; this covers coroutines closed without a request-end drain). */
         zend_hash_index_del(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid());
+        zend_hash_index_del(&zealphp_coro_cid_task, (zend_ulong)os_get_cid());
     }
+    /* #37: a request coroutine closing without reaching superglobals_clear
+     * (fatal, early return — or the normal path, the framework never calls
+     * it) must not stay in the request set forever. Deregister LAST: the
+     * *_snapshot_delete re-parks above are lane-or-owner gated, and the
+     * closing request coroutine IS the live owner of the process settings at
+     * this point. Dropping it from the set first made every one of them skip
+     * whenever another request was in flight, so a warning, setlocale(),
+     * chdir(), tz/umask/mb/libxml change made after the request's last yield
+     * survived into the next fresh request. */
+    if (os_get_cid) {
+        long zp_c = os_get_cid();
+        if (zp_c > 0) {
+            zend_hash_index_del(&zealphp_request_coro_cids, (zend_ulong)zp_c);
+            zend_hash_index_del(&zealphp_adopted_coro_cids, (zend_ulong)zp_c);
+        }
+    }
+    /* A coroutine that was resumed inline and runs to completion hands
+     * control straight back to its resumer (OpenSwoole's on_close restored
+     * the resumer's engine context above): re-apply the resumer's lane. */
+    zealphp_inline_return(arg);
 }
 
 /* Resolve OpenSwoole's current Coroutine::on_yield/on_resume/on_close
@@ -3218,6 +3509,20 @@ static bool zealphp_install_coro_hooks(void)
     os_set_on_resume(zealphp_on_resume);
     os_set_on_close(zealphp_on_close);
     zealphp_coro_wrappers_installed = true;
+    /* Inline-resume support: learn each coroutine's task at its start (see
+     * zealphp_inline_park). Optional — on_yield records it too, so an API
+     * without the hook only loses the never-yielded-resumer case. Both forks
+     * keep ON_CORO_START at index 3 of their global hook enum. */
+    {
+        typedef int (*zp_add_hook_fn_t)(int type, void (*func)(void *), int push_back);
+        void *zp_h = dlopen(NULL, RTLD_LAZY);
+        if (zp_h) {
+            zp_add_hook_fn_t zp_add = (zp_add_hook_fn_t)dlsym(zp_h, "openswoole_add_hook");
+            if (!zp_add) zp_add = (zp_add_hook_fn_t)dlsym(zp_h, "swoole_add_hook");
+            if (zp_add) zp_add(3 /* *_GLOBAL_HOOK_ON_CORO_START */, zealphp_on_coro_start, 1);
+            dlclose(zp_h);
+        }
+    }
 #ifdef ZEALPHP_HAVE_MYSQLND_HEADERS
     /* ext#44 — the orig_path mismatch only exists under hooked transports,
      * so the vio shim rides the same activation. */
@@ -3955,9 +4260,37 @@ PHP_FUNCTION(zealphp_protect_classes)
     } ZEND_HASH_FOREACH_END();
 }
 
+/* Long-running-worker gate for the process-lifetime toggles (S11 snapshot,
+ * Stage 7 include isolation, silent redeclare, full op_array cache). Their flags
+ * and tables are worker-lifetime by design — never reset in RSHUTDOWN — and the
+ * tables hold request-heap keys/op_arrays. Under a per-request SAPI (Apache
+ * mod_php, FPM, CGI, the built-in server) one script arming them changes every
+ * later request in that process, from any vhost, and those requests read freed
+ * memory (measured on the built-in server: S11 snapshot + include isolation, or
+ * silent redeclare + full cache, kill the process on the next request). They
+ * exist for OpenSwoole workers, which run under the CLI SAPI, so refuse
+ * everywhere else. */
+static bool zealphp_sapi_allows_worker_state(const char *fname)
+{
+    if (sapi_module.name
+        && (strcmp(sapi_module.name, "cli") == 0 || strcmp(sapi_module.name, "phpdbg") == 0)) {
+        return true;
+    }
+    (void)fname;   /* php_error_docref prefixes the active function's name */
+    php_error_docref(NULL, E_WARNING,
+        "is only available under the CLI SAPI (long-running workers); "
+        "under the %s SAPI its state would outlive this request",
+        sapi_module.name ? sapi_module.name : "unknown");
+    return false;
+}
+
 PHP_FUNCTION(zealphp_process_state_snapshot)
 {
     zend_string *key;
+
+    if (!zealphp_sapi_allows_worker_state("zealphp_process_state_snapshot")) {
+        return;
+    }
 
     if (zealphp_state_snapshotted) {
         zend_hash_clean(&zealphp_snapshot_files);
@@ -4279,6 +4612,9 @@ static ZEND_NAMED_FUNCTION(zealphp_define_intercept)
              * table only in sync mode) so no peer can park/free it. */
             zend_hash_update(zealphp_reqconst_lane(zealphp_reqconst_cid(), true),
                              Z_STR_P(arg1), &one);
+            if (zealphp_reqconst_cid() > 0) {
+                zealphp_retired_constant_reuse(Z_STR_P(arg1));   /* F7 */
+            }
         }
     }
 }
@@ -4310,6 +4646,15 @@ static void zealphp_clear_const_slots_in(zend_op_array *opa)
         if ((op->opcode == ZEND_FETCH_CONSTANT || op->opcode == ZEND_DEFINED)
             && (size_t) op->extended_value + sizeof(void *) <= (size_t) opa->cache_size) {
             *(void **) ((char *) rtc + op->extended_value) = NULL;
+        } else if (op->opcode == ZEND_RECV_INIT && op->op2_type == IS_CONST) {
+            /* `function f($t = TENANT)`: RECV_INIT caches the evaluated
+             * default (when not refcounted) in a zval slot — a request
+             * constant's value would otherwise stick for every later call. */
+            const zval *zp_def = RT_CONSTANT(op, op->op2);
+            if (Z_TYPE_P(zp_def) == IS_CONSTANT_AST
+                && (size_t) Z_CACHE_SLOT_P(zp_def) + sizeof(zval) <= (size_t) opa->cache_size) {
+                ZVAL_UNDEF((zval *) ((char *) rtc + Z_CACHE_SLOT_P(zp_def)));
+            }
         }
     }
 }
@@ -5028,17 +5373,24 @@ static HashTable zealphp_file_decls;
 static bool zealphp_file_decls_initialized = false;
 
 
-/* Helper: extract a stable file-path key from a zend_file_handle.
- * ALWAYS prefers filename (set at hook entry, before the engine
- * resolves opened_path) for consistency between cache-save (cold
- * compile) and cache-lookup (warm compile). */
+/* Helper: extract a stable file-path key from a zend_file_handle — the
+ * RESOLVED path, never the include string. The hook runs before the engine
+ * opens the file, so for a plain include/require `filename` is still exactly
+ * what the script wrote: `include 'header.php'` from /admin/ and from / both
+ * keyed as "header.php", and the full op_array cache served whichever compiled
+ * first to both (an admin page could run the public header, or the reverse —
+ * skipping an auth check). include_once/require_once already arrive resolved
+ * (zend_include_or_eval resolves before opening), so resolving here with the
+ * same zend_resolve_path() keeps cold store and warm lookup on one key and
+ * matches the Stage-7 skip lookup. NULL (no caching) when the path does not
+ * resolve to a plain file. */
 static zend_string *zealphp_file_handle_path(zend_file_handle *file_handle)
 {
-    if (file_handle->filename) {
-        return zend_string_copy(file_handle->filename);
-    }
     if (file_handle->opened_path) {
         return zend_string_copy(file_handle->opened_path);
+    }
+    if (file_handle->filename) {
+        return zend_resolve_path(file_handle->filename);
     }
     return NULL;
 }
@@ -5482,6 +5834,9 @@ PHP_FUNCTION(zealphp_silent_redeclare)
     ZEND_PARSE_PARAMETERS_END();
 
     bool prev = zealphp_silent_redeclare_enabled;
+    if (!on_is_null && on && !zealphp_sapi_allows_worker_state("zealphp_silent_redeclare")) {
+        RETURN_BOOL(prev);
+    }
     if (!on_is_null) {
         zealphp_silent_redeclare_enabled = (bool)on;
 
@@ -5560,6 +5915,9 @@ PHP_FUNCTION(zealphp_include_isolation)
     ZEND_PARSE_PARAMETERS_END();
 
     bool prev = zealphp_include_isolation_enabled;
+    if (!on_is_null && on && !zealphp_sapi_allows_worker_state("zealphp_include_isolation")) {
+        RETURN_BOOL(prev);
+    }
     if (!on_is_null) {
         zealphp_include_isolation_enabled = (bool)on;
     }
@@ -5610,6 +5968,9 @@ PHP_FUNCTION(zealphp_oparray_cache_full)
     ZEND_PARSE_PARAMETERS_END();
 
     bool prev = zealphp_oparray_cache_full;
+    if (!on_is_null && on && !zealphp_sapi_allows_worker_state("zealphp_oparray_cache_full")) {
+        RETURN_BOOL(prev);
+    }
     if (!on_is_null) {
         zealphp_oparray_cache_full = (bool)on;
     }
@@ -5946,6 +6307,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_constant_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_constant_deferred,  64,  NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_retired_constants,       64,  NULL, NULL, 0);   /* bug 2: borrowed ptrs, reclaimed at process exit */
+    zend_hash_init(&zealphp_retired_by_name,         64,  NULL, ZVAL_PTR_DTOR, 0);   /* F7: per-name reuse pool */
     zealphp_retired_constants_live = true;
     zend_hash_init(&zealphp_coro_reqconst_lanes,     64,  NULL, ZVAL_PTR_DTOR, 0);   /* ext#59 */
     zend_hash_init(&zealphp_coro_ini_snapshots, 256, NULL, ZVAL_PTR_DTOR, 0);
@@ -5988,13 +6350,19 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_indirect_objs,      256, NULL, ZVAL_PTR_DTOR, 0);
     /* cid→Coroutine* bridge (raw pointers, NULL dtor — the deltas own the zvals). */
     zend_hash_init(&zealphp_coro_cid_to_ptr, 64, NULL, NULL, 0);
+    /* Inline-resume bookkeeping (borrowed task pointers, NULL dtor). */
+    zend_hash_init(&zealphp_coro_cid_task, 64, NULL, NULL, 0);
+    zend_hash_init(&zealphp_inline_resumers, 16, NULL, NULL, 0);
     /* persistent=0 — parent snapshot contents come from the per-request heap.
      * Cleared explicitly via zealphp_globals_parent_clear() on disable. */
     zend_hash_init(&zealphp_coro_globals_parent, 128, NULL, ZVAL_PTR_DTOR, 0);
-    /* The three *_snapshot tables below capture name SETS (no request-heap
-     * zvals — value is IS_LONG 1 throughout). Keys are zend_string* that
-     * get persistently-dup'd into the bucket arena by the persistent=1
-     * hash. Safe as-is. */
+    /* The three *_snapshot tables below capture name SETS (value is IS_LONG 1
+     * throughout). They are persistent=1 tables, but zend_hash_update() does
+     * NOT duplicate a non-interned key — it stores the caller's (request-heap)
+     * zend_string with an extra ref. That is only sound while the request that
+     * took the snapshot is still running: the OpenSwoole worker's one CLI
+     * request. zealphp_process_state_snapshot() is therefore refused under
+     * per-request SAPIs (zealphp_sapi_allows_worker_state). */
     zend_hash_init(&zealphp_snapshot_files, 256, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_classes, 256, NULL, ZVAL_PTR_DTOR, 1);
     zend_hash_init(&zealphp_snapshot_functions, 256, NULL, ZVAL_PTR_DTOR, 1);
@@ -6111,6 +6479,30 @@ PHP_MINIT_FUNCTION(zealphp)
 
 PHP_MSHUTDOWN_FUNCTION(zealphp)
 {
+    /* Unhook the engine-level entry points that point into this image — but
+     * only the ones still ours (another extension may have chained on top).
+     * A SAPI that keeps libphp mapped across a module reload (an Apache
+     * graceful restart) would otherwise call into an unloaded image. Pointer
+     * writes only; no table is touched (see below). */
+    if (zend_compile_file == zealphp_compile_file_hook && zealphp_original_compile_file) {
+        zend_compile_file = zealphp_original_compile_file;
+    }
+#define ZEALPHP_UNHOOK_OPCODE(op, ours, prev) \
+    if (zend_get_user_opcode_handler(op) == (ours)) zend_set_user_opcode_handler((op), (prev))
+    ZEALPHP_UNHOOK_OPCODE(ZEND_DECLARE_FUNCTION, zealphp_declare_function_handler, zealphp_prev_declare_function);
+    ZEALPHP_UNHOOK_OPCODE(ZEND_DECLARE_CLASS, zealphp_declare_class_handler, zealphp_prev_declare_class);
+    ZEALPHP_UNHOOK_OPCODE(ZEND_DECLARE_CLASS_DELAYED, zealphp_declare_class_delayed_handler, zealphp_prev_declare_class_delayed);
+    ZEALPHP_UNHOOK_OPCODE(ZEND_BIND_STATIC, zealphp_bind_static_handler, zealphp_prev_bind_static);
+#ifdef ZEND_BIND_INIT_STATIC_OR_JMP
+    ZEALPHP_UNHOOK_OPCODE(ZEND_BIND_INIT_STATIC_OR_JMP, zealphp_bind_static_handler, zealphp_prev_bind_init_static);
+#endif
+    ZEALPHP_UNHOOK_OPCODE(ZEND_INCLUDE_OR_EVAL, zealphp_include_eval_handler, zealphp_prev_include_eval);
+#if PHP_VERSION_ID < 80400 && defined(ZEND_EXIT)
+    if (zealphp_exit_opcode_hooked) {
+        ZEALPHP_UNHOOK_OPCODE(ZEND_EXIT, zealphp_exit_opcode_handler, zealphp_orig_exit_opcode_handler);
+    }
+#endif
+#undef ZEALPHP_UNHOOK_OPCODE
     /* Process is exiting — skip ALL cleanup. On PHP 8.5+ the shutdown order
      * changed: CG(function_table) and refcounted objects (Closures stored in
      * zealphp_callbacks) may already be freed by the time MSHUTDOWN runs.
@@ -6718,7 +7110,7 @@ PHP_FUNCTION(zealphp_reset_request_statics_begin)
  * skipped — they point at the parent's live slot, which the parent's own
  * in-place reset restores; the indirect pointer stays valid because the parent
  * table's address is likewise stable. */
-static void zealphp_reset_class_statics_inplace(zend_class_entry *ce)
+static void zealphp_reset_class_statics_inplace(zend_class_entry *ce, HashTable *dead)
 {
     zval *live = CE_STATIC_MEMBERS(ce);
     if (!live) {
@@ -6759,9 +7151,25 @@ static void zealphp_reset_class_statics_inplace(zend_class_entry *ce)
         }
         zval fresh;
         ZVAL_COPY(&fresh, tmpl);   /* default copy (refcount-correct; UNDEF ok) */
+        if (Z_TYPE(fresh) == IS_CONSTANT_AST) {
+            /* Immutable class: its shared template keeps the AST. Evaluate a
+             * COPY (what zend_update_class_constants does for the live table)
+             * — never store the raw AST in the live slot, the engine will not
+             * resolve it again. */
+            if (zval_update_constant_ex(&fresh, ce) != SUCCESS) {
+                zval_ptr_dtor(&fresh);
+                if (EG(exception)) { zend_clear_exception(); }
+                continue;   /* unresolvable — leave the live slot untouched */
+            }
+        }
         zval old = *dst;
         ZVAL_COPY_VALUE(dst, &fresh);
-        zval_ptr_dtor(&old);       /* release prior value (runs object __destruct) */
+        /* Release the prior value (may run an object __destruct) only after
+         * the caller's walk of EG(class_table): a destructor can autoload or
+         * declare a class and grow the table being iterated. */
+        if (Z_REFCOUNTED(old)) {
+            zend_hash_next_index_insert(dead, &old);
+        }
     }
 }
 
@@ -6787,6 +7195,8 @@ PHP_FUNCTION(zealphp_reset_request_class_statics)
 
     zend_string *cname;
     zend_class_entry *ce;
+    HashTable zp_dead;
+    zend_hash_init(&zp_dead, 8, NULL, ZVAL_PTR_DTOR, 0);
     ZEND_HASH_FOREACH_STR_KEY_PTR(EG(class_table), cname, ce) {
         if (cname && ce && ce->type == ZEND_USER_CLASS
             && ce->default_static_members_count > 0
@@ -6797,11 +7207,12 @@ PHP_FUNCTION(zealphp_reset_request_class_statics)
              * so a cached ZEND_FETCH_STATIC_PROP slot (incl. a snapshot function's,
              * which the rtcache reset skips) can't dangle into freed memory. */
             if (ZEND_MAP_PTR(ce->static_members_table) && CE_STATIC_MEMBERS(ce)) {
-                zealphp_reset_class_statics_inplace(ce);
+                zealphp_reset_class_statics_inplace(ce, &zp_dead);
                 count++;
             }
         }
     } ZEND_HASH_FOREACH_END();
+    zend_hash_destroy(&zp_dead);   /* destructors run here, after the walk */
 
     RETURN_LONG(count);
 }
