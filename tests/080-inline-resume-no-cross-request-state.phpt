@@ -63,7 +63,7 @@ Co::run(function () use (&$out) {
 });
 foreach (['bob_inline_user', 'bob_inline_get', 'bob_inline_sess', 'bob_later_user', 'bob_get',
           'alice_get', 'alice_user', 'alice_sess', 'alice_sess_later'] as $k) {
-    echo $k, ': ', var_export($out[$k] ?? 'MISSING', true), "\n";
+    echo $k, ': ', var_export(array_key_exists($k, $out) ? $out[$k] : 'UNSET', true), "\n";
 }
 ?>
 --EXPECT--
