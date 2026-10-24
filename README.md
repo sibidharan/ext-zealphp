@@ -173,6 +173,28 @@ zealphp_reset_request_statics();               // reset function-local static $x
 zealphp_reset_request_class_statics();         // reset class static properties per request (0.3.25)
 ```
 
+#### Child coroutines (`go()`, `App::go`, `App::parallel`) — 0.4.1
+
+By default a child coroutine spawned inside a request **shares that request's
+`$GLOBALS`, class statics and function statics**: its slices run on the
+request's view and park back into the request's lane, so parent and children
+can communicate through global state (last writer per key wins, at slice
+granularity). Use `Store` when you want explicit, safe sharing. Superglobals,
+constants, ini and the process settings keep their existing per-request rules.
+
+```php
+zealphp_child_coroutine_isolation(true);  // opt in: each child gets its own lane,
+                                          // seeded from its creator's view at go()
+```
+
+Set it once at boot. Objects are handles: with isolation on, a child that
+received an object from its parent still shares that object's properties.
+
+No value is ever released inside the scheduler's yield/resume/close callbacks:
+a value whose release could run a destructor is parked and released in a
+coroutine's own context (the next VM interrupt, `zealphp_coroutine_globals_request_end()`,
+`zealphp_superglobals_clear()`, or request shutdown).
+
 ## Design
 
 - **Scheduler-hook isolation**: `dlsym`s OpenSwoole's `PHPCoroutine::on_yield/on_resume/
