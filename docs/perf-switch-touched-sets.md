@@ -223,6 +223,47 @@ rest of the legacy flags (not an official mode) dies under concurrency with
 `assert($app !== null)` at the request closure; `coroutine-legacy` itself,
 which sets every flag, is unaffected.
 
+## Rebased onto 0.4.1 (child lanes, deferred releases)
+
+ext 0.4.1 landed while this branch was open and changed the same functions
+(B1/B6 deferred releases, B3 COW snapshots, F12 child coroutines sharing their
+request's lane). The branch was rebased commit by commit; what the rebase
+had to reconcile:
+
+- **Deferred releases (B1/B6).** Every value the stages displace inside a
+  switch callback goes through `zealphp_release()` (the dead lists use
+  `zealphp_deferred_zval_dtor`), including the touched-key save path and the
+  class/function-static restores that share instead of deep-copying.
+- **Child lanes (F12).** A `go()` child shares its request's lane, but the
+  write hooks run in the child's coroutine. The touched sets are therefore
+  keyed by the LANE's cid: a recording hook resolves child → lane task →
+  lane cid (`zealphp_touch_cid()`), and the save side resolves its lane
+  argument the same way (`zealphp_lane_touch_cid()`), because a lane is
+  parked from other coroutines too (a child parking it, a capture at child
+  start, an inline resumer parking the task it resumed over). A child that
+  writes before its lane ever parked marks the lane "full walk"; the full
+  0.4.1 walks also remain the path for lanes without a cid, for the "unknown
+  key" marker and for capture-only saves. A first attempt gated the fast
+  paths on "any child live in the worker", which disabled them for most of a
+  busy worker's life (the framework keeps short-lived children around) and
+  doubled the switch cost back up; the per-lane form has no such cliff.
+- **One hidden merge bug.** The automatic merge had left a second
+  `zend_hash_index_update(&zealphp_coro_globals_deltas, cid, &delta)` in the
+  full-walk save; updating the same key with the same array releases that
+  array, so every request's lane was empty on resume whenever the full walk
+  ran (tests 057, 092–096 caught it). Removed.
+- **Test 094** now expects the service object's destructor in request 1,
+  where `$_SESSION = []` drops the last reference: the superglobal lane is
+  moved, not shared, so it holds no extra reference and the owner's drop runs
+  the destructor in the owner's coroutine (php-fpm semantics). 0.4.1's
+  shared lane deferred it to the next request.
+
+Gates on the rebased build: ext phpt 109/109 (CI-style, OpenSwoole loaded);
+framework isolation integration 10/10 with every trust-bar primitive `iso`;
+valgrind clean on 055/057/063/095/096 (093 reports an uninitialised read
+inside OpenSwoole's own `coro_interrupt_function`, identical on pristine
+0.4.1).
+
 ## Not done / ideas
 
 - Per-coroutine *symbol table swap* (true O(1) for $GLOBALS without hooks) —

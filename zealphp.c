@@ -178,11 +178,61 @@ static const zend_uchar zealphp_static_prop_write_opcodes[] = {
 /* Record "class `ce` (NULL = unknown) had a static written by the running
  * coroutine". An inherited static lives in the DECLARING class's table (the
  * child slot is IS_INDIRECT), so the ancestors are recorded too. */
+/* ── F12 lanes and the touched sets ───────────────────────────────────
+ * A go() child started inside a request shares that request's LANE: on the
+ * request's yield its writes must be parked together with the request's own.
+ * The write hooks therefore record under the lane's cid, not the child's, so
+ * the request's touched sets stay complete. The lane is a task pointer; its
+ * cid comes from the ptr→cid bridge the lane's first park filled in. A child
+ * writing before its lane ever parked marks the lane "full walk" (the 0.4.1
+ * table walks) until the lane is deleted. Isolated children (opt-in) are
+ * their own lane and record under their own cid. */
+static HashTable zealphp_child_tasks;        /* tentative: defined with the child-lane code */
+static HashTable zealphp_child_lane;         /* child task → request task */
+static HashTable zealphp_coro_cid_task;      /* cid → task ptr */
+static HashTable zealphp_coro_ptr_to_cid;    /* task ptr → cid (filled at first park) */
+static bool      zealphp_child_isolation;    /* tentative: F12 opt-in */
+static HashTable zealphp_lane_force_full;    /* lane task ptr → (empty): touched sets incomplete */
+static bool      zealphp_lane_force_full_live = false;
+static zend_always_inline bool zealphp_children_live(void)
+{
+    return zend_hash_num_elements(&zealphp_child_tasks) > 0;
+}
+static long zealphp_touch_cid(void)
+{
+    if (!os_get_cid) return 0;
+    long cid = os_get_cid();
+    if (cid <= 0 || zealphp_child_isolation || !zealphp_children_live()) return cid;
+    void *task = zend_hash_index_find_ptr(&zealphp_coro_cid_task, (zend_ulong)cid);
+    if (!task || !zend_hash_index_exists(&zealphp_child_tasks, (zend_ulong)(uintptr_t)task)) return cid;
+    void *lane = zend_hash_index_find_ptr(&zealphp_child_lane, (zend_ulong)(uintptr_t)task);
+    if (!lane) return cid;
+    zval *lc = zend_hash_index_find(&zealphp_coro_ptr_to_cid, (zend_ulong)(uintptr_t)lane);
+    if (lc && Z_TYPE_P(lc) == IS_LONG) return Z_LVAL_P(lc);
+    if (zealphp_lane_force_full_live) {
+        zend_hash_index_add_empty_element(&zealphp_lane_force_full, (zend_ulong)(uintptr_t)lane);
+    }
+    return cid;
+}
+static zend_always_inline bool zealphp_lane_full_walk(long lane)
+{
+    return zealphp_lane_force_full_live && zend_hash_index_exists(&zealphp_lane_force_full, (zend_ulong)lane);
+}
+/* The save side runs for a LANE (the cid argument is its task pointer) and may
+ * run from another coroutine's context: a child parking its request's lane, a
+ * capture at child start, an inline resumer parking the resumed-over task. The
+ * touched sets therefore come from the lane's cid, never from os_get_cid().
+ * -1: the lane never parked (no cid yet) → full walk. */
+static zend_always_inline long zealphp_lane_touch_cid(long lane)
+{
+    zval *lc = zend_hash_index_find(&zealphp_coro_ptr_to_cid, (zend_ulong)lane);
+    return (lc && Z_TYPE_P(lc) == IS_LONG) ? Z_LVAL_P(lc) : -1;
+}
 static bool zealphp_cstat_ce_is_shared(zend_class_entry *ce);   /* defined with the class index */
 static void zealphp_cstat_touch(zend_class_entry *ce)
 {
     zealphp_cstat_dirty = true;
-    long cid = (zealphp_cstat_touched_live && os_get_cid) ? os_get_cid() : 0;
+    long cid = zealphp_cstat_touched_live ? zealphp_touch_cid() : 0;
     HashTable *set = NULL;
     if (cid > 0) {
         set = zend_hash_index_find_ptr(&zealphp_cstat_touched, (zend_ulong)cid);
@@ -209,7 +259,7 @@ static void zealphp_cstat_touch(zend_class_entry *ce)
 static zend_always_inline HashTable *zealphp_cstat_touched_set(void)
 {
     if (!zealphp_cstat_touched_live || !os_get_cid) return NULL;
-    long cid = os_get_cid();
+    long cid = zealphp_touch_cid();
     if (cid <= 0) return NULL;
     return zend_hash_index_find_ptr(&zealphp_cstat_touched, (zend_ulong)cid);
 }
@@ -368,7 +418,7 @@ static void zealphp_fn_touch(zend_ulong key, zend_op_array *opa)
         zend_hash_index_update_ptr(&zealphp_fn_dirty, key, opa);
     }
     if (!zealphp_fn_touched_live || !os_get_cid) return;
-    long cid = os_get_cid();
+    long cid = zealphp_touch_cid();
     if (cid <= 0) return;
     HashTable *set = zend_hash_index_find_ptr(&zealphp_fn_touched, (zend_ulong)cid);
     if (!set) {
@@ -466,7 +516,7 @@ static void zealphp_glob_touch(zend_string *key)
     if (zealphp_trace_match(key)) fprintf(stderr, "[ztrace cid=%lld] touch\n", os_get_cid ? (long long) os_get_cid() : -1);
     if (zealphp_glob_dirty_live) zend_hash_add_empty_element(&zealphp_glob_dirty, key);
     if (!zealphp_glob_touched_live || !os_get_cid) return;
-    long cid = os_get_cid();
+    long cid = zealphp_touch_cid();
     if (cid <= 0) return;
     HashTable *set = zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)cid);
     if (!set) {
@@ -479,7 +529,7 @@ static void zealphp_glob_touch(zend_string *key)
 static zend_always_inline HashTable *zealphp_glob_touched_set(void)
 {
     if (!zealphp_glob_touched_live || !os_get_cid) return NULL;
-    long cid = os_get_cid();
+    long cid = zealphp_touch_cid();
     if (cid <= 0) return NULL;
     return zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)cid);
 }
@@ -2355,14 +2405,18 @@ static void zealphp_statics_snapshot_save_ex(long cid, bool repark)
 
     /* perf: only classes whose statics THIS coroutine wrote (the write-opcode
      * hooks record them) can hold a value to carry or re-park. */
-    HashTable *touched = zealphp_cstat_touched_set();
-    if (zealphp_cstat_hooks_wanted && (!touched || zend_hash_num_elements(touched) == 0)) return;
+    long zp_tcid = zealphp_lane_touch_cid(cid);
+    HashTable *touched = (zealphp_cstat_touched_live && zp_tcid > 0)
+        ? zend_hash_index_find_ptr(&zealphp_cstat_touched, (zend_ulong)zp_tcid) : NULL;
+    bool zp_cstat_full = !zealphp_cstat_hooks_wanted || zp_tcid < 0 || zealphp_lane_full_walk(cid)
+        || (touched && zend_hash_index_exists(touched, 0));
+    if (!zp_cstat_full && (!touched || zend_hash_num_elements(touched) == 0)) return;
 
     /* HAZARD-2: the index is built from EG(class_table), never CG — CG may be
      * a coroutine-stack scratch during a compile (see the Stage 3c notes). */
     zealphp_static_classes_refresh();
 
-    if (!zealphp_cstat_hooks_wanted || zend_hash_index_exists(touched, 0)) {
+    if (zp_cstat_full) {
         /* hooks off, or a write to a class we could not resolve: every class. */
         for (uint32_t ci = 0; ci < zealphp_static_classes_n; ci++) {
             zealphp_statics_save_class(&zealphp_static_classes[ci], zp_v2_disabled, &snapshot, &snapshot_init, repark);
@@ -2645,24 +2699,27 @@ static void zealphp_fn_statics_snapshot_save(long cid)
     /* perf: only the functions THIS coroutine ran (BIND_STATIC fired in it).
      * os_get_cid() names the parking coroutine here (on_yield, or the inline
      * resumer in zealphp_inline_park). */
-    HashTable *set = NULL;
-    if (zealphp_fn_touched_live && os_get_cid) {
-        long zp_cid = os_get_cid();
-        if (zp_cid > 0) set = zend_hash_index_find_ptr(&zealphp_fn_touched, (zend_ulong)zp_cid);
-    }
-    if (!set || zend_hash_num_elements(set) == 0) {
+    long zp_tcid = zealphp_lane_touch_cid(cid);
+    HashTable *set = (zealphp_fn_touched_live && zp_tcid > 0)
+        ? zend_hash_index_find_ptr(&zealphp_fn_touched, (zend_ulong)zp_tcid) : NULL;
+    bool zp_fn_full = zp_tcid < 0 || zealphp_lane_full_walk(cid);   /* no cid yet, or a child wrote before it had one */
+    if (!zp_fn_full && (!set || zend_hash_num_elements(set) == 0)) {
         return;   /* nothing of ours to carry; a prior lane (if any) stays as is */
     }
     zval outer;
     array_init(&outer);
-    zend_ulong key;
-    ZEND_HASH_FOREACH_NUM_KEY(set, key) {
-        zend_op_array *opa = zend_hash_index_find_ptr(&zealphp_fn_static_registry, key);
-        if (!opa || !opa->static_variables) continue;
-        HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
-        if (!live || live == opa->static_variables) continue;
-        zealphp_fn_statics_save_cb(opa, live, &outer);
-    } ZEND_HASH_FOREACH_END();
+    if (zp_fn_full) {
+        zealphp_walk_fn_statics_registry(zealphp_fn_statics_save_cb, &outer);
+    } else {
+        zend_ulong key;
+        ZEND_HASH_FOREACH_NUM_KEY(set, key) {
+            zend_op_array *opa = zend_hash_index_find_ptr(&zealphp_fn_static_registry, key);
+            if (!opa || !opa->static_variables) continue;
+            HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+            if (!live || live == opa->static_variables) continue;
+            zealphp_fn_statics_save_cb(opa, live, &outer);
+        } ZEND_HASH_FOREACH_END();
+    }
     if (zend_hash_num_elements(Z_ARRVAL(outer)) > 0) {
         zend_hash_index_update(&zealphp_coro_fn_static_snapshots, (zend_ulong)cid, &outer);
     } else {
@@ -2962,7 +3019,7 @@ static zend_always_inline void zealphp_globals_reset_slot(zend_string *key, zval
         ZVAL_NULL(target);
     }
     if (Z_REFCOUNTED(old)) {
-        if (!*dead_live) { zend_hash_init(dead, 8, NULL, ZVAL_PTR_DTOR, 0); *dead_live = true; }
+        if (!*dead_live) { zend_hash_init(dead, 8, NULL, zealphp_deferred_zval_dtor, 0); *dead_live = true; }
         zend_hash_next_index_insert(dead, &old);
     }
 }
@@ -3326,9 +3383,6 @@ static void zealphp_globals_snapshot_save_ex(long cid, long frame_key, int flags
             zend_hash_index_del(&zealphp_coro_globals_tombstones, (zend_ulong)cid);
         }
     }
-    /* (an untouched coroutine: nothing to carry, nothing to reset) */
-
-    zend_hash_index_update(&zealphp_coro_globals_deltas, (zend_ulong)cid, &delta);
 
     if (zp_ranges != zp_rbuf) efree(zp_ranges);
 
@@ -3396,8 +3450,10 @@ static void zealphp_globals_snapshot_save_touched(long cid, HashTable *touched)
 static void zealphp_globals_snapshot_save(long cid)
 {
     if (!EG(symbol_table).nTableMask) return;
-    if (zealphp_glob_hooks_wanted) {
-        HashTable *touched = zealphp_glob_touched_set();
+    long zp_tcid = zealphp_lane_touch_cid(cid);
+    if (zealphp_glob_hooks_wanted && zp_tcid > 0 && !zealphp_lane_full_walk(cid)) {
+        HashTable *touched = zealphp_glob_touched_live
+            ? zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)zp_tcid) : NULL;
         if (!touched || zend_hash_num_elements(touched) == 0) {
             /* perf: no recorded write since this coroutine started, so the
              * live table is already the parent for every key it could have
@@ -3677,7 +3733,7 @@ static void zealphp_globals_snapshot_restore_ex(long cid, long frame_key)
          * touched set is found through the cid → ptr bridge instead. */
         HashTable *zp_tset = NULL;
         bool zp_canon_none = false;
-        if (zealphp_glob_hooks_wanted && zealphp_glob_touched_live) {
+        if (zealphp_glob_hooks_wanted && zealphp_glob_touched_live && !zealphp_lane_full_walk(cid)) {
             zval *zp_tc = zend_hash_index_find(&zealphp_coro_ptr_to_cid, (zend_ulong)cid);
             if (zp_tc && Z_TYPE_P(zp_tc) == IS_LONG) {
                 zp_tset = zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)Z_LVAL_P(zp_tc));
@@ -3765,6 +3821,7 @@ static void zealphp_globals_snapshot_restore(long cid)
 /* Delete both per-coroutine tables on coroutine close. */
 static void zealphp_globals_snapshot_delete(long cid)
 {
+    if (zealphp_lane_force_full_live) zend_hash_index_del(&zealphp_lane_force_full, (zend_ulong)cid);
     zend_hash_index_del(&zealphp_coro_globals_deltas,     (zend_ulong)cid);
     zend_hash_index_del(&zealphp_coro_globals_tombstones, (zend_ulong)cid);
     /* Releases this coroutine's held refs to its Stage-8 object globals. When
@@ -4413,6 +4470,14 @@ static void zealphp_state_park(void *arg)
      * first-yielder behaviour, all existing phpt semantics preserved). */
     int zp_req_owner_ok = zealphp_process_state_owner_ok();
     zealphp_owner_ok_cached = zp_req_owner_ok;   /* perf: one answer for the whole park */
+    if (os_get_cid) {
+        long zp_pc = os_get_cid();
+        if (zp_pc > 0) {   /* lane → cid bridge for the touched sets (any coroutine, before any stage) */
+            zval zp_zc;
+            ZVAL_LONG(&zp_zc, (zend_long)zp_pc);
+            zend_hash_index_update(&zealphp_coro_ptr_to_cid, (zend_ulong)(uintptr_t)arg, &zp_zc);
+        }
+    }
     /* Record this coroutine as a KNOWN request coroutine (ptr-keyed, for the
      * restore side) when it is strictly claimed — i.e. its cid is in the
      * claim set, not merely passing via the empty-set legacy mode. */
@@ -4446,9 +4511,6 @@ static void zealphp_state_park(void *arg)
          * (snapshot_delete + deferred drain). os_get_cid() is reliable here. */
         if (os_get_cid) {
             zend_hash_index_update_ptr(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid(), arg);
-            zval zp_zc;
-            ZVAL_LONG(&zp_zc, (zend_long)os_get_cid());
-            zend_hash_index_update(&zealphp_coro_ptr_to_cid, (zend_ulong)(uintptr_t)arg, &zp_zc);
         }
     }
     ZP_PROF_BEGIN(ZP_PROF_SETTINGS_SAVE);
@@ -8284,6 +8346,8 @@ PHP_MINIT_FUNCTION(zealphp)
     /* cid→Coroutine* bridge (raw pointers, NULL dtor — the deltas own the zvals). */
     zend_hash_init(&zealphp_coro_cid_to_ptr, 64, NULL, NULL, 0);
     zend_hash_init(&zealphp_coro_ptr_to_cid, 64, NULL, NULL, 0);
+    zend_hash_init(&zealphp_lane_force_full, 64, NULL, NULL, 0);
+    zealphp_lane_force_full_live = true;
     /* Inline-resume bookkeeping (borrowed task pointers, NULL dtor). */
     zend_hash_init(&zealphp_coro_cid_task, 64, NULL, NULL, 0);
     zend_hash_init(&zealphp_inline_resumers, 16, NULL, NULL, 0);

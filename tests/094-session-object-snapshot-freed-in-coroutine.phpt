@@ -29,7 +29,9 @@ Co::run(function () {
         echo "request 1 done\n";
     });
     Co::usleep(5000);
-    go(function () {             // the next request: the release runs here
+    go(function () {             // the next request (the lane holds no extra ref: the
+                                 // owner's `$_SESSION = []` above already ran the destructor,
+                                 // in its own coroutine, exactly as under php-fpm)
         zealphp_superglobals_owner();
         for ($i = 0; $i < 3; $i++) { Co::usleep(500); }
         zealphp_superglobals_clear();
@@ -40,7 +42,7 @@ echo "survived\n";
 ?>
 --EXPECT--
 resumed with svc: yes
-request 1 done
 service closed in: coroutine
+request 1 done
 request 2 done
 survived
