@@ -3961,6 +3961,38 @@ static void zealphp_sg_keys_init(void)
     }
 }
 
+/* perf: the superglobal lane is a fixed struct — one zval per superglobal,
+ * UNDEF = not in the lane — kept per coroutine for its lifetime. A yield moves
+ * the live arrays into it and a resume moves them back; no array allocation,
+ * no hash inserts and no lookups per switch. */
+typedef struct {
+    zval v[8];
+} zealphp_sg_lane;
+static HashTable zealphp_coro_sg_lanes;        /* cid → zealphp_sg_lane* */
+static bool      zealphp_coro_sg_lanes_live = false;
+static void zealphp_sg_lane_dtor(zval *zv)
+{
+    zealphp_sg_lane *l = Z_PTR_P(zv);
+    if (!l) return;
+    for (int i = 0; i < 8; i++) {
+        if (Z_TYPE(l->v[i]) != IS_UNDEF) zealphp_release(&l->v[i]);   /* B1: may run user code → deferred */
+    }
+    efree(l);
+}
+static zealphp_sg_lane *zealphp_sg_lane_get(long cid, bool create)
+{
+    if (!zealphp_coro_sg_lanes_live) {
+        if (!create) return NULL;
+        zend_hash_init(&zealphp_coro_sg_lanes, 256, NULL, zealphp_sg_lane_dtor, 0);
+        zealphp_coro_sg_lanes_live = true;
+    }
+    zealphp_sg_lane *l = zend_hash_index_find_ptr(&zealphp_coro_sg_lanes, (zend_ulong)cid);
+    if (l || !create) return l;
+    l = emalloc(sizeof(zealphp_sg_lane));
+    for (int i = 0; i < 8; i++) ZVAL_UNDEF(&l->v[i]);
+    zend_hash_index_add_new_ptr(&zealphp_coro_sg_lanes, (zend_ulong)cid, l);
+    return l;
+}
 static void zealphp_snapshot_save(long cid)
 {
     /* Guard: EG(symbol_table) may be invalid during coroutine teardown.
@@ -3997,10 +4029,15 @@ static void zealphp_snapshot_save(long cid)
             (sgda && Z_TYPE_P(sgda) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(sgda)) : -1);
     }
 
-    zval snapshot;
-    array_init_size(&snapshot, 8);
+    zealphp_sg_lane *zp_lane = zealphp_sg_lane_get(cid, true);
     for (int zp_si = 0; zp_si < zealphp_sg_keys_n; zp_si++) {
-        const char *const *n = &sg_names[zp_si];
+        zval *zp_slot = &zp_lane->v[zp_si];
+        if (Z_TYPE_P(zp_slot) != IS_UNDEF) {   /* a yield without a resume in between: drop the stale entry */
+            zval zp_stale;
+            ZVAL_COPY_VALUE(&zp_stale, zp_slot);
+            ZVAL_UNDEF(zp_slot);
+            zealphp_release(&zp_stale);
+        }
         zval *sg = zend_hash_find(&EG(symbol_table), zealphp_sg_keys[zp_si]);
         if (!sg) continue;
         /* $_GET et al. may be wrapped in IS_REFERENCE — ZealPHP's
@@ -4017,9 +4054,7 @@ static void zealphp_snapshot_save(long cid)
         if (Z_ARRVAL_P(arr) == (HashTable *)&zend_empty_array) continue;
         if (zp_capture_only) {
             /* Adopted child: inherit a (COW-shared) view, leave the live table. */
-            zval copy;
-            ZVAL_COPY(&copy, arr);
-            zend_hash_add_new(Z_ARRVAL(snapshot), zealphp_sg_keys[zp_si], &copy);   /* interned key: no rehash */
+            ZVAL_COPY(zp_slot, arr);   /* shared, copy-on-write */
             continue;
         }
         /* MOVE the array into the lane (O(1), no copy) and park the live slot
@@ -4029,10 +4064,8 @@ static void zealphp_snapshot_save(long cid)
          * zval address and reference wrapper (CV-cache / $g alias safe). The
          * owner's array comes back untouched on resume — refcount unchanged,
          * so its first write after the resume separates nothing. */
-        zval moved;
-        ZVAL_COPY_VALUE(&moved, arr);
+        ZVAL_COPY_VALUE(zp_slot, arr);   /* MOVE: the owner keeps its refcount */
         ZVAL_EMPTY_ARRAY(arr);
-        zend_hash_add_new(Z_ARRVAL(snapshot), zealphp_sg_keys[zp_si], &moved);   /* interned key: no rehash */
         /* Keep PG(http_globals) (the auto-global JIT source) in step. */
         int zp_idx = zealphp_sg_track_idx[zp_si];
         if (zp_idx >= 0) {
@@ -4042,7 +4075,6 @@ static void zealphp_snapshot_save(long cid)
             ZVAL_EMPTY_ARRAY(&PG(http_globals)[zp_idx]);
         }
     }
-    zend_hash_index_update(&zealphp_coro_snapshots, (zend_ulong)cid, &snapshot);
 
     /* Record which cid owns this snapshot (restore can't ask os_get_cid —
      * there it names the resumer: -1 for the event loop, the pusher for an
@@ -4074,16 +4106,16 @@ static zend_always_inline bool zealphp_sg_live_needs_clear(zend_string *key)
 }
 static void zealphp_snapshot_restore(long cid)
 {
-    zval *snapshot = zend_hash_index_find(&zealphp_coro_snapshots, (zend_ulong)cid);
-    if (!snapshot || Z_TYPE_P(snapshot) != IS_ARRAY) {
+    zealphp_sg_lane *zp_lane = zealphp_sg_lane_get(cid, false);
+    if (!zp_lane) {
         if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] restore NOSNAP key=%ld owner=%ld\n", cid, zealphp_sg_owner_cid);
         return;
     }
     if (zealphp_sg_dbg()) {
-        zval *sv = zend_hash_str_find(Z_ARRVAL_P(snapshot), "_SESSION", sizeof("_SESSION")-1);
+        zval *sv = &zp_lane->v[6];   /* _SESSION */
         fprintf(stderr, "[SGDBG] restore key=%ld owner_before=%ld snap_sess_n=%d\n",
             cid, zealphp_sg_owner_cid,
-            (sv && Z_TYPE_P(sv) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(sv)) : -1);
+            (Z_TYPE_P(sv) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(sv)) : -1);
     }
 
     /* Restore gate (#32 → reworked for #40): the original single-owner
@@ -4117,8 +4149,8 @@ static void zealphp_snapshot_restore(long cid)
     zealphp_sg_keys_init();
     for (int zp_si = 0; zp_si < zealphp_sg_keys_n; zp_si++) {
         const char *const *n = &sg_names[zp_si];
-        zval *val = zend_hash_find(Z_ARRVAL_P(snapshot), zealphp_sg_keys[zp_si]);
-        if (val) {
+        zval *val = &zp_lane->v[zp_si];
+        if (Z_TYPE_P(val) != IS_UNDEF) {
             /* MOVE the lane's array back into the live slot (O(1)): the slot
              * keeps its zval address (CV cache compatible) and the array keeps
              * its refcount — the owner writes to it with no COW separation. The
@@ -4134,7 +4166,7 @@ static void zealphp_snapshot_restore(long cid)
                 zval old;
                 ZVAL_COPY_VALUE(&old, slot);
                 ZVAL_COPY_VALUE(slot, val);
-                ZVAL_NULL(val);
+                ZVAL_UNDEF(val);         /* moved out of the lane */
                 zealphp_release(&old);   /* B1: may be a non-owner's last object ref */
                 /* PG(http_globals) is left at the empty array the save parked
                  * there: sharing the owner's array into it would raise its
@@ -4144,7 +4176,7 @@ static void zealphp_snapshot_restore(long cid)
             } else {
                 zval copy;
                 ZVAL_COPY_VALUE(&copy, val);
-                ZVAL_NULL(val);
+                ZVAL_UNDEF(val);         /* moved out of the lane */
                 zend_hash_add_new(&EG(symbol_table), zealphp_sg_keys[zp_si], &copy);
             }
         } else if (zealphp_sg_live_needs_clear(zealphp_sg_keys[zp_si])) {
@@ -4899,6 +4931,7 @@ static void zealphp_on_close_body(void *arg)
         }
     }
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
+    if (zealphp_coro_sg_lanes_live) zend_hash_index_del(&zealphp_coro_sg_lanes, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_sg_owner_cids, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_request_coro_ptrs, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -5964,6 +5997,7 @@ PHP_FUNCTION(zealphp_coroutine_superglobals)
     if (!enable) {
         zealphp_coro_hooks_active = false;
         zend_hash_clean(&zealphp_coro_snapshots);
+        if (zealphp_coro_sg_lanes_live) zend_hash_clean(&zealphp_coro_sg_lanes);
         RETURN_TRUE;
     }
 
