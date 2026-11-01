@@ -298,6 +298,50 @@ so an app can see which of its writes the switch carries. For a framework
 request they are all empty: the remaining per-stage cost is probes and the
 profiler's own timers, not work.
 
+## Complexity (measured 2026-11-01)
+
+Per switch the path is **O(1) in app size and O(K) in the state the request
+has written so far** (K = globals written + classes whose statics were written
++ functions whose `static` ran). Measured in the Docker bench
+(`lab/bench/touched.php`, profiler on, 2000 yields per sample, averages in ns):
+
+| written | K=0 | K=10 | K=100 | K=1000 | K=5000 |
+|---|---|---|---|---|---|
+| globals: park / unpark | 282 / 273 | 610 / 532 | 3374 / 2855 | 29970 / 22370 | 150286 / 114747 |
+| class statics: park / unpark | 285 / 281 | 562 / 358 | 3118 / 1087 | 32867 / 11322 | 183144 / 64238 |
+| function statics: park / unpark | 281 / 269 | 557 / 304 | 2927 / 616 | 36911 / 14038 | 316455 / 114506 |
+
+So roughly 30 ns per written global and 33–37 ns per written class or
+function on park, half to a third of that on unpark, and the per-request
+cleanup is O(K) once (18 µs for 1000 globals; 400 µs for 5000 functions).
+The K=0 constant is almost entirely the profiler's own `clock_gettime`
+pairs (each idle stage shows the same 17 ns); with the profiler off the
+whole legacy overhead on `/yield/20` is under 0.4 µs per switch.
+
+Why the O(K) term is structural, not an implementation choice: every value a
+request wrote sits in a table the VM reads *directly* (symbol table buckets,
+`CE_STATIC_MEMBERS` slots, `static_variables_ptr` arrays), and PHP has no read
+barrier on those paths, so a peer would see the leftover value unless it is
+moved out before the peer runs. Moving K values is O(K). The two ways to make a
+switch O(1) both change where the cost lands:
+
+1. **Swap the containers by pointer** (per-coroutine `CG(map_ptr_base)`,
+   per-coroutine symbol table header). The map_ptr base couples the static
+   tables with every function's run-time cache, which caches raw `zval*` into
+   those tables; the per-coroutine swap was prototyped and crashed under
+   interleaving (`perf-o1-baseswap-research.md`, §6f). Making it safe needs an
+   engine change (a separate base for statics, or self-healing rtcache
+   slots), not an extension change.
+2. **Read barriers** (user opcode handlers on the static-property fetch
+   opcodes and on `$GLOBALS`/`global` reads, JIT off for them) so leftovers
+   are swapped on first access by a different coroutine. That is O(1) per
+   switch but adds ~20–40 ns to every static read, which costs more than the
+   switch for any request with fewer than a few thousand written items.
+
+For the apps legacy mode exists for (a few hundred globals, a few dozen static
+classes, 5–20 yields per request) the O(K) term is 50–200 µs per request
+against request times of tens of milliseconds, i.e. under 1 %.
+
 ## Not done / ideas
 
 - Per-coroutine *symbol table swap* (true O(1) for $GLOBALS without hooks) —
