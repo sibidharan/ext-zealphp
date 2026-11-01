@@ -146,6 +146,237 @@ static bool zealphp_lasterr_isolation_active = false;
 /* Per-coroutine static property snapshots: coro_id → HashTable(class_name → zval[]) */
 static HashTable zealphp_coro_static_snapshots;
 
+/* ── perf: static-property WRITE hooks ────────────────────────────────
+ *
+ * The S5b save compared every class's static slots to its baseline on every
+ * yield, O(classes-with-statics), even for a coroutine that never wrote a
+ * static. The write opcodes (ASSIGN_STATIC_PROP*, *INC/DEC_STATIC_PROP,
+ * FETCH_STATIC_PROP_W/RW/FUNC_ARG/UNSET, UNSET_STATIC_PROP) are hooked to flag
+ * the writing coroutine; a coroutine without the flag skips the save entirely,
+ * and a request-end reset runs only when some write happened since the last
+ * one. Writes that bypass the VM (ReflectionProperty::setValue on a static,
+ * zend_update_static_property from C) are not seen; they stay process-wide
+ * until the next VM write marks the state dirty. */
+static HashTable zealphp_cstat_touched;       /* cid → HashTable* of (uintptr_t)ce keys; key 0 = "unknown class, treat all" */
+static bool      zealphp_cstat_touched_live = false;
+static HashTable zealphp_cstat_dirty_set;     /* (uintptr_t)ce → (empty): written since the last request-end reset; key 0 = all */
+static bool      zealphp_cstat_dirty_live = false;
+static bool      zealphp_cstat_dirty = true;  /* some static was written since the last reset */
+static bool      zealphp_cstat_hooks_wanted = false;
+static void zealphp_cstat_touched_dtor(zval *zv)
+{
+    HashTable *ht = Z_PTR_P(zv);
+    if (ht) { zend_hash_destroy(ht); efree(ht); }
+}
+static int (*zealphp_prev_static_prop_handlers[256])(zend_execute_data *);
+static const zend_uchar zealphp_static_prop_write_opcodes[] = {
+    ZEND_ASSIGN_STATIC_PROP, ZEND_ASSIGN_STATIC_PROP_OP, ZEND_ASSIGN_STATIC_PROP_REF,
+    ZEND_PRE_INC_STATIC_PROP, ZEND_PRE_DEC_STATIC_PROP, ZEND_POST_INC_STATIC_PROP, ZEND_POST_DEC_STATIC_PROP,
+    ZEND_FETCH_STATIC_PROP_W, ZEND_FETCH_STATIC_PROP_RW, ZEND_FETCH_STATIC_PROP_FUNC_ARG,
+    ZEND_FETCH_STATIC_PROP_UNSET, ZEND_UNSET_STATIC_PROP, 0
+};
+/* Record "class `ce` (NULL = unknown) had a static written by the running
+ * coroutine". An inherited static lives in the DECLARING class's table (the
+ * child slot is IS_INDIRECT), so the ancestors are recorded too. */
+/* ── F12 lanes and the touched sets ───────────────────────────────────
+ * A go() child started inside a request shares that request's LANE: on the
+ * request's yield its writes must be parked together with the request's own.
+ * The write hooks therefore record under the lane's cid, not the child's, so
+ * the request's touched sets stay complete. The lane is a task pointer; its
+ * cid comes from the ptr→cid bridge the lane's first park filled in. A child
+ * writing before its lane ever parked marks the lane "full walk" (the 0.4.1
+ * table walks) until the lane is deleted. Isolated children (opt-in) are
+ * their own lane and record under their own cid. */
+static HashTable zealphp_child_tasks;        /* tentative: defined with the child-lane code */
+static HashTable zealphp_child_lane;         /* child task → request task */
+static HashTable zealphp_coro_cid_task;      /* cid → task ptr */
+static HashTable zealphp_coro_ptr_to_cid;    /* task ptr → cid (filled at first park) */
+static bool      zealphp_child_isolation;    /* tentative: F12 opt-in */
+static HashTable zealphp_lane_force_full;    /* lane task ptr → (empty): touched sets incomplete */
+static bool      zealphp_lane_force_full_live = false;
+static zend_always_inline bool zealphp_children_live(void)
+{
+    return zend_hash_num_elements(&zealphp_child_tasks) > 0;
+}
+static long zealphp_touch_cid(void)
+{
+    if (!os_get_cid) return 0;
+    long cid = os_get_cid();
+    if (cid <= 0 || zealphp_child_isolation || !zealphp_children_live()) return cid;
+    void *task = zend_hash_index_find_ptr(&zealphp_coro_cid_task, (zend_ulong)cid);
+    if (!task || !zend_hash_index_exists(&zealphp_child_tasks, (zend_ulong)(uintptr_t)task)) return cid;
+    void *lane = zend_hash_index_find_ptr(&zealphp_child_lane, (zend_ulong)(uintptr_t)task);
+    if (!lane) return cid;
+    zval *lc = zend_hash_index_find(&zealphp_coro_ptr_to_cid, (zend_ulong)(uintptr_t)lane);
+    if (lc && Z_TYPE_P(lc) == IS_LONG) return Z_LVAL_P(lc);
+    if (zealphp_lane_force_full_live) {
+        zend_hash_index_add_empty_element(&zealphp_lane_force_full, (zend_ulong)(uintptr_t)lane);
+    }
+    return cid;
+}
+static zend_always_inline bool zealphp_lane_full_walk(long lane)
+{
+    return zealphp_lane_force_full_live && zend_hash_index_exists(&zealphp_lane_force_full, (zend_ulong)lane);
+}
+/* The save side runs for a LANE (the cid argument is its task pointer) and may
+ * run from another coroutine's context: a child parking its request's lane, a
+ * capture at child start, an inline resumer parking the resumed-over task. The
+ * touched sets therefore come from the lane's cid, never from os_get_cid().
+ * -1: the lane never parked (no cid yet) → full walk. */
+static zend_always_inline long zealphp_lane_touch_cid(long lane)
+{
+    zval *lc = zend_hash_index_find(&zealphp_coro_ptr_to_cid, (zend_ulong)lane);
+    return (lc && Z_TYPE_P(lc) == IS_LONG) ? Z_LVAL_P(lc) : -1;
+}
+static bool zealphp_cstat_ce_is_shared(zend_class_entry *ce);   /* defined with the class index */
+static void zealphp_cstat_touch(zend_class_entry *ce)
+{
+    zealphp_cstat_dirty = true;
+    long cid = zealphp_cstat_touched_live ? zealphp_touch_cid() : 0;
+    HashTable *set = NULL;
+    if (cid > 0) {
+        set = zend_hash_index_find_ptr(&zealphp_cstat_touched, (zend_ulong)cid);
+        if (!set) {
+            set = emalloc(sizeof(HashTable));
+            zend_hash_init(set, 8, NULL, NULL, 0);
+            zend_hash_index_add_new_ptr(&zealphp_cstat_touched, (zend_ulong)cid, set);
+        }
+    }
+    if (!ce) {
+        if (set) zend_hash_index_add_empty_element(set, 0);
+        if (zealphp_cstat_dirty_live) zend_hash_index_add_empty_element(&zealphp_cstat_dirty_set, 0);
+        return;
+    }
+    for (zend_class_entry *c = ce; c; c = c->parent) {
+        if (c->type != ZEND_USER_CLASS || c->default_static_members_count == 0) continue;
+        if (zealphp_cstat_ce_is_shared(c)) continue;   /* process-shared by prefix: never isolated, never reset */
+        if (set) zend_hash_index_add_empty_element(set, (zend_ulong)(uintptr_t)c);
+        if (zealphp_cstat_dirty_live) zend_hash_index_add_empty_element(&zealphp_cstat_dirty_set, (zend_ulong)(uintptr_t)c);
+    }
+}
+/* The per-coroutine set of classes with statics written in the CURRENT
+ * coroutine (NULL = none). */
+static zend_always_inline HashTable *zealphp_cstat_touched_set(void)
+{
+    if (!zealphp_cstat_touched_live || !os_get_cid) return NULL;
+    long cid = zealphp_touch_cid();
+    if (cid <= 0) return NULL;
+    return zend_hash_index_find_ptr(&zealphp_cstat_touched, (zend_ulong)cid);
+}
+/* Resolve the class a static-property opcode addresses, without autoloading
+ * (the cache slot when warm; the scope for self/parent/static; a name or
+ * class-entry operand otherwise). NULL = unknown → the save treats every class. */
+static zend_class_entry *zealphp_static_prop_opline_ce(zend_execute_data *execute_data)
+{
+    const zend_op *opline = EX(opline);
+    uint32_t slot = opline->extended_value;
+    if (opline->opcode == ZEND_FETCH_STATIC_PROP_W || opline->opcode == ZEND_FETCH_STATIC_PROP_RW
+        || opline->opcode == ZEND_FETCH_STATIC_PROP_FUNC_ARG || opline->opcode == ZEND_FETCH_STATIC_PROP_UNSET) {
+        slot &= ~ZEND_FETCH_OBJ_FLAGS;
+    }
+    if (opline->op2_type == IS_CONST) {
+        void **rtc = EX(run_time_cache);
+        if (rtc && EX(func) && (size_t)slot + sizeof(void *) <= (size_t)EX(func)->op_array.cache_size) {
+            zend_class_entry *ce = (zend_class_entry *)rtc[slot / sizeof(void *)];
+            if (ce) return ce;
+        }
+        zval *name = RT_CONSTANT(opline, opline->op2);
+        if (Z_TYPE_P(name) == IS_STRING && Z_TYPE_P(name + 1) == IS_STRING) {
+            return zend_hash_find_ptr(EG(class_table), Z_STR_P(name + 1));   /* lc name literal */
+        }
+        return NULL;
+    }
+    if (opline->op2_type == IS_UNUSED) {
+        switch (opline->op2.num & ZEND_FETCH_CLASS_MASK) {
+            case ZEND_FETCH_CLASS_SELF:   return EX(func) ? EX(func)->common.scope : NULL;
+            case ZEND_FETCH_CLASS_PARENT: return (EX(func) && EX(func)->common.scope) ? EX(func)->common.scope->parent : NULL;
+            case ZEND_FETCH_CLASS_STATIC: return zend_get_called_scope(execute_data);
+            default: return NULL;
+        }
+    }
+    zval *op = EX_VAR(opline->op2.var);
+    ZVAL_DEREF(op);
+    if (Z_TYPE_P(op) == IS_PTR)    return Z_CE_P(op);
+    if (Z_TYPE_P(op) == IS_OBJECT) return Z_OBJCE_P(op);
+    if (Z_TYPE_P(op) == IS_STRING) return zend_lookup_class_ex(Z_STR_P(op), NULL, ZEND_FETCH_CLASS_NO_AUTOLOAD);
+    return NULL;
+}
+static int zealphp_static_prop_write_handler(zend_execute_data *execute_data)
+{
+    if (zealphp_cstat_hooks_wanted) {
+        zealphp_cstat_touch(zealphp_static_prop_opline_ce(execute_data));
+    }
+    int (*prev)(zend_execute_data *) = zealphp_prev_static_prop_handlers[EX(opline)->opcode];
+    return prev ? prev(execute_data) : ZEND_USER_OPCODE_DISPATCH;
+}
+
+/* ── perf: class-with-statics index + boot-class baselines ───────────────
+ *
+ * The S5b save used to walk EVERY entry of EG(class_table) on every yield
+ * (internal classes, vendor classes, a snapshot_classes hash probe per user
+ * class) and, for BOOT classes, deep-copied every scalar/array static twice
+ * per switch (save + restore) whether or not anything had changed — the
+ * framework's own App::$routes-sized arrays, so ~30 µs per switch on an app
+ * with zero user classes. Two fixes:
+ *
+ *  1. An INDEX of user classes that have static members, with their boot flag
+ *     precomputed. Rebuilt only when EG(class_table) changes size, a deletion
+ *     bumps zealphp_symtab_gen, or the boot snapshot is (re)taken. The per-yield
+ *     walk is then O(classes-with-statics), not O(all classes), and probes no
+ *     hash.
+ *  2. A per-boot-class BASELINE: the value of each isolatable static slot the
+ *     first time the save sees the class (post-boot, warm). The baseline holds
+ *     a shared reference, so any later in-place write to that array/string
+ *     COW-separates it and the slot's payload pointer changes; a slot is then
+ *     snapshotted (and restored on resume, as before) ONLY when it differs from
+ *     the baseline. An unchanged boot static costs a type/pointer compare.
+ *     Semantics: unchanged boot statics stay process-shared (they already were
+ *     — the old restore wrote the same value back); a boot static one request
+ *     mutated is still carried in that request's lane exactly as before. */
+typedef struct {
+    zend_class_entry *ce;
+    zend_string      *name;   /* EG(class_table) key — borrowed; the index is rebuilt before any deletion can dangle it */
+    bool              boot;
+    bool              shared; /* name matches zealphp_shared_static_classes(): process-wide, never isolated */
+} zealphp_static_class_ref;
+/* Lower-cased class-name prefixes whose statics are PROCESS-WIDE by design
+ * (the framework registers its own namespace: its request state lives in
+ * RequestContext, its statics are per-worker caches / tables that concurrent
+ * requests share — e.g. the pipelining turnstile — and must never be carried
+ * per coroutine or reset). zend_string list, persistent. */
+static zend_string **zealphp_shared_static_prefixes = NULL;
+static uint32_t zealphp_shared_static_prefixes_n = 0;
+/* Boot-class baselines are captured at the END of boot — the first request
+ * claim (zealphp_request_input_set / zealphp_superglobals_owner), before any
+ * request code runs — so they hold the warm boot values, not a request's. */
+static bool zealphp_boot_baselines_done = false;
+static zealphp_static_class_ref *zealphp_static_classes = NULL;
+static HashTable zealphp_static_classes_by_ce;   /* (uintptr_t)ce → position + 1 */
+static bool      zealphp_static_classes_by_ce_live = false;
+static uint32_t zealphp_static_classes_n = 0;
+static uint32_t zealphp_static_classes_cap = 0;
+static uint32_t zealphp_static_classes_tbl_n = (uint32_t)-1;
+static uint32_t zealphp_static_classes_gen = (uint32_t)-1;
+static bool     zealphp_static_classes_snap = false;
+/* Bumped whenever the ext removes entries from the function/class tables
+ * (zealphp_process_state_clean) so pointer-holding caches rebuild. */
+static uint32_t zealphp_symtab_gen = 0;
+/* (uintptr_t)ce → zealphp_boot_baseline* */
+static HashTable zealphp_boot_static_baseline;
+typedef struct {
+    uint32_t n;
+    zval     v[1];   /* n entries; IS_UNDEF = slot not tracked (inherited / object / resource) */
+} zealphp_boot_baseline;
+static void zealphp_boot_baseline_dtor(zval *zv)
+{
+    zealphp_boot_baseline *b = Z_PTR_P(zv);
+    if (!b) return;
+    for (uint32_t i = 0; i < b->n; i++) {
+        if (Z_TYPE(b->v[i]) != IS_UNDEF) zval_ptr_dtor(&b->v[i]);
+    }
+    efree(b);
+}
+
 /* Per-coroutine FUNCTION-local static snapshots: coro_id → HashTable(
  * (zend_ulong) op_array->static_variables [template ptr, stable & unique per
  * function/method with statics] → HashTable(var_name → zval value) ).
@@ -164,6 +395,39 @@ static bool zealphp_fn_statics_active = false;
  * heap lifetime and would dangle. This is exactly the population the full-table
  * walk covers, so it's semantic parity. */
 static HashTable zealphp_fn_static_registry;
+/* perf: which static-using functions each coroutine actually RAN (cid →
+ * HashTable of template-ptr keys), filled by the BIND_STATIC hook. The
+ * per-yield save/restore walks only this set — O(touched) — instead of the
+ * whole registry. A function this coroutine never called has no per-coroutine
+ * value to carry. Entries drop at coroutine close. */
+static HashTable zealphp_fn_touched;          /* cid → HashTable* (keys = template ptrs) */
+static bool      zealphp_fn_touched_live = false;
+/* perf: functions whose live static table may differ from the template since
+ * the last request-end reset (any coroutine bound or restored them). The
+ * request-begin refresh and request-end reset walk only this set. */
+static HashTable zealphp_fn_dirty;            /* template ptr → zend_op_array* */
+static bool      zealphp_fn_dirty_live = false;
+static void zealphp_fn_touched_dtor(zval *zv)
+{
+    HashTable *ht = Z_PTR_P(zv);
+    if (ht) { zend_hash_destroy(ht); efree(ht); }
+}
+static void zealphp_fn_touch(zend_ulong key, zend_op_array *opa)
+{
+    if (zealphp_fn_dirty_live) {
+        zend_hash_index_update_ptr(&zealphp_fn_dirty, key, opa);
+    }
+    if (!zealphp_fn_touched_live || !os_get_cid) return;
+    long cid = zealphp_touch_cid();
+    if (cid <= 0) return;
+    HashTable *set = zend_hash_index_find_ptr(&zealphp_fn_touched, (zend_ulong)cid);
+    if (!set) {
+        set = emalloc(sizeof(HashTable));
+        zend_hash_init(set, 8, NULL, NULL, 0);
+        zend_hash_index_add_new_ptr(&zealphp_fn_touched, (zend_ulong)cid, set);
+    }
+    zend_hash_index_add_empty_element(set, key);
+}
 typedef int (*zealphp_user_opcode_t)(zend_execute_data *);
 static zealphp_user_opcode_t zealphp_prev_bind_static = NULL;
 /* PHP 8.4 emits ZEND_BIND_INIT_STATIC_OR_JMP (203) for an INITIALIZED static
@@ -214,6 +478,114 @@ static zend_always_inline int zealphp_chain_or_dispatch(
  *   - On resume: reset EG → parent, apply delta overrides, delete tombstones.
  *
  * Memory: parent (1×) + N × O(delta_keys) instead of N × O(all_keys). */
+/* ── perf: global-variable WRITE tracking ─────────────────────────────
+ *
+ * The S2 save walked the whole EG(symbol_table) on every yield (and the reset
+ * walked it again) — O(globals) per switch, 35 µs at 2000 globals. The only
+ * VM paths that write a global are: `global $x` (ZEND_BIND_GLOBAL), the
+ * write-context fetches of `$GLOBALS['x']` / `$$name`-in-global-scope
+ * (ZEND_FETCH_W / RW / FUNC_ARG / UNSET with the GLOBAL fetch type, or the
+ * LOCAL type on a frame attached to EG(symbol_table)), unset() of those
+ * (ZEND_UNSET_VAR), and the CVs of a Stage-8 global-scope frame (recorded
+ * when zealphp_require_global() opens the frame). Each records the key for
+ * the running coroutine (and in a process-wide dirty set); the save and the
+ * resets then visit only those keys. A write whose key cannot be read (a
+ * non-string dynamic name) records the ALL marker → full walk for that
+ * coroutine. extract() into a global-scope frame is hooked too. */
+static HashTable zealphp_glob_touched;        /* cid → HashTable* (string keys) */
+static bool      zealphp_glob_touched_live = false;
+static HashTable zealphp_glob_dirty;          /* string keys possibly != parent since the last full reset */
+static bool      zealphp_glob_dirty_live = false;
+static bool      zealphp_glob_hooks_wanted = false;
+static zend_string *zealphp_glob_all_key = NULL;   /* marker: "every key" */
+static int (*zealphp_prev_glob_handlers[256])(zend_execute_data *);
+static const zend_uchar zealphp_glob_write_opcodes[] = {
+    ZEND_BIND_GLOBAL, ZEND_FETCH_W, ZEND_FETCH_RW, ZEND_FETCH_FUNC_ARG, ZEND_FETCH_UNSET, ZEND_UNSET_VAR, 0
+};
+static void zealphp_glob_touched_dtor(zval *zv)
+{
+    HashTable *ht = Z_PTR_P(zv);
+    if (ht) { zend_hash_destroy(ht); efree(ht); }
+}
+static zend_always_inline bool zealphp_trace_match(zend_string *key);
+static bool zealphp_globals_is_superglobal_key(const char *key, size_t len);
+static void zealphp_glob_touch(zend_string *key)
+{
+    if (!key) key = zealphp_glob_all_key;
+    else if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) return;   /* perf: S1 owns these */
+    if (zealphp_trace_match(key)) fprintf(stderr, "[ztrace cid=%lld] touch\n", os_get_cid ? (long long) os_get_cid() : -1);
+    if (zealphp_glob_dirty_live) zend_hash_add_empty_element(&zealphp_glob_dirty, key);
+    if (!zealphp_glob_touched_live || !os_get_cid) return;
+    long cid = zealphp_touch_cid();
+    if (cid <= 0) return;
+    HashTable *set = zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)cid);
+    if (!set) {
+        set = emalloc(sizeof(HashTable));
+        zend_hash_init(set, 8, NULL, NULL, 0);
+        zend_hash_index_add_new_ptr(&zealphp_glob_touched, (zend_ulong)cid, set);
+    }
+    zend_hash_add_empty_element(set, key);
+}
+static zend_always_inline HashTable *zealphp_glob_touched_set(void)
+{
+    if (!zealphp_glob_touched_live || !os_get_cid) return NULL;
+    long cid = zealphp_touch_cid();
+    if (cid <= 0) return NULL;
+    return zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)cid);
+}
+static int zealphp_glob_write_handler(zend_execute_data *execute_data)
+{
+    if (zealphp_glob_hooks_wanted) {
+        const zend_op *opline = EX(opline);
+        if (opline->opcode == ZEND_BIND_GLOBAL) {
+            /* ZEND_BIND_GLOBAL is a REPEATABLE opcode: the engine's handler
+             * loops over the consecutive BIND_GLOBALs of one `global $a, $b;`
+             * statement internally (ZEND_VM_REPEAT_OPCODE), so this hook runs
+             * once per statement, not once per name. Record the whole run. */
+            const zend_op *zp_op = opline;
+            do {
+                zval *name = RT_CONSTANT(zp_op, zp_op->op2);
+                zealphp_glob_touch(Z_TYPE_P(name) == IS_STRING ? Z_STR_P(name) : NULL);
+                zp_op++;
+            } while (zp_op->opcode == ZEND_BIND_GLOBAL);
+        } else {
+            uint32_t ftype = opline->extended_value & ZEND_FETCH_TYPE_MASK;
+            bool is_global = (ftype == ZEND_FETCH_GLOBAL || ftype == ZEND_FETCH_GLOBAL_LOCK)
+                || (ftype == ZEND_FETCH_LOCAL
+                    && (ZEND_CALL_INFO(execute_data) & ZEND_CALL_HAS_SYMBOL_TABLE)
+                    && EX(symbol_table) == &EG(symbol_table));
+            if (is_global) {
+                zend_string *k = NULL;
+                if (opline->op1_type == IS_CONST) {
+                    zval *n = RT_CONSTANT(opline, opline->op1);
+                    if (Z_TYPE_P(n) == IS_STRING) k = Z_STR_P(n);
+                } else {
+                    zval *n = EX_VAR(opline->op1.var);
+                    ZVAL_DEREF(n);
+                    if (Z_TYPE_P(n) == IS_STRING) k = Z_STR_P(n);
+                }
+                zealphp_glob_touch(k);
+            }
+        }
+    }
+    int (*prev)(zend_execute_data *) = zealphp_prev_glob_handlers[EX(opline)->opcode];
+    return prev ? prev(execute_data) : ZEND_USER_OPCODE_DISPATCH;
+}
+/* extract() writes dynamic names straight into the caller's symbol table. */
+static zif_handler zealphp_orig_extract = NULL;
+static ZEND_NAMED_FUNCTION(zealphp_hook_extract)
+{
+    if (zealphp_glob_hooks_wanted) {
+        zend_execute_data *caller = EX(prev_execute_data);
+        if (caller && caller->func && ZEND_USER_CODE(caller->func->type)
+            && (ZEND_CALL_INFO(caller) & ZEND_CALL_HAS_SYMBOL_TABLE)
+            && caller->symbol_table == &EG(symbol_table)) {
+            zealphp_glob_touch(NULL);   /* unknown names → every key */
+        }
+    }
+    zealphp_orig_extract(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
 static HashTable zealphp_coro_globals_deltas;      /* coro-ptr → zval-array (live overrides) */
 static HashTable zealphp_coro_globals_tombstones;  /* coro-ptr → zval-array (set of deleted keys) */
 static bool zealphp_coro_globals_hooks_active = false;
@@ -244,6 +616,7 @@ static HashTable zealphp_coro_indirect_objs;
  * request-end drain (zealphp_coroutine_globals_request_end) find and free THIS
  * coroutine's pointer-keyed delta so object globals destruct in-coroutine. */
 static HashTable zealphp_coro_cid_to_ptr;
+static HashTable zealphp_coro_ptr_to_cid;   /* perf: the reverse bridge (task ptr → cid) for the resume side */
 
 /* Shared parent snapshot. */
 static HashTable zealphp_coro_globals_parent;
@@ -1096,14 +1469,190 @@ static HashTable zealphp_request_coro_ptrs;
  * skipping children; only the superglobal lane adopts. Entries are removed
  * at coroutine close. */
 static HashTable zealphp_adopted_coro_cids;
+/* perf: the owner test is pure per coroutine, and a park asks it ~10 times
+ * (once per process-setting stage). zealphp_state_park computes it once and
+ * publishes the answer here for the duration of the park (-1 = not cached). */
+static int zealphp_owner_ok_cached = -1;
 static int zealphp_process_state_owner_ok(void)
 {
+    if (zealphp_owner_ok_cached >= 0) return zealphp_owner_ok_cached;
     if (zend_hash_num_elements(&zealphp_request_coro_cids) == 0) return 1;
     if (!os_get_cid) return 1;
     long cur = os_get_cid();
     if (cur <= 0) return 1;   /* unknown context — fail open (legacy) */
     return zend_hash_index_exists(&zealphp_request_coro_cids, (zend_ulong)cur) ? 1 : 0;
 }
+
+/* ── perf: process-setting SETTER hooks ──────────────────────────────
+ *
+ * Every yield used to ask the process for its cwd, locale, umask, timezone,
+ * mb encoding and libxml flag (three of those are PHP-function calls) to see
+ * whether the coroutine had moved them off the baseline. The only ways to
+ * move them are the six PHP functions below, so their internal handlers are
+ * wrapped to record the CALLING coroutine's cid in a touched-set. A save for
+ * a coroutine that never called a setter and holds no lane is a hash probe;
+ * the full getter path runs only for coroutines that did. Stage-internal
+ * getter/setter calls are excluded (zealphp_settings_in_stage). */
+static HashTable zealphp_settings_touched;      /* cid → (empty): called a setter */
+static bool      zealphp_settings_touched_live = false;
+/* perf: task ptr → (empty) for coroutines that hold at least one of the six
+ * setter-driven lanes (cwd/locale/umask/tz/mbenc/libxml). A coroutine that
+ * never called a setter and holds no lane skips all six stages with ONE probe
+ * instead of two per stage. last-error is gated by PG(last_error_message)
+ * directly and stays outside this gate. */
+static HashTable zealphp_settings_lane_any;
+static bool      zealphp_settings_lane_any_live = false;
+static int       zealphp_settings_in_stage = 0; /* >0 while a stage calls a hooked fn itself */
+static bool      zealphp_settings_hooks_installed = false;
+
+static zend_always_inline void zealphp_settings_touch(void)
+{
+    if (zealphp_settings_in_stage || !zealphp_settings_touched_live || !os_get_cid) return;
+    long cid = os_get_cid();
+    if (cid > 0) {
+        zend_hash_index_add_empty_element(&zealphp_settings_touched, (zend_ulong)cid);
+    }
+}
+/* May this coroutine have moved a process setting? (Its own cid in PHP context /
+ * on_yield; inline_park passes the resumer, whose cid os_get_cid() names there.) */
+static zend_always_inline bool zealphp_settings_maybe_dirty(void)
+{
+    if (!zealphp_settings_hooks_installed || !os_get_cid) return true;   /* no hooks: never skip */
+    long cid = os_get_cid();
+    if (cid <= 0) return true;
+    return zend_hash_index_exists(&zealphp_settings_touched, (zend_ulong)cid);
+}
+#define ZP_SETTER_HOOK(fn) \
+    static zif_handler zealphp_orig_##fn = NULL; \
+    static ZEND_NAMED_FUNCTION(zealphp_hook_##fn) { zealphp_settings_touch(); zealphp_orig_##fn(INTERNAL_FUNCTION_PARAM_PASSTHRU); }
+ZP_SETTER_HOOK(chdir)
+ZP_SETTER_HOOK(setlocale)
+ZP_SETTER_HOOK(umask)
+ZP_SETTER_HOOK(date_default_timezone_set)
+ZP_SETTER_HOOK(mb_internal_encoding)
+ZP_SETTER_HOOK(libxml_use_internal_errors)
+#undef ZP_SETTER_HOOK
+static void zealphp_setter_hook_one(const char *name, size_t len, zif_handler *orig, zif_handler ours)
+{
+    zend_function *f = zend_hash_str_find_ptr(CG(function_table), name, len);
+    if (!f || f->type != ZEND_INTERNAL_FUNCTION || f->internal_function.handler == ours) return;
+    *orig = f->internal_function.handler;
+    f->internal_function.handler = ours;
+}
+static void zealphp_setter_unhook_one(const char *name, size_t len, zif_handler *orig, zif_handler ours)
+{
+    if (!*orig) return;
+    zend_function *f = zend_hash_str_find_ptr(CG(function_table), name, len);
+    if (f && f->type == ZEND_INTERNAL_FUNCTION && f->internal_function.handler == ours) {
+        f->internal_function.handler = *orig;   /* compare-and-restore: only if still ours */
+    }
+    *orig = NULL;
+}
+#define ZP_SETTER_EACH(X) \
+    X(chdir) X(setlocale) X(umask) X(date_default_timezone_set) X(mb_internal_encoding) X(libxml_use_internal_errors)
+/* isolation: ReflectionProperty::setValue() / setRawValue() and
+ * ReflectionClass::setStaticPropertyValue() write static slots from C
+ * (zend_update_static_property), bypassing the static-prop write opcodes the
+ * touched set is built from. Wrap them: a static write records the class (and
+ * its ancestors) for the lane; an instance write records nothing. */
+static zif_handler zealphp_orig_refl_prop_setvalue    = NULL;
+static zif_handler zealphp_orig_refl_prop_setrawvalue = NULL;
+static zif_handler zealphp_orig_refl_class_setstatic  = NULL;
+static bool        zealphp_refl_hooks_installed       = false;
+static void zealphp_refl_touch(zval *this_zv, bool class_object)
+{
+    if (!zealphp_cstat_hooks_wanted || !this_zv || Z_TYPE_P(this_zv) != IS_OBJECT) return;
+    zval rv;
+    zval *cls = zend_read_property(Z_OBJCE_P(this_zv), Z_OBJ_P(this_zv),
+                                   class_object ? "name" : "class", class_object ? 4 : 5, 1, &rv);
+    if (!cls || Z_TYPE_P(cls) != IS_STRING) { zealphp_cstat_touch(NULL); return; }
+    zend_string *lc = zend_string_tolower(Z_STR_P(cls));
+    zend_class_entry *ce = zend_hash_find_ptr(EG(class_table), lc);
+    zend_string_release(lc);
+    if (!ce) { zealphp_cstat_touch(NULL); return; }
+    if (!class_object) {
+        zval rv2;
+        zval *pn = zend_read_property(Z_OBJCE_P(this_zv), Z_OBJ_P(this_zv), "name", 4, 1, &rv2);
+        if (!pn || Z_TYPE_P(pn) != IS_STRING) { zealphp_cstat_touch(ce); return; }
+        zend_property_info *pi = zend_hash_find_ptr(&ce->properties_info, Z_STR_P(pn));
+        if (!pi) { zealphp_cstat_touch(ce); return; }          /* unknown: be conservative */
+        if (!(pi->flags & ZEND_ACC_STATIC)) return;             /* instance property: nothing to isolate */
+    }
+    zealphp_cstat_touch(ce);
+}
+static ZEND_NAMED_FUNCTION(zealphp_hook_refl_prop_setvalue)
+{
+    zealphp_refl_touch(ZEND_THIS, false);
+    zealphp_orig_refl_prop_setvalue(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+static ZEND_NAMED_FUNCTION(zealphp_hook_refl_prop_setrawvalue)
+{
+    zealphp_refl_touch(ZEND_THIS, false);
+    zealphp_orig_refl_prop_setrawvalue(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+static ZEND_NAMED_FUNCTION(zealphp_hook_refl_class_setstatic)
+{
+    zealphp_refl_touch(ZEND_THIS, true);
+    zealphp_orig_refl_class_setstatic(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+static void zealphp_method_hook_one(const char *cls, const char *meth, zif_handler *orig, zif_handler ours)
+{
+    zend_class_entry *ce = zend_hash_str_find_ptr(CG(class_table), cls, strlen(cls));
+    if (!ce) return;
+    zend_function *f = zend_hash_str_find_ptr(&ce->function_table, meth, strlen(meth));
+    if (!f || f->type != ZEND_INTERNAL_FUNCTION || f->internal_function.handler == ours) return;
+    *orig = f->internal_function.handler;
+    f->internal_function.handler = ours;
+}
+static void zealphp_method_unhook_one(const char *cls, const char *meth, zif_handler *orig, zif_handler ours)
+{
+    if (!*orig) return;
+    zend_class_entry *ce = zend_hash_str_find_ptr(CG(class_table), cls, strlen(cls));
+    if (!ce) return;
+    zend_function *f = zend_hash_str_find_ptr(&ce->function_table, meth, strlen(meth));
+    if (f && f->type == ZEND_INTERNAL_FUNCTION && f->internal_function.handler == ours) {
+        f->internal_function.handler = *orig;
+    }
+}
+static void zealphp_refl_hooks_install(void)
+{
+    if (zealphp_refl_hooks_installed) return;
+    zealphp_method_hook_one("reflectionproperty", "setvalue",    &zealphp_orig_refl_prop_setvalue,    zealphp_hook_refl_prop_setvalue);
+    zealphp_method_hook_one("reflectionproperty", "setrawvalue", &zealphp_orig_refl_prop_setrawvalue, zealphp_hook_refl_prop_setrawvalue);
+    zealphp_method_hook_one("reflectionclass", "setstaticpropertyvalue", &zealphp_orig_refl_class_setstatic, zealphp_hook_refl_class_setstatic);
+    zealphp_refl_hooks_installed = true;
+}
+static void zealphp_refl_hooks_remove(void)
+{
+    if (!zealphp_refl_hooks_installed) return;
+    zealphp_method_unhook_one("reflectionproperty", "setvalue",    &zealphp_orig_refl_prop_setvalue,    zealphp_hook_refl_prop_setvalue);
+    zealphp_method_unhook_one("reflectionproperty", "setrawvalue", &zealphp_orig_refl_prop_setrawvalue, zealphp_hook_refl_prop_setrawvalue);
+    zealphp_method_unhook_one("reflectionclass", "setstaticpropertyvalue", &zealphp_orig_refl_class_setstatic, zealphp_hook_refl_class_setstatic);
+    zealphp_refl_hooks_installed = false;
+}
+static void zealphp_settings_hooks_install(void)
+{
+    if (zealphp_settings_hooks_installed) return;
+    if (!zealphp_settings_touched_live) {
+        zend_hash_init(&zealphp_settings_touched, 64, NULL, NULL, 1);
+        zend_hash_init(&zealphp_settings_lane_any, 64, NULL, NULL, 1);
+        zealphp_settings_lane_any_live = true;
+        zealphp_settings_touched_live = true;
+    }
+#define X(fn) zealphp_setter_hook_one(#fn, sizeof(#fn) - 1, &zealphp_orig_##fn, zealphp_hook_##fn);
+    ZP_SETTER_EACH(X)
+#undef X
+    zealphp_settings_hooks_installed = true;
+}
+static void zealphp_settings_hooks_remove(void)
+{
+    if (!zealphp_settings_hooks_installed) return;
+#define X(fn) zealphp_setter_unhook_one(#fn, sizeof(#fn) - 1, &zealphp_orig_##fn, zealphp_hook_##fn);
+    ZP_SETTER_EACH(X)
+#undef X
+    zealphp_settings_hooks_installed = false;
+}
+#undef ZP_SETTER_EACH
 
 /* ── Per-coroutine CWD isolation (framework #323) ─────────────────── */
 
@@ -1130,6 +1679,8 @@ static void zealphp_cwd_snapshot_save(zend_long cid)
      * Lane-symmetry exception (2026-06-10) — see zealphp_setting_snapshot_save. */
     if (!zealphp_process_state_owner_ok()
         && !zend_hash_index_exists(&zealphp_coro_cwd_snapshots, (zend_ulong)cid)) return;
+    if (!zealphp_settings_maybe_dirty()
+        && !zend_hash_index_exists(&zealphp_coro_cwd_snapshots, (zend_ulong)cid)) return;   /* perf: never chdir()'d */
     char buf[MAXPATHLEN];
     if (!VCWD_GETCWD(buf, sizeof(buf))) return;
     if (strcmp(buf, zealphp_cwd_baseline) == 0) {
@@ -1186,6 +1737,8 @@ static void zealphp_locale_snapshot_save(zend_long cid)
      * Lane-symmetry exception (2026-06-10) — see zealphp_setting_snapshot_save. */
     if (!zealphp_process_state_owner_ok()
         && !zend_hash_index_exists(&zealphp_coro_locale_snapshots, (zend_ulong)cid)) return;
+    if (!zealphp_settings_maybe_dirty()
+        && !zend_hash_index_exists(&zealphp_coro_locale_snapshots, (zend_ulong)cid)) return;   /* perf */
     const char *cur = setlocale(LC_ALL, NULL);
     if (!cur) return;
     if (strcmp(cur, zealphp_locale_baseline) == 0) {
@@ -1235,6 +1788,8 @@ static void zealphp_umask_snapshot_save(zend_long cid)
      * Lane-symmetry exception (2026-06-10) — see zealphp_setting_snapshot_save. */
     if (!zealphp_process_state_owner_ok()
         && !zend_hash_index_exists(&zealphp_coro_umask_snapshots, (zend_ulong)cid)) return;
+    if (!zealphp_settings_maybe_dirty()
+        && !zend_hash_index_exists(&zealphp_coro_umask_snapshots, (zend_ulong)cid)) return;   /* perf */
     /* One syscall: set the baseline AND read the previous value. */
     mode_t cur = umask(zealphp_umask_baseline);
     if (cur == zealphp_umask_baseline) {
@@ -1376,12 +1931,14 @@ static char *zealphp_call_string_getter(const char *fname)
     zval fn, rv;
     ZVAL_STRING(&fn, fname);
     char *out = NULL;
+    zealphp_settings_in_stage++;
     if (call_user_function(EG(function_table), NULL, &fn, &rv, 0, NULL) == SUCCESS) {
         if (Z_TYPE(rv) == IS_STRING) {
             out = estrndup(Z_STRVAL(rv), Z_STRLEN(rv));
         }
         zval_ptr_dtor(&rv);
     }
+    zealphp_settings_in_stage--;
     zval_ptr_dtor(&fn);
     return out;
 }
@@ -1392,9 +1949,11 @@ static void zealphp_call_string_setter(const char *fname, const char *val)
     zval fn, rv, arg;
     ZVAL_STRING(&fn, fname);
     ZVAL_STRING(&arg, val);
+    zealphp_settings_in_stage++;
     if (call_user_function(EG(function_table), NULL, &fn, &rv, 1, &arg) == SUCCESS) {
         zval_ptr_dtor(&rv);
     }
+    zealphp_settings_in_stage--;
     zval_ptr_dtor(&arg);
     zval_ptr_dtor(&fn);
 }
@@ -1414,6 +1973,8 @@ static void zealphp_setting_snapshot_save(zend_long cid, int active, const char 
      * exists), so the anti-steal property is preserved. */
     if (!zealphp_process_state_owner_ok()
         && !zend_hash_index_exists(snaps, (zend_ulong)cid)) return;
+    if (!zealphp_settings_maybe_dirty()
+        && !zend_hash_index_exists(snaps, (zend_ulong)cid)) return;   /* perf: never called the setter */
     char *cur = zealphp_call_string_getter(getter);
     if (!cur) return;
     if (strcmp(cur, baseline) == 0) {
@@ -1449,7 +2010,7 @@ static void zealphp_setting_snapshot_delete(zend_long cid, int active, const cha
 {
     bool zp_had_lane = zend_hash_index_exists(snaps, (zend_ulong)cid);
     zend_hash_index_del(snaps, (zend_ulong)cid);
-    if (active && baseline) {
+    if (active && baseline && (zp_had_lane || zealphp_settings_maybe_dirty())) {
         /* Re-park when the closing coroutine HAD A LANE (its last resume
          * restored its setting and no further yield re-parked — the final
          * teardown slice) OR is a registered request coroutine / legacy
@@ -1504,11 +2065,13 @@ static int zealphp_libxml_flag_get(void)
     zval fn, rv;
     ZVAL_STRING(&fn, "libxml_use_internal_errors");
     int out = -1;
+    zealphp_settings_in_stage++;
     if (call_user_function(EG(function_table), NULL, &fn, &rv, 0, NULL) == SUCCESS) {
         if (Z_TYPE(rv) == IS_TRUE) out = 1;
         else if (Z_TYPE(rv) == IS_FALSE) out = 0;
         zval_ptr_dtor(&rv);
     }
+    zealphp_settings_in_stage--;
     zval_ptr_dtor(&fn);
     /* The no-arg READ form itself returns the current value WITHOUT
      * changing it (PHP 8.x: null $use_errors keeps the state). */
@@ -1520,9 +2083,11 @@ static void zealphp_libxml_flag_set(int on)
     zval fn, rv, arg;
     ZVAL_STRING(&fn, "libxml_use_internal_errors");
     ZVAL_BOOL(&arg, on ? 1 : 0);
+    zealphp_settings_in_stage++;
     if (call_user_function(EG(function_table), NULL, &fn, &rv, 1, &arg) == SUCCESS) {
         zval_ptr_dtor(&rv);
     }
+    zealphp_settings_in_stage--;
     zval_ptr_dtor(&fn);
 }
 
@@ -1532,6 +2097,8 @@ static void zealphp_libxml_snapshot_save(zend_long cid)
     /* Owner gate + lane-symmetry exception — see zealphp_setting_snapshot_save. */
     if (!zealphp_process_state_owner_ok()
         && !zend_hash_index_exists(&zealphp_coro_libxml_snapshots, (zend_ulong)cid)) return;
+    if (!zealphp_settings_maybe_dirty()
+        && !zend_hash_index_exists(&zealphp_coro_libxml_snapshots, (zend_ulong)cid)) return;   /* perf */
     int cur = zealphp_libxml_flag_get();
     if (cur < 0) return;
     if (cur == zealphp_libxml_baseline) {
@@ -1557,6 +2124,7 @@ static void zealphp_libxml_snapshot_delete(zend_long cid)
     bool zp_had_lane = zend_hash_index_exists(&zealphp_coro_libxml_snapshots, (zend_ulong)cid);
     zend_hash_index_del(&zealphp_coro_libxml_snapshots, (zend_ulong)cid);
     if (zealphp_libxml_isolation_active
+        && (zp_had_lane || zealphp_settings_maybe_dirty())
         && (zp_had_lane || zealphp_process_state_owner_ok())) {
         int cur = zealphp_libxml_flag_get();
         if (cur >= 0 && cur != zealphp_libxml_baseline) {
@@ -1576,6 +2144,12 @@ static void zealphp_libxml_snapshot_delete(zend_long cid)
  * where clear() never ran and the cid is still registered. */
 static void zealphp_process_settings_repark(void)
 {
+    /* perf: a request that never called a setter (and whose coroutine holds
+     * no lane) left every setting at the baseline — nothing to re-park. */
+    if (!zealphp_settings_maybe_dirty()) {
+        if (zealphp_lasterr_isolation_active) zealphp_lasterr_park();
+        return;
+    }
     if (zealphp_cwd_isolation_active && zealphp_cwd_baseline[0] != '\0') {
         char zp_buf[MAXPATHLEN];
         if (VCWD_GETCWD(zp_buf, sizeof(zp_buf)) && strcmp(zp_buf, zealphp_cwd_baseline) != 0) {
@@ -1644,89 +2218,202 @@ static bool zealphp_state_snapshotted;
 static HashTable zealphp_statics_orphans;
 static bool zealphp_statics_orphans_live = false;
 
-/* repark=false: capture only (F12 — a child coroutine starting on its
- * parent's live view records it without re-parking anything). */
-static void zealphp_statics_snapshot_save_ex(long cid, bool repark)
+static bool zealphp_globals_isolatable(zval *v);
+
+/* Rebuild the class-with-statics index when the class table changed. */
+/* perf: answers "is this class process-shared by prefix?" from the index so
+ * the write hook can leave such classes out of the per-coroutine touched set
+ * and the request-end dirty set. Not indexed yet → false (conservative: the
+ * save then sees the entry and skips it by its shared flag). */
+static bool zealphp_cstat_ce_is_shared(zend_class_entry *ce)
 {
-    zval snapshot;
-    array_init(&snapshot);
-    bool has_statics = false;
+    if (!zealphp_static_classes_by_ce_live || zealphp_shared_static_prefixes_n == 0) return false;
+    zval *pos = zend_hash_index_find(&zealphp_static_classes_by_ce, (zend_ulong)(uintptr_t)ce);
+    if (!pos) return false;
+    return zealphp_static_classes[Z_LVAL_P(pos) - 1].shared;
+}
+static void zealphp_static_classes_refresh(void)
+{
+    uint32_t n = zend_hash_num_elements(EG(class_table));
+    if (zealphp_static_classes
+        && n == zealphp_static_classes_tbl_n
+        && zealphp_static_classes_gen == zealphp_symtab_gen
+        && zealphp_static_classes_snap == zealphp_state_snapshotted) {
+        return;
+    }
+    zealphp_static_classes_n = 0;
+    if (!zealphp_static_classes_by_ce_live) {
+        zend_hash_init(&zealphp_static_classes_by_ce, 256, NULL, NULL, 1);
+        zealphp_static_classes_by_ce_live = true;
+    } else {
+        zend_hash_clean(&zealphp_static_classes_by_ce);
+    }
+    HashTable seen;
+    zend_hash_init(&seen, 64, NULL, NULL, 0);
+    zend_string *cn;
+    zval *zv;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(EG(class_table), cn, zv) {
+        if (!cn) continue;
+        zend_class_entry *ce = Z_PTR_P(zv);
+        if (!ce || ce->type != ZEND_USER_CLASS || ce->default_static_members_count == 0) continue;
+        /* class_alias() entries share one ce — visit each ce once. */
+        if (zend_hash_index_exists(&seen, (zend_ulong)(uintptr_t)ce)) continue;
+        zend_hash_index_add_empty_element(&seen, (zend_ulong)(uintptr_t)ce);
+        if (zealphp_static_classes_n == zealphp_static_classes_cap) {
+            zealphp_static_classes_cap = zealphp_static_classes_cap ? zealphp_static_classes_cap * 2 : 64;
+            zealphp_static_classes = perealloc(zealphp_static_classes,
+                sizeof(zealphp_static_class_ref) * zealphp_static_classes_cap, 1);
+        }
+        zealphp_static_class_ref *r = &zealphp_static_classes[zealphp_static_classes_n++];
+        r->ce   = ce;
+        r->name = cn;
+        r->boot = zealphp_state_snapshotted && zend_hash_exists(&zealphp_snapshot_classes, cn);
+        r->shared = false;
+        for (uint32_t pi = 0; pi < zealphp_shared_static_prefixes_n; pi++) {
+            zend_string *pf = zealphp_shared_static_prefixes[pi];
+            if (ZSTR_LEN(cn) >= ZSTR_LEN(pf) && memcmp(ZSTR_VAL(cn), ZSTR_VAL(pf), ZSTR_LEN(pf)) == 0) {
+                r->shared = true;
+                break;
+            }
+        }
+        {
+            zval pos;
+            ZVAL_LONG(&pos, (zend_long)zealphp_static_classes_n);   /* position + 1 */
+            zend_hash_index_update(&zealphp_static_classes_by_ce, (zend_ulong)(uintptr_t)ce, &pos);
+        }
+    } ZEND_HASH_FOREACH_END();
+    zend_hash_destroy(&seen);
+    zealphp_static_classes_tbl_n = n;
+    zealphp_static_classes_gen   = zealphp_symtab_gen;
+    zealphp_static_classes_snap  = zealphp_state_snapshotted;
+}
 
-    zend_string *class_name;
-    zval *cls_zv;
-    /* HAZARD-2 fix: iterate EG(class_table), NOT CG(class_table). The compile-file
-     * hook (Stage 3c) swaps CG(class_table) to a STACK-LOCAL scratch table on the
-     * coroutine's stack during compile; EG is deliberately left pointing at the
-     * real global table (see the "Stage 3c: swap CG only" note in
-     * zealphp_compile_file_hook). This snapshot fires on EVERY coroutine yield —
-     * including a yield mid-compile (autoload) or during bailout/teardown — so
-     * iterating CG(class_table) there can read a coroutine-stack scratch that
-     * becomes a use-after-free once that coroutine's stack is freed (ASAN-confirmed
-     * heap-use-after-free at this line on PHP 8.4/8.5). EG(class_table) is never
-     * swapped, so it is always the stable, real, process-global table. */
-    ZEND_HASH_FOREACH_STR_KEY_VAL(EG(class_table), class_name, cls_zv) {
-        if (!class_name) continue;
-        zend_class_entry *ce = Z_PTR_P(cls_zv);
-        if (!ce || ce->type != ZEND_USER_CLASS) continue;
-        if (ce->default_static_members_count == 0) continue;
+/* Is the live slot still what the baseline recorded? Refcounted payloads
+ * compare by pointer (the baseline's shared ref forces COW on any write);
+ * scalars by value. */
+static zend_always_inline bool zealphp_static_slot_same(const zval *slot, const zval *base)
+{
+    if (Z_TYPE_P(slot) != Z_TYPE_P(base)) return false;
+    if (Z_REFCOUNTED_P(slot)) return Z_COUNTED_P(slot) == Z_COUNTED_P(base);
+    switch (Z_TYPE_P(slot)) {
+        case IS_LONG:   return Z_LVAL_P(slot) == Z_LVAL_P(base);
+        case IS_DOUBLE: return Z_DVAL_P(slot) == Z_DVAL_P(base);
+        case IS_STRING: return Z_STR_P(slot) == Z_STR_P(base)
+                            || zend_string_equals(Z_STR_P(slot), Z_STR_P(base));   /* interned */
+        default:        return true;   /* UNDEF / NULL / FALSE / TRUE */
+    }
+}
 
-        zval *statics = CE_STATIC_MEMBERS(ce);
+/* Baseline for a boot class — captured the first time the save sees it. */
+static zealphp_boot_baseline *zealphp_boot_baseline_for(zend_class_entry *ce, zval *statics)
+{
+    zealphp_boot_baseline *b = zend_hash_index_find_ptr(&zealphp_boot_static_baseline, (zend_ulong)(uintptr_t)ce);
+    if (b) return b;
+    uint32_t n = (uint32_t)ce->default_static_members_count;
+    b = emalloc(sizeof(zealphp_boot_baseline) + sizeof(zval) * n);
+    b->n = n;
+    for (uint32_t i = 0; i < n; i++) {
+        zval *slot = &statics[i];
+        if (Z_TYPE_P(slot) == IS_INDIRECT || Z_ISREF_P(slot) || Z_TYPE_P(slot) == IS_RESOURCE) {
+            ZVAL_UNDEF(&b->v[i]);
+        } else {
+            ZVAL_COPY(&b->v[i], slot);   /* shared ref: forces COW on a later in-place write */
+        }
+    }
+    zend_hash_index_add_new_ptr(&zealphp_boot_static_baseline, (zend_ulong)(uintptr_t)ce, b);
+    return b;
+}
+
+/* End-of-boot capture: every boot class whose static table exists gets its
+ * baseline NOW (warm boot values). A boot class first touched during a request
+ * has no table yet and is handled against its compile-time template, exactly
+ * like a request-loaded class. Idempotent; a refresh re-captures. */
+static void zealphp_boot_baselines_capture(bool refresh)
+{
+    if (refresh) {
+        zend_hash_clean(&zealphp_boot_static_baseline);
+    }
+    zealphp_static_classes_refresh();
+    for (uint32_t ci = 0; ci < zealphp_static_classes_n; ci++) {
+        zealphp_static_class_ref *ref = &zealphp_static_classes[ci];
+        if (!ref->boot || ref->shared) continue;
+        zval *statics = CE_STATIC_MEMBERS(ref->ce);
         if (!statics) continue;
+        (void) zealphp_boot_baseline_for(ref->ce, statics);
+    }
+    zealphp_boot_baselines_done = true;
+}
+
+/* Save ONE class's statics for the parking coroutine (see the regime notes
+ * inside). `*snapshot`/`*snapshot_init` is the coroutine's lane under construction. */
+static void zealphp_statics_save_class(zealphp_static_class_ref *ref, int zp_v2_disabled,
+                                       zval *snapshot_p, bool *snapshot_init_p, bool repark)
+{
+    zval *snapshot = snapshot_p; (void)snapshot;
+#define snapshot (*snapshot_p)
+#define snapshot_init (*snapshot_init_p)
+        zend_class_entry *ce = ref->ce;
+        zval *statics = CE_STATIC_MEMBERS(ce);
+        if (!statics) return;   /* never initialised in this worker — nothing to isolate */
 
         /* ext#48 (S5b v2) — two regimes by class provenance:
          *
-         * BOOT classes (in zealphp_snapshot_classes — framework state like
-         * App::$routes / the middleware stack): the ORIGINAL behavior, byte
-         * for byte. Scalars/arrays snapshot+restore per coroutine; objects
-         * stay process-shared; live slots are never re-parked. Framework
-         * per-worker state must stay warm.
+         * BOOT classes (framework state like App::$routes / the middleware
+         * stack): scalars/arrays that a request CHANGED are carried in its lane
+         * (snapshot + restore); objects stay process-shared; live slots are never
+         * re-parked. Unchanged slots are detected against the boot baseline and
+         * cost nothing (see zealphp_boot_baseline_for).
          *
-         * POST-BOOT (request-loaded) classes — the #48 frontier
-         * (CakePHP Router::$_collection, Kirby App::$instance, Piwigo), and
-         * empirically ALSO the ext#44/#49 concurrent-corruption substrate:
-         * the ASAN-pinned property-walk crashes (gc_mark_grey /
-         * zend_object_dtor_property / the S11c drain) all walked object
-         * graphs held in PROCESS-SHARED class statics that concurrent
-         * requests mutated under each other. Isolating + re-parking them
-         * took WordPress cold-concurrent bursts from 5/5 worker deaths to
-         * 0/5 and phpMyAdmin to 0 — with NO other change:
-         *   1. snapshot slots that DIFFER from the template, INCLUDING
-         *      OBJECTS (ref-hold via ZVAL_DUP — objects copy by handle).
-         *      Snapshot-first ordering makes the re-park dtor below safe:
-         *      the displaced value's refcount is >= 2, so no __destruct can
-         *      fire inside this C scheduler callback (the exact safety
-         *      argument of the object-globals stage, 0.3.23/0.3.47).
-         *   2. re-park the live slot to the boot TEMPLATE (the S11c
-         *      in-place discipline: stable address, IS_INDIRECT skipped) so
-         *      a peer that never touched this class reads the PHP-FPM
-         *      default — closing BOTH #48 legs (object leak + first-touch
-         *      scalar/array leak). The owner's values come back via
-         *      restore-over-template on its resume.
-         * Object refs held here are released by the in-coroutine request-end
-         * drain (zealphp_coroutine_globals_request_end), NEVER by on_close —
-         * see zealphp_statics_snapshot_delete's orphan path. */
-        static int zp_v2_disabled = -1;
-        if (zp_v2_disabled < 0) {
-            const char *e = getenv("ZEALPHP_CLASS_STATICS_V2_DISABLE");
-            zp_v2_disabled = (e && *e && *e != '0') ? 1 : 0;
+         * POST-BOOT (request-loaded) classes — the #48 frontier (CakePHP
+         * Router::$_collection, Kirby App::$instance, Piwigo), and empirically
+         * ALSO the ext#44/#49 concurrent-corruption substrate: isolate + re-park
+         * to the boot TEMPLATE, objects included (ref-held via ZVAL_DUP). Object
+         * refs held here are released by the in-coroutine request-end drain
+         * (zealphp_coroutine_globals_request_end), NEVER by on_close. */
+        if (ref->shared) return;   /* framework-registered process-wide statics */
+        bool zp_boot_class = zp_v2_disabled || ref->boot;
+        zealphp_boot_baseline *base = NULL;
+        if (zp_boot_class) {
+            base = zend_hash_index_find_ptr(&zealphp_boot_static_baseline, (zend_ulong)(uintptr_t)ce);
+            if (!base) {
+                if (!zealphp_boot_baselines_done) {
+                    base = zealphp_boot_baseline_for(ce, statics);   /* still booting: warm values */
+                } else {
+                    zp_boot_class = false;   /* first touched inside a request: template regime */
+                }
+            }
         }
-        bool zp_boot_class = zp_v2_disabled
-            || (zealphp_state_snapshotted
-                && zend_hash_exists(&zealphp_snapshot_classes, class_name));
 
         zval class_snapshot;
-        array_init_size(&class_snapshot, ce->default_static_members_count);
         bool any = false;
         for (int i = 0; i < ce->default_static_members_count; i++) {
             zval *slot = &statics[i];
             if (Z_TYPE_P(slot) == IS_INDIRECT) continue;   /* parent owns inherited slots */
 
             if (zp_boot_class) {
-                if (!zealphp_globals_isolatable(slot)) continue;
+                if ((uint32_t)i >= base->n) continue;
+                zval *bv = &base->v[i];
+                if (Z_TYPE_P(bv) == IS_UNDEF) continue;          /* untracked (inherited / resource / ref at boot) */
+                if (zealphp_static_slot_same(slot, bv)) continue; /* unchanged since boot: nothing to carry */
+                if (Z_TYPE_P(slot) == IS_RESOURCE || Z_ISREF_P(slot)) continue;
+                if (!any) { array_init_size(&class_snapshot, ce->default_static_members_count); any = true; }
+                /* 1. carry this coroutine's value in its lane (+1 ref; a refcount
+                 *    >= 2 payload COW-separates on any write, so the lane never
+                 *    observes a later mutation; objects copy by handle). */
                 zval copy;
-                ZVAL_DUP(&copy, slot);
+                ZVAL_COPY(&copy, slot);
                 zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
-                any = true;
+                /* 2. re-park the live slot at the boot baseline so a peer reads
+                 *    the warm boot value (the per-request contract), and the
+                 *    owner's resume finds a slot it can overwrite without ever
+                 *    freeing a peer's object: the displaced value's refcount is
+                 *    >= 2 (the lane holds it), so no __destruct runs here. */
+                if (!repark) continue;   /* capture only (F12 child start) */
+                zval fresh;
+                ZVAL_COPY(&fresh, bv);
+                zval old = *slot;
+                ZVAL_COPY_VALUE(slot, &fresh);
+                zealphp_release(&old);   /* B1: never release inside a switch callback */
                 continue;
             }
 
@@ -1748,11 +2435,11 @@ static void zealphp_statics_snapshot_save_ex(long cid, bool repark)
             }
             if (Z_TYPE_P(slot) == IS_RESOURCE) continue;       /* resources stay shared */
 
-            /* 1. snapshot (objects = +1 ref-hold; scalars/arrays = deep copy) */
+            /* 1. snapshot (+1 ref-hold; arrays/strings COW-separate on a later write) */
+            if (!any) { array_init_size(&class_snapshot, ce->default_static_members_count); any = true; }
             zval copy;
-            ZVAL_DUP(&copy, slot);
+            ZVAL_COPY(&copy, slot);
             zend_hash_index_add_new(Z_ARRVAL(class_snapshot), i, &copy);
-            any = true;
 
             /* A constant-expression default is still an unresolved AST in the
              * template (always for an opcache-immutable class; for a runtime
@@ -1776,15 +2463,56 @@ static void zealphp_statics_snapshot_save_ex(long cid, bool repark)
             ZVAL_COPY_VALUE(slot, &fresh);
             zealphp_release(&old);
         }
-        if (!any) { zval_ptr_dtor(&class_snapshot); continue; }
-        zend_hash_update(Z_ARRVAL(snapshot), class_name, &class_snapshot);
-        has_statics = true;
-    } ZEND_HASH_FOREACH_END();
+        if (!any) return;
+        if (!snapshot_init) { array_init(&snapshot); snapshot_init = true; }
+        zend_hash_update(Z_ARRVAL(snapshot), ref->name, &class_snapshot);
+#undef snapshot
+#undef snapshot_init
+}
 
-    if (has_statics) {
+/* repark=false: capture only (F12 — a child coroutine starting on its
+ * parent's live view records it without re-parking anything). */
+static void zealphp_statics_snapshot_save_ex(long cid, bool repark)
+{
+    zval snapshot;
+    bool snapshot_init = false;
+
+    static int zp_v2_disabled = -1;
+    if (zp_v2_disabled < 0) {
+        const char *e = getenv("ZEALPHP_CLASS_STATICS_V2_DISABLE");
+        zp_v2_disabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+
+    /* perf: only classes whose statics THIS coroutine wrote (the write-opcode
+     * hooks record them) can hold a value to carry or re-park. */
+    long zp_tcid = zealphp_lane_touch_cid(cid);
+    HashTable *touched = (zealphp_cstat_touched_live && zp_tcid > 0)
+        ? zend_hash_index_find_ptr(&zealphp_cstat_touched, (zend_ulong)zp_tcid) : NULL;
+    bool zp_cstat_full = !zealphp_cstat_hooks_wanted || zp_tcid < 0 || zealphp_lane_full_walk(cid)
+        || (touched && zend_hash_index_exists(touched, 0));
+    if (!zp_cstat_full && (!touched || zend_hash_num_elements(touched) == 0)) return;
+
+    /* HAZARD-2: the index is built from EG(class_table), never CG — CG may be
+     * a coroutine-stack scratch during a compile (see the Stage 3c notes). */
+    zealphp_static_classes_refresh();
+
+    if (zp_cstat_full) {
+        /* hooks off, or a write to a class we could not resolve: every class. */
+        for (uint32_t ci = 0; ci < zealphp_static_classes_n; ci++) {
+            zealphp_statics_save_class(&zealphp_static_classes[ci], zp_v2_disabled, &snapshot, &snapshot_init, repark);
+        }
+    } else {
+        zend_ulong cek;
+        ZEND_HASH_FOREACH_NUM_KEY(touched, cek) {
+            zval *pos = zend_hash_index_find(&zealphp_static_classes_by_ce, cek);
+            if (!pos) continue;   /* class without statics / unknown — nothing to isolate */
+            zealphp_statics_save_class(&zealphp_static_classes[Z_LVAL_P(pos) - 1], zp_v2_disabled, &snapshot, &snapshot_init, repark);
+        } ZEND_HASH_FOREACH_END();
+    }
+
+    if (snapshot_init) {
         zend_hash_index_update(&zealphp_coro_static_snapshots, (zend_ulong)cid, &snapshot);
     } else {
-        zval_ptr_dtor(&snapshot);
         /* Nothing differs now: drop an earlier yield's snapshot, or the next
          * restore would write those stale values back over the live slots. */
         zend_hash_index_del(&zealphp_coro_static_snapshots, (zend_ulong)cid);
@@ -1815,25 +2543,28 @@ static void zealphp_statics_snapshot_restore(long cid)
         zval *statics = CE_STATIC_MEMBERS(ce);
         if (!statics) continue;
 
-        /* Boot classes never snapshot objects (process-shared framework
-         * state). A boot-class slot that holds an object/resource NOW was set
-         * by a peer since our save; overwriting it would free the peer's object
-         * inside on_resume. Keep it shared, matching the save side. */
-        bool zp_boot_class = zealphp_state_snapshotted
-            && zend_hash_exists(&zealphp_snapshot_classes, class_name);
+        /* A live slot holding a resource or reference is never ours to replace
+         * (the save side never carries those). Everything else in the lane was
+         * put there by this coroutine's own save, which re-parked the slot, so
+         * the live value is the baseline/template (or a finished peer's value
+         * whose ref the request-end reset drops in PHP context). */
         zval *val;
         zend_ulong idx;
         ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(class_snapshot), idx, val) {
             if ((int)idx < ce->default_static_members_count) {
                 if (Z_TYPE(statics[idx]) == IS_INDIRECT) continue;   /* parent owns it */
-                if (zp_boot_class && !zealphp_globals_isolatable(&statics[idx])) continue;
+                if (Z_TYPE(statics[idx]) == IS_RESOURCE || Z_ISREF(statics[idx])) continue;
+                if (Z_REFCOUNTED_P(val) && Z_REFCOUNTED(statics[idx])
+                    && Z_COUNTED_P(val) == Z_COUNTED(statics[idx])) continue;   /* already ours */
                 /* B1: the displaced value may be the last reference to an
                  * object a non-owner coroutine stored here (its writes are
                  * never parked) — never release it inside on_resume. */
                 zval zp_old;
                 ZVAL_COPY_VALUE(&zp_old, &statics[idx]);
-                ZVAL_DUP(&statics[idx], val);
+                ZVAL_COPY(&statics[idx], val);   /* share; COW on write */
                 zealphp_release(&zp_old);
+                zealphp_cstat_dirty = true;      /* live now holds a non-baseline value */
+                if (zealphp_cstat_dirty_live) zend_hash_index_add_empty_element(&zealphp_cstat_dirty_set, (zend_ulong)(uintptr_t)ce);
             }
         } ZEND_HASH_FOREACH_END();
     } ZEND_HASH_FOREACH_END();
@@ -1999,7 +2730,7 @@ static void zealphp_fn_statics_save_cb(zend_op_array *opa, HashTable *live, void
          * avoids a __destruct firing inside zealphp_on_resume. */
         if (!zealphp_globals_isolatable(src)) continue;
         zval copy;
-        ZVAL_DUP(&copy, src);
+        ZVAL_COPY(&copy, src);   /* share; COW on write */
         zend_hash_update(Z_ARRVAL(inner), vn, &copy);
     } ZEND_HASH_FOREACH_END();
     /* update (not add_new): an op_array may be reached twice via inheritance. */
@@ -2021,7 +2752,7 @@ static void zealphp_fn_statics_restore_cb(zend_op_array *opa, HashTable *live, v
         zval *slot = zend_hash_find(live, vn);
         if (!slot) {
             zval copy;
-            ZVAL_DUP(&copy, val);
+            ZVAL_COPY(&copy, val);
             zend_hash_add(live, vn, &copy);
             continue;
         }
@@ -2034,18 +2765,41 @@ static void zealphp_fn_statics_restore_cb(zend_op_array *opa, HashTable *live, v
          * callback; a destructor's first BIND_STATIC grows the registry this
          * walk iterates). Leave it shared, as the save side does. */
         if (!zealphp_globals_isolatable(target)) continue;
+        if (Z_REFCOUNTED_P(val) && Z_REFCOUNTED_P(target)
+            && Z_COUNTED_P(val) == Z_COUNTED_P(target)) continue;   /* unchanged since our restore */
         zval old;
         ZVAL_COPY_VALUE(&old, target);
-        ZVAL_DUP(target, val);
-        zealphp_release(&old);   /* an array may still hold the last ref to an object */
+        ZVAL_COPY(target, val);   /* share; COW on write */
+        zealphp_release(&old);    /* an array may still hold the last ref to an object */
     } ZEND_HASH_FOREACH_END();
 }
 
 static void zealphp_fn_statics_snapshot_save(long cid)
 {
+    /* perf: only the functions THIS coroutine ran (BIND_STATIC fired in it).
+     * os_get_cid() names the parking coroutine here (on_yield, or the inline
+     * resumer in zealphp_inline_park). */
+    long zp_tcid = zealphp_lane_touch_cid(cid);
+    HashTable *set = (zealphp_fn_touched_live && zp_tcid > 0)
+        ? zend_hash_index_find_ptr(&zealphp_fn_touched, (zend_ulong)zp_tcid) : NULL;
+    bool zp_fn_full = zp_tcid < 0 || zealphp_lane_full_walk(cid);   /* no cid yet, or a child wrote before it had one */
+    if (!zp_fn_full && (!set || zend_hash_num_elements(set) == 0)) {
+        return;   /* nothing of ours to carry; a prior lane (if any) stays as is */
+    }
     zval outer;
     array_init(&outer);
-    zealphp_walk_fn_statics_registry(zealphp_fn_statics_save_cb, &outer);
+    if (zp_fn_full) {
+        zealphp_walk_fn_statics_registry(zealphp_fn_statics_save_cb, &outer);
+    } else {
+        zend_ulong key;
+        ZEND_HASH_FOREACH_NUM_KEY(set, key) {
+            zend_op_array *opa = zend_hash_index_find_ptr(&zealphp_fn_static_registry, key);
+            if (!opa || !opa->static_variables) continue;
+            HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+            if (!live || live == opa->static_variables) continue;
+            zealphp_fn_statics_save_cb(opa, live, &outer);
+        } ZEND_HASH_FOREACH_END();
+    }
     if (zend_hash_num_elements(Z_ARRVAL(outer)) > 0) {
         zend_hash_index_update(&zealphp_coro_fn_static_snapshots, (zend_ulong)cid, &outer);
     } else {
@@ -2058,7 +2812,24 @@ static void zealphp_fn_statics_snapshot_restore(long cid)
 {
     zval *outer = zend_hash_index_find(&zealphp_coro_fn_static_snapshots, (zend_ulong)cid);
     if (!outer || Z_TYPE_P(outer) != IS_ARRAY) return;
-    zealphp_walk_fn_statics_registry(zealphp_fn_statics_restore_cb, outer);
+    /* perf: walk the lane (O(touched)), not the registry. */
+    zend_ulong key;
+    ZEND_HASH_FOREACH_NUM_KEY(Z_ARRVAL_P(outer), key) {
+        zend_op_array *opa = zend_hash_index_find_ptr(&zealphp_fn_static_registry, key);
+        if (!opa || !opa->static_variables) continue;
+        if (!ZEND_MAP_PTR(opa->static_variables_ptr)) continue;
+        HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+        if (!live || live == opa->static_variables) {
+            /* Table gone (a reset destroyed it): re-dup the template so our
+             * values have somewhere to land — mirrors ZEND_BIND_STATIC's dup. */
+            live = zend_array_dup(opa->static_variables);
+            ZEND_MAP_PTR_SET(opa->static_variables_ptr, live);
+        }
+        zealphp_fn_statics_restore_cb(opa, live, outer);
+        /* The live table now holds a non-template value: the next request's
+         * begin-refresh / end-reset must visit it. */
+        if (zealphp_fn_dirty_live) zend_hash_index_update_ptr(&zealphp_fn_dirty, key, opa);
+    } ZEND_HASH_FOREACH_END();
 }
 
 static void zealphp_fn_statics_snapshot_delete(long cid)
@@ -2294,9 +3065,76 @@ static void zealphp_globals_parent_clear(void)
  *   - Reinstall every parent key (refcount-shared via ZVAL_COPY).
  * Used by both snapshot_save (post-yield reset so the next coroutine
  * inherits clean state) and snapshot_restore (pre-delta cleanup). */
+/* perf: true while the live table is known to equal the parent baseline — set
+ * by every reset_to_parent, cleared when a coroutine starts or resumes onto the
+ * table (it may write). The restore side skips its belt-and-suspenders reset
+ * while this holds (the common event-loop resume right after a peer's yield). */
+static bool zealphp_globals_live_is_parent = false;
+
+/* Reset ONE live slot to the parent baseline (or NULL). `val` is the live
+ * bucket (may be IS_INDIRECT / IS_REFERENCE), `pv` the parent value or NULL.
+ * Displaced refcounted values go to *dead (created on demand). */
+static zend_always_inline void zealphp_globals_reset_slot(zend_string *key, zval *val, zval *pv,
+                                                          HashTable *dead, bool *dead_live)
+{
+    bool indirect = (Z_TYPE_P(val) == IS_INDIRECT);
+    zval *target = val;
+    if (indirect) target = Z_INDIRECT_P(target);
+    if (Z_ISREF_P(target)) target = Z_REFVAL_P(target);
+    if (!zealphp_globals_isolatable_obj(target)) return;
+    if (!pv && indirect) return;                                 /* master's own variable */
+    if (pv) {
+        zval *pvd = Z_ISREF_P(pv) ? Z_REFVAL_P(pv) : pv;
+        if (zealphp_globals_zval_identical(target, pvd)) return;   /* already at baseline */
+    } else if (Z_TYPE_P(target) == IS_NULL) {
+        return;
+    }
+    ZTRACE(key, "reset: write %s indirect=%d oldtype=%d", pv ? "baseline" : "NULL",
+           (int) indirect, (int) Z_TYPE_P(target));
+    zval old;
+    ZVAL_COPY_VALUE(&old, target);
+    if (pv) {
+        ZVAL_COPY(target, Z_ISREF_P(pv) ? Z_REFVAL_P(pv) : pv);
+    } else {
+        ZVAL_NULL(target);
+    }
+    if (Z_REFCOUNTED(old)) {
+        if (!*dead_live) { zend_hash_init(dead, 8, NULL, zealphp_deferred_zval_dtor, 0); *dead_live = true; }
+        zend_hash_next_index_insert(dead, &old);
+    }
+}
+
 static void zealphp_globals_reset_to_parent(void)
 {
     if (!EG(symbol_table).nTableMask) return;
+    zealphp_globals_live_is_parent = true;   /* holds from the end of this walk on */
+
+    /* perf: when every write since the last full reset was recorded, only the
+     * dirty keys can differ from the parent — reset those and forget them. */
+    if (zealphp_glob_hooks_wanted && zealphp_glob_dirty_live
+        && !zend_hash_exists(&zealphp_glob_dirty, zealphp_glob_all_key)) {
+        HashTable zp_dead;
+        bool zp_dead_live = false;
+        zend_string *dk;
+        ZEND_HASH_FOREACH_STR_KEY(&zealphp_glob_dirty, dk) {
+            if (!dk || zealphp_globals_is_superglobal_key(ZSTR_VAL(dk), ZSTR_LEN(dk))) continue;
+            zval *pv = zealphp_coro_globals_parent_set ? zend_hash_find(&zealphp_coro_globals_parent, dk) : NULL;
+            zval *val = zend_hash_find(&EG(symbol_table), dk);
+            if (!val) {
+                if (pv) {   /* unset() by a request: reinstall the baseline */
+                    zval copy;
+                    ZVAL_COPY(&copy, pv);
+                    zend_hash_add_new(&EG(symbol_table), dk, &copy);
+                }
+                continue;
+            }
+            zealphp_globals_reset_slot(dk, val, pv, &zp_dead, &zp_dead_live);
+        } ZEND_HASH_FOREACH_END();
+        zend_hash_clean(&zealphp_glob_dirty);
+        if (zp_dead_live) zend_hash_destroy(&zp_dead);
+        return;
+    }
+    if (zealphp_glob_dirty_live) zend_hash_clean(&zealphp_glob_dirty);   /* full reset below covers everything */
 
     /* Value-in-place reset (Stage-8 safe): NEVER zend_hash_del a slot. A live
      * global-scope include frame holds an INDIRECT CV into the bucket; deleting it
@@ -2314,7 +3152,7 @@ static void zealphp_globals_reset_to_parent(void)
      * grows (reallocates) the very table this loop is iterating. Inside a
      * switch callback the release is deferred instead (B1, zealphp_release). */
     HashTable zp_dead;
-    zend_hash_init(&zp_dead, 8, NULL, zealphp_deferred_zval_dtor, 0);
+    bool zp_dead_live = false;   /* perf: allocate the dead-list only when something is displaced */
     ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), key, rv) {
         if (!key) continue;
         if (zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
@@ -2337,6 +3175,14 @@ static void zealphp_globals_reset_to_parent(void)
          * resets to NULL below; an IS_INDIRECT that IS in the baseline (a master
          * global a request overwrote) still resets to the baseline value. */
         if (!pv && indirect) continue;
+        /* perf: already at the baseline (same payload pointer / scalar) or
+         * already NULL — nothing to write, no refcount churn. */
+        if (pv) {
+            zval *pvd = Z_ISREF_P(pv) ? Z_REFVAL_P(pv) : pv;
+            if (zealphp_globals_zval_identical(target, pvd)) continue;
+        } else if (Z_TYPE_P(target) == IS_NULL) {
+            continue;
+        }
         ZTRACE(key, "reset: write %s indirect=%d oldtype=%d", pv ? "baseline" : "NULL",
                (int) indirect, (int) Z_TYPE_P(target));
         zval old;
@@ -2347,10 +3193,11 @@ static void zealphp_globals_reset_to_parent(void)
             ZVAL_NULL(target);
         }
         if (Z_REFCOUNTED(old)) {
+            if (!zp_dead_live) { zend_hash_init(&zp_dead, 8, NULL, zealphp_deferred_zval_dtor, 0); zp_dead_live = true; }
             zend_hash_next_index_insert(&zp_dead, &old);   /* released below */
         }
     } ZEND_HASH_FOREACH_END();
-    zend_hash_destroy(&zp_dead);
+    if (zp_dead_live) zend_hash_destroy(&zp_dead);
 
     /* Reinstall parent keys not present (e.g. userland unset() removed one). */
     if (zealphp_coro_globals_parent_set) {
@@ -2381,6 +3228,82 @@ static void zealphp_globals_reset_to_parent(void)
  * After saving, resets EG to parent baseline so the next coroutine
  * (even one started inline via Coroutine::create before any channel yield)
  * always inherits a clean parent state rather than leftover writes. */
+/* ── perf: touched-key $GLOBALS save ─────────────────────────────────
+ * With the global-write hooks on, a coroutine's lane can only differ from the
+ * parent at the keys it wrote (BIND_GLOBAL, $GLOBALS[...] writes, extract()
+ * into global scope, Stage-8 frame CVs). The save then visits those keys
+ * instead of the whole table: capture + park + reset per key in one step.
+ * The full-walk zealphp_globals_snapshot_save_ex() below stays the path for
+ * the "unknown key" marker, for child lanes (F12) and for capture-only. */
+typedef struct {
+    long cid;
+    zval *delta;
+    zval *reg;                 /* lazily created per-cid Stage-8 registry array */
+    HashTable dead;            /* displaced values, released after the walk (deferred: B1) */
+    bool dead_live;
+    zealphp_frame_range rbuf[ZEALPHP_MAX_REQ_FRAME_RANGES];
+    zealphp_frame_range *ranges;
+    int nranges;
+} zealphp_gsave_ctx;
+
+static void zealphp_globals_save_key(zealphp_gsave_ctx *c, zend_string *key, zval *val, zval *pv)
+{
+    bool indirect = (Z_TYPE_P(val) == IS_INDIRECT);
+    zval *uv = val;
+    if (indirect) {
+        uv = Z_INDIRECT_P(uv);
+        if (zealphp_ptr_in_frame_ranges(uv, c->ranges, c->nranges)) {
+            /* Pass 1b (ext#52): a request-frame CV. PARK it — save the value
+             * into the per-coroutine registry (one held ref), NULL the frame
+             * CV, and SEVER the bucket to a plain NULL, so at every suspension
+             * point no bucket is INDIRECT into a request frame (a peer's
+             * zend_attach_symbol_table can then only ever move a NULL).
+             * Re-applied to the right frame CV by restore Step 2b. */
+            zval *tgt = uv;
+            if (Z_ISREF_P(tgt)) tgt = Z_REFVAL_P(tgt);
+            if (Z_TYPE_P(tgt) != IS_UNDEF) {
+                ZTRACE(key, "park: type=%d slot=%p", (int) Z_TYPE_P(tgt), (void *) uv);
+                if (!c->reg) {
+                    c->reg = zend_hash_index_find(&zealphp_coro_indirect_objs, (zend_ulong)c->cid);
+                    if (!c->reg) {
+                        zval arr;
+                        array_init(&arr);
+                        c->reg = zend_hash_index_add_new(&zealphp_coro_indirect_objs, (zend_ulong)c->cid, &arr);
+                    }
+                }
+                zval held;
+                ZVAL_COPY(&held, tgt);                            /* +1: registry holds the value */
+                zend_hash_update(Z_ARRVAL_P(c->reg), key, &held);  /* frees a prior entry (replaced value) */
+                zval zp_cv;
+                ZVAL_COPY_VALUE(&zp_cv, tgt);
+                ZVAL_NULL(tgt);                                   /* park the frame slot */
+                zealphp_release(&zp_cv);                          /* B1: the CV's ref goes outside the callback */
+            }
+            ZVAL_NULL(val);                                       /* sever the bucket→frame edge */
+            if (pv) {
+                ZVAL_COPY(val, Z_ISREF_P(pv) ? Z_REFVAL_P(pv) : pv);   /* baseline for peers */
+            }
+            return;
+        }
+    }
+    zval *target = uv;
+    if (Z_ISREF_P(target)) target = Z_REFVAL_P(target);   /* deref global-keyword refs */
+
+    /* Delta capture (the former Pass 1). */
+    if (Z_TYPE_P(target) != IS_UNDEF
+        && zealphp_globals_isolatable_obj(target)          /* resources stay shared */
+        && !(!pv && indirect)                              /* a master-frame CV not in the baseline is the master's own var */
+        && !(pv && zealphp_globals_zval_identical(target, pv))) {
+        ZTRACE(key, "save: delta-capture type=%d indirect=%d", (int) Z_TYPE_P(target), (int) indirect);
+        zval copy;
+        ZVAL_COPY(&copy, target);   /* B3: share; a refcount >= 2 payload COW-separates on any write */
+        zend_hash_update(Z_ARRVAL_P(c->delta), key, &copy);
+    }
+
+    /* Reset in place (the former zealphp_globals_reset_to_parent walk). */
+    zealphp_globals_reset_slot(key, val, pv, &c->dead, &c->dead_live);
+}
+
 /* Lane flags for the $GLOBALS / statics save side (F12 child lanes). */
 #define ZP_LANE_CAPTURE  1   /* record the live view, change nothing (no park, no reset) */
 
@@ -2549,8 +3472,82 @@ static void zealphp_globals_snapshot_save_ex(long cid, long frame_key, int flags
     }
 }
 
+/* perf: the touched-key save (see the note above zealphp_gsave_ctx). */
+static void zealphp_globals_snapshot_save_touched(long cid, HashTable *touched)
+{
+    zealphp_gsave_ctx c;
+    c.cid = cid;
+    c.reg = NULL;
+    c.dead_live = false;
+    c.ranges = c.rbuf;
+    /* ext#52 perf: one frame-chain walk per save; per-key tests are a few
+     * pointer comparisons instead of an O(frames) re-walk each. */
+    c.nranges = zealphp_collect_request_frame_ranges(c.rbuf, ZEALPHP_MAX_REQ_FRAME_RANGES, &c.ranges);
+
+    zval delta;
+    array_init(&delta);
+    c.delta = &delta;
+    bool zp_parent_set = zealphp_coro_globals_parent_set;
+
+    zval tombstones;
+    bool tomb_init = false;
+    zend_string *key;
+    ZEND_HASH_FOREACH_STR_KEY(touched, key) {
+        if (!key || zealphp_globals_is_superglobal_key(ZSTR_VAL(key), ZSTR_LEN(key))) continue;
+        zval *pv = zp_parent_set ? zend_hash_find(&zealphp_coro_globals_parent, key) : NULL;
+        zval *val = zend_hash_find(&EG(symbol_table), key);
+        if (!val) {
+            if (pv) {   /* this coroutine unset() a baseline key: tombstone for it, reinstall for peers */
+                if (!tomb_init) { array_init(&tombstones); tomb_init = true; }
+                zval one;
+                ZVAL_LONG(&one, 1);
+                zend_hash_update(Z_ARRVAL(tombstones), key, &one);
+                zval copy;
+                ZVAL_COPY(&copy, pv);
+                zend_hash_add_new(&EG(symbol_table), key, &copy);
+            }
+            continue;
+        }
+        zealphp_globals_save_key(&c, key, val, pv);
+        /* This key is back at the parent (or NULL); drop it from the dirty
+         * set — a later restore re-adds the keys it re-applies. */
+        if (zealphp_glob_dirty_live) zend_hash_del(&zealphp_glob_dirty, key);
+    } ZEND_HASH_FOREACH_END();
+    if (tomb_init) {
+        zend_hash_index_update(&zealphp_coro_globals_tombstones, (zend_ulong)cid, &tombstones);
+    } else {
+        /* nothing unset now: drop a stale set from an earlier save */
+        zend_hash_index_del(&zealphp_coro_globals_tombstones, (zend_ulong)cid);
+    }
+    zend_hash_index_update(&zealphp_coro_globals_deltas, (zend_ulong)cid, &delta);
+
+    if (c.ranges != c.rbuf) efree(c.ranges);
+    /* Displaced values are released AFTER the walk (and, B1, outside the
+     * callback: the dead-list dtor defers them to coroutine context). */
+    if (c.dead_live) zend_hash_destroy(&c.dead);
+}
+
 static void zealphp_globals_snapshot_save(long cid)
 {
+    if (!EG(symbol_table).nTableMask) return;
+    long zp_tcid = zealphp_lane_touch_cid(cid);
+    if (zealphp_glob_hooks_wanted && zp_tcid > 0 && !zealphp_lane_full_walk(cid)) {
+        HashTable *touched = zealphp_glob_touched_live
+            ? zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)zp_tcid) : NULL;
+        if (!touched || zend_hash_num_elements(touched) == 0) {
+            /* perf: no recorded write since this coroutine started, so the
+             * live table is already the parent for every key it could have
+             * changed: no frame walk, no lane, no reset. The restore side
+             * treats "no lane" as "nothing to apply" and still re-parks a
+             * table a non-gated peer left dirty. */
+            zealphp_globals_live_is_parent = true;
+            return;
+        }
+        if (!zend_hash_exists(touched, zealphp_glob_all_key)) {
+            zealphp_globals_snapshot_save_touched(cid, touched);
+            return;
+        }
+    }
     zealphp_globals_snapshot_save_ex(cid, cid, 0);
 }
 
@@ -2587,13 +3584,24 @@ static void zealphp_globals_snapshot_restore_ex(long cid, long frame_key)
      * mid-request resume wiped the live owner's $GLOBALS (`$g` → NULL). */
     if (!zend_hash_index_exists(&zealphp_coro_globals_deltas, (zend_ulong)cid)
         && !zend_hash_index_exists(&zealphp_coro_globals_tombstones, (zend_ulong)cid)) {
+        /* No lane (an untouched coroutine, or one that never yielded as a
+         * request). Still make sure it resumes onto the parent: a peer that is
+         * not save-gated may have written since the last reset. */
+        if (!zealphp_globals_live_is_parent) {
+            zealphp_globals_reset_to_parent();
+        }
+        zealphp_globals_live_is_parent = false;   /* about to run on it */
         return;
     }
 
     /* Step 1 — parent baseline (belt-and-suspenders: on_yield reset it too,
      * but on_resume may fire without a preceding on_yield if OpenSwoole
-     * resumes a coroutine that was never explicitly yielded). */
-    zealphp_globals_reset_to_parent();
+     * resumes a coroutine that was never explicitly yielded). perf: skipped
+     * when nothing ran on the table since the last reset. */
+    if (!zealphp_globals_live_is_parent) {
+        zealphp_globals_reset_to_parent();
+    }
+    zealphp_globals_live_is_parent = false;   /* this coroutine is about to run on it */
 
     /* Step 2 — apply delta (adds / overrides). */
     zval *delta = zend_hash_index_find(&zealphp_coro_globals_deltas, (zend_ulong)cid);
@@ -2627,6 +3635,7 @@ static void zealphp_globals_snapshot_restore_ex(long cid, long frame_key)
                 ZVAL_COPY(&copy, val);
                 zend_hash_add_new(&EG(symbol_table), key, &copy);
             }
+            if (zealphp_glob_dirty_live) zend_hash_add_empty_element(&zealphp_glob_dirty, key);   /* live != parent again */
         } ZEND_HASH_FOREACH_END();
     }
 
@@ -2685,6 +3694,7 @@ static void zealphp_globals_snapshot_restore_ex(long cid, long frame_key)
                     ZVAL_INDIRECT(&ind, slot);
                     zend_hash_add_new(&EG(symbol_table), oa->vars[i], &ind);
                 }
+                if (zealphp_glob_dirty_live) zend_hash_add_empty_element(&zealphp_glob_dirty, oa->vars[i]);
                 zend_hash_del(reg, oa->vars[i]);
             }
         }
@@ -2709,6 +3719,7 @@ static void zealphp_globals_snapshot_restore_ex(long cid, long frame_key)
                     ZVAL_COPY(&copy, oval);
                     zend_hash_add_new(&EG(symbol_table), okey, &copy);
                 }
+                if (zealphp_glob_dirty_live) zend_hash_add_empty_element(&zealphp_glob_dirty, okey);
             } ZEND_HASH_FOREACH_END();
             zend_hash_clean(reg);
         }
@@ -2732,6 +3743,7 @@ static void zealphp_globals_snapshot_restore_ex(long cid, long frame_key)
             } else {
                 zend_hash_del(&EG(symbol_table), key);
             }
+            if (zealphp_glob_dirty_live) zend_hash_add_empty_element(&zealphp_glob_dirty, key);   /* missing != parent */
         } ZEND_HASH_FOREACH_END();
     }
 
@@ -2793,16 +3805,49 @@ static void zealphp_globals_snapshot_restore_ex(long cid, long frame_key)
         zend_hash_init(&zp_canon, 16, NULL, NULL, 0);
         zend_string *gk;
         zval *gv;
-        ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), gk, gv) {
-            if (!gk) continue;
-            if (zealphp_globals_is_superglobal_key(ZSTR_VAL(gk), ZSTR_LEN(gk))) continue;
-            zval *slot = gv;
-            if (Z_TYPE_P(slot) == IS_INDIRECT) slot = Z_INDIRECT_P(slot);
-            zval *dv = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot;
-            if (Z_TYPE_P(dv) != IS_OBJECT && Z_TYPE_P(dv) != IS_ARRAY) continue;  /* repair only toward a live object/array */
-            if (!Z_ISREF_P(slot)) ZVAL_MAKE_REF(slot);               /* establish a shareable canonical reference */
-            zend_hash_update_ptr(&zp_canon, gk, Z_REF_P(slot));
-        } ZEND_HASH_FOREACH_END();
+        /* perf: a frame can only hold a `global $K` binding for a key its own
+         * coroutine touched (ZEND_BIND_GLOBAL is a recorded write), so when
+         * every write was recorded the canon set is this coroutine's touched
+         * keys, not the whole table. os_get_cid() is NOT the resumed
+         * coroutine here (see the identity note above zealphp_on_yield), so the
+         * touched set is found through the cid → ptr bridge instead. */
+        HashTable *zp_tset = NULL;
+        bool zp_canon_none = false;
+        if (zealphp_glob_hooks_wanted && zealphp_glob_touched_live && !zealphp_lane_full_walk(cid)) {
+            zval *zp_tc = zend_hash_index_find(&zealphp_coro_ptr_to_cid, (zend_ulong)cid);
+            if (zp_tc && Z_TYPE_P(zp_tc) == IS_LONG) {
+                zp_tset = zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)Z_LVAL_P(zp_tc));
+            }
+            if (!zp_tset || zend_hash_num_elements(zp_tset) == 0) {
+                zp_canon_none = true;      /* a `global $K` binding is a recorded write: none → nothing to repair */
+            } else if (zend_hash_exists(zp_tset, zealphp_glob_all_key)) {
+                zp_tset = NULL;            /* unknown keys: full scan */
+            }
+        }
+#define ZP_CANON_CONSIDER(gk, gv) do { \
+            if (!(gk)) break; \
+            if (zealphp_globals_is_superglobal_key(ZSTR_VAL(gk), ZSTR_LEN(gk))) break; \
+            zval *slot = (gv); \
+            if (Z_TYPE_P(slot) == IS_INDIRECT) slot = Z_INDIRECT_P(slot); \
+            zval *dv = Z_ISREF_P(slot) ? Z_REFVAL_P(slot) : slot; \
+            if (Z_TYPE_P(dv) != IS_OBJECT && Z_TYPE_P(dv) != IS_ARRAY) break;  /* repair only toward a live object/array */ \
+            if (!Z_ISREF_P(slot)) ZVAL_MAKE_REF(slot);               /* establish a shareable canonical reference */ \
+            zend_hash_update_ptr(&zp_canon, (gk), Z_REF_P(slot)); \
+        } while (0)
+        if (zp_canon_none) {
+            /* nothing bound by this coroutine */
+        } else if (zp_tset) {
+            ZEND_HASH_FOREACH_STR_KEY(zp_tset, gk) {
+                gv = gk ? zend_hash_find(&EG(symbol_table), gk) : NULL;
+                if (!gv) continue;
+                ZP_CANON_CONSIDER(gk, gv);
+            } ZEND_HASH_FOREACH_END();
+        } else {
+            ZEND_HASH_FOREACH_STR_KEY_VAL(&EG(symbol_table), gk, gv) {
+                ZP_CANON_CONSIDER(gk, gv);
+            } ZEND_HASH_FOREACH_END();
+        }
+#undef ZP_CANON_CONSIDER
 
         if (zend_hash_num_elements(&zp_canon) > 0) {
             zend_execute_data *rx = EG(current_execute_data);
@@ -2856,6 +3901,7 @@ static void zealphp_globals_snapshot_restore(long cid)
 /* Delete both per-coroutine tables on coroutine close. */
 static void zealphp_globals_snapshot_delete(long cid)
 {
+    if (zealphp_lane_force_full_live) zend_hash_index_del(&zealphp_lane_force_full, (zend_ulong)cid);
     zend_hash_index_del(&zealphp_coro_globals_deltas,     (zend_ulong)cid);
     zend_hash_index_del(&zealphp_coro_globals_tombstones, (zend_ulong)cid);
     /* Releases this coroutine's held refs to its Stage-8 object globals. When
@@ -2869,6 +3915,7 @@ static void zealphp_globals_snapshot_delete(long cid)
 /* Defined below (~1713); forward-declared so snapshot_save()/snapshot_restore()
  * can reuse the CV-cache-safe in-place superglobal write for the #15 reset/clear. */
 static void zealphp_set_superglobal(const char *name, size_t name_len, zval *value);
+static int zealphp_track_vars_index(const char *name);
 
 /* Superglobal OWNERSHIP gating (the go()-child steal — zealphp#332 / #2
  * residual): the live superglobals belong to ONE coroutine — the request
@@ -2900,11 +3947,58 @@ static int zealphp_sg_dbg(void) {
 /* snapshot key (coroutine ptr cast) → IS_LONG owner cid, written at save time. */
 static HashTable zealphp_coro_sg_owner_cids;
 
+/* perf: the seven superglobal names as interned strings with a cached hash,
+ * so the per-switch lookups are zend_hash_find (no strlen/rehash). */
+static zend_string *zealphp_sg_keys[8];
+static int zealphp_sg_track_idx[8];   /* PG(http_globals) slot per name, -1 = none (_SESSION) */
+static int zealphp_sg_keys_n = 0;
+static void zealphp_sg_keys_init(void)
+{
+    if (zealphp_sg_keys_n) return;
+    for (const char **n = sg_names; *n && zealphp_sg_keys_n < 8; n++) {
+        zealphp_sg_track_idx[zealphp_sg_keys_n] = zealphp_track_vars_index(*n);
+        zealphp_sg_keys[zealphp_sg_keys_n++] = zend_string_init_interned(*n, strlen(*n), 1);
+    }
+}
+
+/* perf: the superglobal lane is a fixed struct — one zval per superglobal,
+ * UNDEF = not in the lane — kept per coroutine for its lifetime. A yield moves
+ * the live arrays into it and a resume moves them back; no array allocation,
+ * no hash inserts and no lookups per switch. */
+typedef struct {
+    zval v[8];
+} zealphp_sg_lane;
+static HashTable zealphp_coro_sg_lanes;        /* cid → zealphp_sg_lane* */
+static bool      zealphp_coro_sg_lanes_live = false;
+static void zealphp_sg_lane_dtor(zval *zv)
+{
+    zealphp_sg_lane *l = Z_PTR_P(zv);
+    if (!l) return;
+    for (int i = 0; i < 8; i++) {
+        if (Z_TYPE(l->v[i]) != IS_UNDEF) zealphp_release(&l->v[i]);   /* B1: may run user code → deferred */
+    }
+    efree(l);
+}
+static zealphp_sg_lane *zealphp_sg_lane_get(long cid, bool create)
+{
+    if (!zealphp_coro_sg_lanes_live) {
+        if (!create) return NULL;
+        zend_hash_init(&zealphp_coro_sg_lanes, 256, NULL, zealphp_sg_lane_dtor, 0);
+        zealphp_coro_sg_lanes_live = true;
+    }
+    zealphp_sg_lane *l = zend_hash_index_find_ptr(&zealphp_coro_sg_lanes, (zend_ulong)cid);
+    if (l || !create) return l;
+    l = emalloc(sizeof(zealphp_sg_lane));
+    for (int i = 0; i < 8; i++) ZVAL_UNDEF(&l->v[i]);
+    zend_hash_index_add_new_ptr(&zealphp_coro_sg_lanes, (zend_ulong)cid, l);
+    return l;
+}
 static void zealphp_snapshot_save(long cid)
 {
     /* Guard: EG(symbol_table) may be invalid during coroutine teardown.
      * Check that the table has a valid nTableMask (non-zero when initialized). */
     if (!EG(symbol_table).nTableMask) return;
+    zealphp_sg_keys_init();
 
     /* Owner gate: a non-owner coroutine (a go() child) yielding must leave
      * the live superglobals alone — they belong to its parent request. #42:
@@ -2935,10 +4029,16 @@ static void zealphp_snapshot_save(long cid)
             (sgda && Z_TYPE_P(sgda) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(sgda)) : -1);
     }
 
-    zval snapshot;
-    array_init(&snapshot);
-    for (const char **n = sg_names; *n; n++) {
-        zval *sg = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
+    zealphp_sg_lane *zp_lane = zealphp_sg_lane_get(cid, true);
+    for (int zp_si = 0; zp_si < zealphp_sg_keys_n; zp_si++) {
+        zval *zp_slot = &zp_lane->v[zp_si];
+        if (Z_TYPE_P(zp_slot) != IS_UNDEF) {   /* a yield without a resume in between: drop the stale entry */
+            zval zp_stale;
+            ZVAL_COPY_VALUE(&zp_stale, zp_slot);
+            ZVAL_UNDEF(zp_slot);
+            zealphp_release(&zp_stale);
+        }
+        zval *sg = zend_hash_find(&EG(symbol_table), zealphp_sg_keys[zp_si]);
         if (!sg) continue;
         /* $_GET et al. may be wrapped in IS_REFERENCE — ZealPHP's
          * RequestContext &__get() hands back $GLOBALS['_GET'] BY REFERENCE,
@@ -2947,38 +4047,32 @@ static void zealphp_snapshot_save(long cid)
          * referenced superglobal entirely, dropping it on resume (the
          * "$_GET cleared after yield once code touches $g->get" leak). */
         zval *arr = Z_ISREF_P(sg) ? Z_REFVAL_P(sg) : sg;
-        if (Z_TYPE_P(arr) == IS_ARRAY) {
-            /* B3: hold a reference instead of a deep copy. The live slot is
-             * replaced by a fresh empty array right below (or, capture-only,
-             * shared copy-on-write with the parent), so the snapshot is the
-             * array's owner and no request data is copied per switch. The
-             * deep copy made every yield duplicate e.g. an 8 MB $_POST and
-             * $_REQUEST, with memory_limit lifted, and the clamp afterwards
-             * made the NEXT coroutine's allocation fatal. */
-            zval copy;
-            ZVAL_COPY(&copy, arr);
-            add_assoc_zval(&snapshot, *n, &copy);
+        if (Z_TYPE_P(arr) != IS_ARRAY) continue;
+        /* perf: the immutable empty array IS the parked value — moving it into
+         * the lane and back buys nothing; the restore treats "absent from the
+         * lane + live is the immutable empty array" as "mine, already there". */
+        if (Z_ARRVAL_P(arr) == (HashTable *)&zend_empty_array) continue;
+        if (zp_capture_only) {
+            /* Adopted child: inherit a (COW-shared) view, leave the live table. */
+            ZVAL_COPY(zp_slot, arr);   /* shared, copy-on-write */
+            continue;
         }
-    }
-    zend_hash_index_update(&zealphp_coro_snapshots, (zend_ulong)cid, &snapshot);
-
-    /* #15: AFTER snapshotting this coroutine's superglobals, reset the live EG
-     * slots to empty — the same post-save reset $GLOBALS isolation does via
-     * reset_to_parent. Without this, a value this coroutine left in the
-     * process-shared symbol table (e.g. $_SESSION) stays live while it is
-     * suspended, so the NEXT coroutine's snapshot_save captures it as ITS OWN →
-     * cross-coroutine session leak. This coroutine's values are re-applied from
-     * the snapshot on its resume, so the round-trip is preserved; peers running
-     * in between start from a clean slate. Superglobals are per-request, so the
-     * clean baseline is "empty" (each request repopulates its own). */
-    if (!zp_capture_only) {
-        for (const char **n = sg_names; *n; n++) {
-            if (zend_hash_str_find(&EG(symbol_table), *n, strlen(*n))) {
-                zval empty;
-                array_init(&empty);
-                zealphp_set_superglobal(*n, strlen(*n), &empty);
-                zval_ptr_dtor(&empty);
+        /* MOVE the array into the lane (O(1), no copy) and park the live slot
+         * at the immutable empty array (#15: a suspended coroutine's values
+         * must not stay live, or the next coroutine's save captures them as
+         * its own — the cross-coroutine $_SESSION leak). The slot keeps its
+         * zval address and reference wrapper (CV-cache / $g alias safe). The
+         * owner's array comes back untouched on resume — refcount unchanged,
+         * so its first write after the resume separates nothing. */
+        ZVAL_COPY_VALUE(zp_slot, arr);   /* MOVE: the owner keeps its refcount */
+        ZVAL_EMPTY_ARRAY(arr);
+        /* Keep PG(http_globals) (the auto-global JIT source) in step. */
+        int zp_idx = zealphp_sg_track_idx[zp_si];
+        if (zp_idx >= 0) {
+            if (Z_TYPE(PG(http_globals)[zp_idx]) != IS_UNDEF) {
+                zval_ptr_dtor(&PG(http_globals)[zp_idx]);
             }
+            ZVAL_EMPTY_ARRAY(&PG(http_globals)[zp_idx]);
         }
     }
 
@@ -3001,18 +4095,27 @@ static void zealphp_snapshot_save(long cid)
     }
 }
 
+static zend_always_inline bool zealphp_sg_live_needs_clear(zend_string *key)
+{
+    zval *live = zend_hash_find(&EG(symbol_table), key);
+    if (!live) return false;
+    zval *a = Z_ISREF_P(live) ? Z_REFVAL_P(live) : live;
+    /* the immutable empty array is the parked value itself (and what a
+     * skipped-empty save left behind): nothing to clear */
+    return !(Z_TYPE_P(a) == IS_ARRAY && Z_ARRVAL_P(a) == (HashTable *)&zend_empty_array);
+}
 static void zealphp_snapshot_restore(long cid)
 {
-    zval *snapshot = zend_hash_index_find(&zealphp_coro_snapshots, (zend_ulong)cid);
-    if (!snapshot || Z_TYPE_P(snapshot) != IS_ARRAY) {
+    zealphp_sg_lane *zp_lane = zealphp_sg_lane_get(cid, false);
+    if (!zp_lane) {
         if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] restore NOSNAP key=%ld owner=%ld\n", cid, zealphp_sg_owner_cid);
         return;
     }
     if (zealphp_sg_dbg()) {
-        zval *sv = zend_hash_str_find(Z_ARRVAL_P(snapshot), "_SESSION", sizeof("_SESSION")-1);
+        zval *sv = &zp_lane->v[6];   /* _SESSION */
         fprintf(stderr, "[SGDBG] restore key=%ld owner_before=%ld snap_sess_n=%d\n",
             cid, zealphp_sg_owner_cid,
-            (sv && Z_TYPE_P(sv) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(sv)) : -1);
+            (Z_TYPE_P(sv) == IS_ARRAY) ? (int)zend_hash_num_elements(Z_ARRVAL_P(sv)) : -1);
     }
 
     /* Restore gate (#32 → reworked for #40): the original single-owner
@@ -3043,14 +4146,17 @@ static void zealphp_snapshot_restore(long cid)
         }
     }
 
-    for (const char **n = sg_names; *n; n++) {
-        zval *val = zend_hash_str_find(Z_ARRVAL_P(snapshot), *n, strlen(*n));
-        if (val) {
-            /* In-place zval swap with ZVAL_DUP: same pattern as
-             * zealphp_set_superglobal. Preserves the zval memory address
-             * (CV cache compatible) AND creates a full copy with refcount=1
-             * (no COW separation on write). */
-            zval *existing = zend_hash_str_find(&EG(symbol_table), *n, strlen(*n));
+    zealphp_sg_keys_init();
+    for (int zp_si = 0; zp_si < zealphp_sg_keys_n; zp_si++) {
+        const char *const *n = &sg_names[zp_si];
+        zval *val = &zp_lane->v[zp_si];
+        if (Z_TYPE_P(val) != IS_UNDEF) {
+            /* MOVE the lane's array back into the live slot (O(1)): the slot
+             * keeps its zval address (CV cache compatible) and the array keeps
+             * its refcount — the owner writes to it with no COW separation. The
+             * lane entry is left as NULL so the snapshot's dtor frees nothing
+             * we handed back. */
+            zval *existing = zend_hash_find(&EG(symbol_table), zealphp_sg_keys[zp_si]);
             if (existing) {
                 /* If the live slot is an IS_REFERENCE (a $g->get alias bound
                  * via &__get), update the value the reference points at rather
@@ -3059,16 +4165,21 @@ static void zealphp_snapshot_restore(long cid)
                 zval *slot = Z_ISREF_P(existing) ? Z_REFVAL_P(existing) : existing;
                 zval old;
                 ZVAL_COPY_VALUE(&old, slot);
-                /* B3: share with the snapshot (copy-on-write) — a request that
-                 * only reads its input never copies it. */
-                ZVAL_COPY(slot, val);
-                zealphp_release(&old);
+                ZVAL_COPY_VALUE(slot, val);
+                ZVAL_UNDEF(val);         /* moved out of the lane */
+                zealphp_release(&old);   /* B1: may be a non-owner's last object ref */
+                /* PG(http_globals) is left at the empty array the save parked
+                 * there: sharing the owner's array into it would raise its
+                 * refcount and force a COW copy on the owner's first write.
+                 * The auto-global JIT only reads PG once per worker (the
+                 * "armed" flag), so the symbol table is the live source. */
             } else {
                 zval copy;
-                ZVAL_COPY(&copy, val);
-                zend_hash_str_add_new(&EG(symbol_table), *n, strlen(*n), &copy);
+                ZVAL_COPY_VALUE(&copy, val);
+                ZVAL_UNDEF(val);         /* moved out of the lane */
+                zend_hash_add_new(&EG(symbol_table), zealphp_sg_keys[zp_si], &copy);
             }
-        } else if (zend_hash_str_find(&EG(symbol_table), *n, strlen(*n))) {
+        } else if (zealphp_sg_live_needs_clear(zealphp_sg_keys[zp_si])) {
             /* #15 safety net: this superglobal is NOT in our snapshot but a value
              * is live in EG — a peer set it and finished without yielding (so the
              * post-save reset never ran for it). Clear it so we don't inherit the
@@ -3387,6 +4498,54 @@ static void zealphp_lane_close(void *arg)
  * coroutine whose PHP context is live right now (os_get_cid() names it): the
  * yielding coroutine in on_yield, or the inline resumer in on_resume (see
  * zealphp_inline_park). */
+/* ── Switch profiler (ZEALPHP_SWITCH_PROF=1) ──────────────────────────
+ * Per-stage wall-clock accumulators for the yield/resume path. Off by default
+ * (one static branch per stage); when on, each stage costs two clock_gettime
+ * calls. Read from PHP via zealphp_switch_profile(): [stage => [calls, ns]]. */
+#include <time.h>
+enum {
+    ZP_PROF_SG_SAVE, ZP_PROF_SG_RESTORE,
+    ZP_PROF_CONST_SAVE, ZP_PROF_CONST_RESTORE,
+    ZP_PROF_INI_SAVE, ZP_PROF_INI_RESTORE,
+    ZP_PROF_SETTINGS_SAVE, ZP_PROF_SETTINGS_RESTORE,
+    ZP_PROF_CSTAT_SAVE, ZP_PROF_CSTAT_RESTORE,
+    ZP_PROF_FSTAT_SAVE, ZP_PROF_FSTAT_RESTORE,
+    ZP_PROF_GLOB_SAVE, ZP_PROF_GLOB_RESTORE,
+    ZP_PROF_PARK_TOTAL, ZP_PROF_UNPARK_TOTAL,
+    ZP_PROF_REQ_RTCACHES, ZP_PROF_REQ_FSTAT_RESET, ZP_PROF_REQ_FSTAT_BEGIN, ZP_PROF_REQ_CSTAT_RESET,
+    ZP_PROF_REQ_GLOBALS_CLEAN, ZP_PROF_REQ_GLOBALS_END, ZP_PROF_REQ_CONST_CLEAR, ZP_PROF_REQ_INI_RESTORE,
+    ZP_PROF_REQ_INPUT_SET, ZP_PROF_REQ_SG_CLEAR, ZP_PROF_REQ_PSTATE_CLEAN,
+    ZP_PROF_N
+};
+static const char *zealphp_prof_names[ZP_PROF_N] = {
+    "sg_save", "sg_restore", "const_save", "const_restore", "ini_save", "ini_restore",
+    "settings_save", "settings_restore", "class_statics_save", "class_statics_restore",
+    "fn_statics_save", "fn_statics_restore", "globals_save", "globals_restore",
+    "park_total", "unpark_total",
+    "req_rtcaches", "req_fn_statics_reset", "req_fn_statics_begin", "req_class_statics_reset",
+    "req_globals_clean", "req_globals_request_end", "req_constants_clear", "req_ini_restore",
+    "req_input_set", "req_superglobals_clear", "req_process_state_clean"
+};
+static uint64_t zealphp_prof_ns[ZP_PROF_N];
+static uint64_t zealphp_prof_calls[ZP_PROF_N];
+static int zealphp_prof_on = -1;
+static zend_always_inline int zealphp_prof_enabled(void)
+{
+    if (zealphp_prof_on == -1) {
+        const char *e = getenv("ZEALPHP_SWITCH_PROF");
+        zealphp_prof_on = (e && *e == '1') ? 1 : 0;
+    }
+    return zealphp_prof_on;
+}
+static zend_always_inline uint64_t zealphp_prof_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#define ZP_PROF_BEGIN(id) uint64_t zp_t_##id = zealphp_prof_enabled() ? zealphp_prof_now() : 0
+#define ZP_PROF_END(id)   do { if (zp_t_##id) { zealphp_prof_ns[id] += zealphp_prof_now() - zp_t_##id; zealphp_prof_calls[id]++; } } while (0)
+
 static void zealphp_state_park(void *arg)
 {
     /* HAZARD-2: if this coroutine is suspended mid-CG-swap, stash the swap and
@@ -3422,6 +4581,15 @@ static void zealphp_state_park(void *arg)
      * claimed (raw non-framework use) → gate passes everyone (legacy
      * first-yielder behaviour, all existing phpt semantics preserved). */
     int zp_req_owner_ok = zealphp_process_state_owner_ok();
+    zealphp_owner_ok_cached = zp_req_owner_ok;   /* perf: one answer for the whole park */
+    if (os_get_cid) {
+        long zp_pc = os_get_cid();
+        if (zp_pc > 0) {   /* lane → cid bridge for the touched sets (any coroutine, before any stage) */
+            zval zp_zc;
+            ZVAL_LONG(&zp_zc, (zend_long)zp_pc);
+            zend_hash_index_update(&zealphp_coro_ptr_to_cid, (zend_ulong)(uintptr_t)arg, &zp_zc);
+        }
+    }
     /* Record this coroutine as a KNOWN request coroutine (ptr-keyed, for the
      * restore side) when it is strictly claimed — i.e. its cid is in the
      * claim set, not merely passing via the empty-set legacy mode. */
@@ -3436,10 +4604,17 @@ static void zealphp_state_park(void *arg)
     if (zealphp_sg_dbg()) fprintf(stderr, "[GDBG] yield key=%ld cur=%ld reqset_n=%d save_ok=%d\n",
         (long)(uintptr_t)arg, os_get_cid ? os_get_cid() : -99,
         (int)zend_hash_num_elements(&zealphp_request_coro_cids), zp_req_owner_ok);
+    ZP_PROF_BEGIN(ZP_PROF_PARK_TOTAL);
+    ZP_PROF_BEGIN(ZP_PROF_SG_SAVE);
     zealphp_snapshot_save((zend_long)(uintptr_t)arg);
+    ZP_PROF_END(ZP_PROF_SG_SAVE);
     if (zp_req_owner_ok) {
+        ZP_PROF_BEGIN(ZP_PROF_CONST_SAVE);
         zealphp_constants_snapshot_save((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_CONST_SAVE);
+        ZP_PROF_BEGIN(ZP_PROF_INI_SAVE);
         zealphp_ini_snapshot_save((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_INI_SAVE);
         /* Bridge cid→ptr on EVERY request-owner yield, not only under $GLOBALS
          * isolation: zealphp_constants_clear() (PHP context, cid only) uses it to
          * drop this coroutine's pointer-keyed constant snapshot after moving its
@@ -3450,17 +4625,40 @@ static void zealphp_state_park(void *arg)
             zend_hash_index_update_ptr(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid(), arg);
         }
     }
-    zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
-    zealphp_locale_snapshot_save((zend_long)(uintptr_t)arg);
-    zealphp_umask_snapshot_save((zend_long)(uintptr_t)arg);
-    zealphp_lasterr_snapshot_save((zend_long)(uintptr_t)arg);
-    zealphp_tz_snapshot_save((zend_long)(uintptr_t)arg);
-    zealphp_mbenc_snapshot_save((zend_long)(uintptr_t)arg);
-    zealphp_libxml_snapshot_save((zend_long)(uintptr_t)arg);
+    ZP_PROF_BEGIN(ZP_PROF_SETTINGS_SAVE);
+    {
+        zend_ulong zp_k = (zend_ulong)(uintptr_t)arg;
+        bool zp_had_lane = zealphp_settings_lane_any_live
+            && zend_hash_index_exists(&zealphp_settings_lane_any, zp_k);
+        if (zp_had_lane || zealphp_settings_maybe_dirty()) {
+            zealphp_cwd_snapshot_save((zend_long)(uintptr_t)arg);
+            zealphp_locale_snapshot_save((zend_long)(uintptr_t)arg);
+            zealphp_umask_snapshot_save((zend_long)(uintptr_t)arg);
+            zealphp_tz_snapshot_save((zend_long)(uintptr_t)arg);
+            zealphp_mbenc_snapshot_save((zend_long)(uintptr_t)arg);
+            zealphp_libxml_snapshot_save((zend_long)(uintptr_t)arg);
+            if (zealphp_settings_lane_any_live) {
+                bool zp_any = zend_hash_index_exists(&zealphp_coro_cwd_snapshots, zp_k)
+                    || zend_hash_index_exists(&zealphp_coro_locale_snapshots, zp_k)
+                    || zend_hash_index_exists(&zealphp_coro_umask_snapshots, zp_k)
+                    || zend_hash_index_exists(&zealphp_coro_tz_snapshots, zp_k)
+                    || zend_hash_index_exists(&zealphp_coro_mbenc_snapshots, zp_k)
+                    || zend_hash_index_exists(&zealphp_coro_libxml_snapshots, zp_k);
+                if (zp_any) zend_hash_index_add_empty_element(&zealphp_settings_lane_any, zp_k);
+                else        zend_hash_index_del(&zealphp_settings_lane_any, zp_k);
+            }
+        }
+        zealphp_lasterr_snapshot_save((zend_long)(uintptr_t)arg);
+    }
+    ZP_PROF_END(ZP_PROF_SETTINGS_SAVE);
     if (zp_req_owner_ok) {
+        ZP_PROF_BEGIN(ZP_PROF_CSTAT_SAVE);
         zealphp_statics_snapshot_save((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_CSTAT_SAVE);
         if (zealphp_fn_statics_active) {
+            ZP_PROF_BEGIN(ZP_PROF_FSTAT_SAVE);
             zealphp_fn_statics_snapshot_save((zend_long)(uintptr_t)arg);
+            ZP_PROF_END(ZP_PROF_FSTAT_SAVE);
         }
     }
     /* Full $GLOBALS snapshot: runs AFTER superglobals save so the
@@ -3468,7 +4666,9 @@ static void zealphp_state_park(void *arg)
      * is_superglobal_key filter inside this call deliberately skips the
      * 7 SG slots — those are owned by zealphp_snapshot_save above. */
     if (zealphp_coro_globals_hooks_active && zp_req_owner_ok) {
+        ZP_PROF_BEGIN(ZP_PROF_GLOB_SAVE);
         zealphp_globals_snapshot_save((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_GLOB_SAVE);
         /* (cid→ptr bridge recorded above — the request-end drain uses it to
          * free this coroutine's pointer-keyed delta.) */
     }
@@ -3477,6 +4677,8 @@ static void zealphp_state_park(void *arg)
     } else if (zealphp_child_lanes_active()) {
         zealphp_child_park(arg);             /* F12: a child's lane */
     }
+    ZP_PROF_END(ZP_PROF_PARK_TOTAL);
+    zealphp_owner_ok_cached = -1;
 }
 
 /* Re-apply the state parked under `arg` — the resume side of a switch. Runs
@@ -3525,6 +4727,7 @@ static void zealphp_state_unpark(void *arg)
     if (zend_hash_num_elements(&zealphp_request_coro_cids) > 0
         && !zend_hash_index_exists(&zealphp_request_coro_ptrs, (zend_ulong)(uintptr_t)arg)) {
         zp_restore_ok = 0;
+        zealphp_globals_live_is_parent = false;   /* an unmanaged coroutine resumes onto the table */
     }
     /* F12: a child coroutine resumes onto its lane ($GLOBALS + statics). */
     bool zp_child = zend_hash_index_exists(&zealphp_child_tasks, (zend_ulong)(uintptr_t)arg);
@@ -3534,30 +4737,49 @@ static void zealphp_state_unpark(void *arg)
     /* Full $GLOBALS restore runs BEFORE superglobals restore so that
      * the superglobals layer can overwrite the 7 SG slots last and win
      * any race against stale snapshot data. */
+    ZP_PROF_BEGIN(ZP_PROF_UNPARK_TOTAL);
     if (zealphp_coro_globals_hooks_active && zp_restore_ok && !zp_child) {
+        ZP_PROF_BEGIN(ZP_PROF_GLOB_RESTORE);
         zealphp_globals_snapshot_restore((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_GLOB_RESTORE);
     }
     if (zp_restore_ok && !zp_child) {
         zealphp_lane_holder = arg;
     }
+    ZP_PROF_BEGIN(ZP_PROF_SG_RESTORE);
     zealphp_snapshot_restore((zend_long)(uintptr_t)arg);
+    ZP_PROF_END(ZP_PROF_SG_RESTORE);
     if (zp_restore_ok) {
+        ZP_PROF_BEGIN(ZP_PROF_CONST_RESTORE);
         zealphp_constants_snapshot_restore((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_CONST_RESTORE);
+        ZP_PROF_BEGIN(ZP_PROF_INI_RESTORE);
         zealphp_ini_snapshot_restore((zend_long)(uintptr_t)arg);
-        zealphp_cwd_snapshot_restore((zend_long)(uintptr_t)arg);
-        zealphp_locale_snapshot_restore((zend_long)(uintptr_t)arg);
-        zealphp_umask_snapshot_restore((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_INI_RESTORE);
+        ZP_PROF_BEGIN(ZP_PROF_SETTINGS_RESTORE);
+        if (!zealphp_settings_lane_any_live
+            || zend_hash_index_exists(&zealphp_settings_lane_any, (zend_ulong)(uintptr_t)arg)) {
+            zealphp_cwd_snapshot_restore((zend_long)(uintptr_t)arg);
+            zealphp_locale_snapshot_restore((zend_long)(uintptr_t)arg);
+            zealphp_umask_snapshot_restore((zend_long)(uintptr_t)arg);
+            zealphp_tz_snapshot_restore((zend_long)(uintptr_t)arg);
+            zealphp_mbenc_snapshot_restore((zend_long)(uintptr_t)arg);
+            zealphp_libxml_snapshot_restore((zend_long)(uintptr_t)arg);
+        }
         zealphp_lasterr_snapshot_restore((zend_long)(uintptr_t)arg);
-        zealphp_tz_snapshot_restore((zend_long)(uintptr_t)arg);
-        zealphp_mbenc_snapshot_restore((zend_long)(uintptr_t)arg);
-        zealphp_libxml_snapshot_restore((zend_long)(uintptr_t)arg);
+        ZP_PROF_END(ZP_PROF_SETTINGS_RESTORE);
         if (!zp_child) {
+            ZP_PROF_BEGIN(ZP_PROF_CSTAT_RESTORE);
             zealphp_statics_snapshot_restore((zend_long)(uintptr_t)arg);
+            ZP_PROF_END(ZP_PROF_CSTAT_RESTORE);
             if (zealphp_fn_statics_active) {
+                ZP_PROF_BEGIN(ZP_PROF_FSTAT_RESTORE);
                 zealphp_fn_statics_snapshot_restore((zend_long)(uintptr_t)arg);
+                ZP_PROF_END(ZP_PROF_FSTAT_RESTORE);
             }
         }
     }
+    ZP_PROF_END(ZP_PROF_UNPARK_TOTAL);
 }
 
 /* ── Inline resumes (Channel::push / pop on a coroutine's own stack) ──
@@ -3593,8 +4815,10 @@ static void zealphp_state_unpark(void *arg)
 static HashTable zealphp_coro_cid_task;       /* cid → task ptr (borrowed, no dtor) */
 static HashTable zealphp_inline_resumers;     /* resumed task → resumer task (borrowed) */
 
+static bool zealphp_globals_live_is_parent;
 static void zealphp_on_coro_start(void *task)
 {
+    zealphp_globals_live_is_parent = false;   /* a fresh coroutine will run on the live table */
     if (!task || !os_get_cid) return;
     long zp_cid = os_get_cid();
     if (zp_cid > 0) {
@@ -3707,6 +4931,7 @@ static void zealphp_on_close_body(void *arg)
         }
     }
     zend_hash_index_del(&zealphp_coro_snapshots, (zend_ulong)(uintptr_t)arg);
+    if (zealphp_coro_sg_lanes_live) zend_hash_index_del(&zealphp_coro_sg_lanes, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_coro_sg_owner_cids, (zend_ulong)(uintptr_t)arg);
     zend_hash_index_del(&zealphp_request_coro_ptrs, (zend_ulong)(uintptr_t)arg);
     zealphp_constants_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -3739,6 +4964,7 @@ static void zealphp_on_close_body(void *arg)
         }
     }
     zealphp_ini_snapshot_delete((zend_long)(uintptr_t)arg);
+    if (zealphp_settings_lane_any_live) zend_hash_index_del(&zealphp_settings_lane_any, (zend_ulong)(uintptr_t)arg);
     zealphp_cwd_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_locale_snapshot_delete((zend_long)(uintptr_t)arg);
     zealphp_umask_snapshot_delete((zend_long)(uintptr_t)arg);
@@ -3758,6 +4984,7 @@ static void zealphp_on_close_body(void *arg)
         /* Drop the cid→ptr bridge entry (request-end drain usually removed it
          * already; this covers coroutines closed without a request-end drain). */
         zend_hash_index_del(&zealphp_coro_cid_to_ptr, (zend_ulong)os_get_cid());
+        zend_hash_index_del(&zealphp_coro_ptr_to_cid, (zend_ulong)(uintptr_t)arg);
         zend_hash_index_del(&zealphp_coro_cid_task, (zend_ulong)os_get_cid());
     }
     /* #37: a request coroutine closing without reaching superglobals_clear
@@ -3774,6 +5001,18 @@ static void zealphp_on_close_body(void *arg)
         if (zp_c > 0) {
             zend_hash_index_del(&zealphp_request_coro_cids, (zend_ulong)zp_c);
             zend_hash_index_del(&zealphp_adopted_coro_cids, (zend_ulong)zp_c);
+            if (zealphp_settings_touched_live) {
+                zend_hash_index_del(&zealphp_settings_touched, (zend_ulong)zp_c);
+            }
+            if (zealphp_cstat_touched_live) {
+                zend_hash_index_del(&zealphp_cstat_touched, (zend_ulong)zp_c);
+            }
+            if (zealphp_fn_touched_live) {
+                zend_hash_index_del(&zealphp_fn_touched, (zend_ulong)zp_c);
+            }
+            if (zealphp_glob_touched_live) {
+                zend_hash_index_del(&zealphp_glob_touched, (zend_ulong)zp_c);
+            }
         }
     }
     /* A coroutine that was resumed inline and runs to completion hands
@@ -4036,6 +5275,9 @@ static bool zealphp_install_coro_hooks(void)
         zend_interrupt_function = zealphp_interrupt_function;
         zealphp_interrupt_installed = true;
     }
+    zealphp_settings_hooks_install();   /* perf: setter hooks feed the settings fast path */
+    zealphp_cstat_hooks_wanted = true;  /* perf: static-property write flags feed the S5b fast path */
+    zealphp_refl_hooks_install();       /* isolation: Reflection static writes feed the touched set too */
     /* Inline-resume support: learn each coroutine's task at its start (see
      * zealphp_inline_park). Optional — on_yield records it too, so an API
      * without the hook only loses the never-yielded-resumer case. Both forks
@@ -4545,7 +5787,14 @@ PHP_FUNCTION(zealphp_superglobals_set)
  * the handler reads the wrong request's input. ZealPHP calls this in the HANDLER
  * coroutine, right before dispatch (no intervening yield), from the per-coroutine
  * OpenSwoole request — guaranteeing the handler sees its OWN input. */
+static void zealphp_request_input_set_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_request_input_set)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_INPUT_SET);
+    zealphp_request_input_set_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_INPUT_SET);
+}
+static void zealphp_request_input_set_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     zval *get, *post, *cookie, *server, *files, *request;
 
@@ -4577,6 +5826,7 @@ PHP_FUNCTION(zealphp_request_input_set)
         }
         if (zealphp_sg_dbg()) fprintf(stderr, "[SGDBG] claim(input_set) cid=%ld\n", zealphp_oc);
     }
+    if (!zealphp_boot_baselines_done) zealphp_boot_baselines_capture(false);   /* end of boot */
 }
 
 /* zealphp_superglobals_owner(): bool
@@ -4589,6 +5839,7 @@ PHP_FUNCTION(zealphp_request_input_set)
 PHP_FUNCTION(zealphp_superglobals_owner)
 {
     ZEND_PARSE_PARAMETERS_NONE();
+    if (!zealphp_boot_baselines_done) zealphp_boot_baselines_capture(false);   /* end of boot */
     if (os_get_cid) {
         long zealphp_oc = os_get_cid();
         if (zealphp_oc > 0) {
@@ -4632,7 +5883,14 @@ PHP_FUNCTION(zealphp_superglobals_adopt)
 /* zealphp_superglobals_clear(): void
  * Resets all superglobals to empty arrays. Called at request end
  * to prevent cross-request leakage in coroutine mode. */
+static void zealphp_superglobals_clear_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_superglobals_clear)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_SG_CLEAR);
+    zealphp_superglobals_clear_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_SG_CLEAR);
+}
+static void zealphp_superglobals_clear_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     /* Request end — release ownership so the next holder starts clean
      * (#32), but ONLY when this coroutine is the current owner (#40): a
@@ -4739,6 +5997,7 @@ PHP_FUNCTION(zealphp_coroutine_superglobals)
     if (!enable) {
         zealphp_coro_hooks_active = false;
         zend_hash_clean(&zealphp_coro_snapshots);
+        if (zealphp_coro_sg_lanes_live) zend_hash_clean(&zealphp_coro_sg_lanes);
         RETURN_TRUE;
     }
 
@@ -4808,6 +6067,14 @@ PHP_FUNCTION(zealphp_coroutine_globals)
     }
 
     zealphp_coro_globals_hooks_active = true;
+    zealphp_glob_hooks_wanted = true;   /* perf: start recording global writes */
+    {
+        zend_function *f = zend_hash_str_find_ptr(CG(function_table), "extract", sizeof("extract") - 1);
+        if (f && f->type == ZEND_INTERNAL_FUNCTION && f->internal_function.handler != zealphp_hook_extract) {
+            zealphp_orig_extract = f->internal_function.handler;
+            f->internal_function.handler = zealphp_hook_extract;
+        }
+    }
     RETURN_TRUE;
 }
 
@@ -4832,6 +6099,8 @@ PHP_FUNCTION(zealphp_globals_baseline_refresh)
     }
     zealphp_globals_parent_clear();
     zealphp_globals_parent_snapshot();
+    if (zealphp_glob_dirty_live) zend_hash_clean(&zealphp_glob_dirty);   /* the live table IS the new baseline */
+    zealphp_boot_baselines_capture(true);   /* late boot writes to class statics, same as $GLOBALS */
     RETURN_TRUE;
 }
 
@@ -5009,7 +6278,14 @@ PHP_FUNCTION(zealphp_process_state_snapshot)
     zealphp_state_snapshotted = true;
 }
 
+static void zealphp_process_state_clean_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_process_state_clean)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_PSTATE_CLEAN);
+    zealphp_process_state_clean_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_PSTATE_CLEAN);
+}
+static void zealphp_process_state_clean_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     zend_string *key;
     zval *val;
@@ -5020,6 +6296,10 @@ PHP_FUNCTION(zealphp_process_state_clean)
     ZEND_PARSE_PARAMETERS_END();
 
     if (!zealphp_state_snapshotted) return;
+
+    /* perf caches hold class/op_array pointers — invalidate before any deletion. */
+    zealphp_symtab_gen++;
+    zend_hash_clean(&zealphp_boot_static_baseline);
 
     /* HAZARD-2 fix: NEVER delete user classes/functions from the shared
      * process-global CG tables while silent-redeclare is on (coroutine-legacy).
@@ -5173,7 +6453,14 @@ PHP_FUNCTION(zealphp_globals_snapshot)
 }
 
 /* zealphp_globals_clean(): void — remove keys not in the snapshot */
+static void zealphp_globals_clean_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_globals_clean)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_GLOBALS_CLEAN);
+    zealphp_globals_clean_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_GLOBALS_CLEAN);
+}
+static void zealphp_globals_clean_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     zend_string *key;
     zval *val;
@@ -5222,7 +6509,14 @@ PHP_FUNCTION(zealphp_globals_clean)
  * object's final ref, that ref is released in THIS coroutine and __destruct runs
  * here. No-op unless per-coroutine $GLOBALS isolation is active. Idempotent:
  * on_close's snapshot_delete then finds an already-freed delta. */
+static void zealphp_coroutine_globals_request_end_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_coroutine_globals_request_end)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_GLOBALS_END);
+    zealphp_coroutine_globals_request_end_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_GLOBALS_END);
+}
+static void zealphp_coroutine_globals_request_end_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
     /* B1/B6: values the switch callbacks displaced are released here, in
@@ -5242,6 +6536,7 @@ PHP_FUNCTION(zealphp_coroutine_globals_request_end)
              * snapshot's object refs before on_close could see them. */
             zend_hash_index_del(&zealphp_coro_static_snapshots, (zend_ulong)(zend_long)(uintptr_t)ptr);
             zend_hash_index_del(&zealphp_coro_cid_to_ptr, cid);
+            if (ptr) zend_hash_index_del(&zealphp_coro_ptr_to_cid, (zend_ulong)(uintptr_t)ptr);
         }
     }
     /* ext#48: drain orphaned object-bearing static snapshots from coroutines
@@ -5397,7 +6692,14 @@ static void zealphp_clear_constant_cache_slots(void)
 
 /* ── zealphp_constants_clear(): void ─────────────────────────────── */
 
+static void zealphp_constants_clear_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_constants_clear)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_CONST_CLEAR);
+    zealphp_constants_clear_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_CONST_CLEAR);
+}
+static void zealphp_constants_clear_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     zend_string *name;
     long cid = os_get_cid ? os_get_cid() : -1;
@@ -5480,7 +6782,14 @@ PHP_FUNCTION(zealphp_constants_clear)
  * Called at request end from SessionManager/CoSessionManager. For
  * sequential requests (no yield), the coroutine hooks don't fire, so
  * this is the cleanup path. */
+static void zealphp_ini_restore_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_ini_restore)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_INI_RESTORE);
+    zealphp_ini_restore_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_INI_RESTORE);
+}
+static void zealphp_ini_restore_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
@@ -5873,6 +7182,44 @@ static int zealphp_declare_class_delayed_handler(zend_execute_data *execute_data
  * Chain-aware: if another extension (e.g. uopz's uopz_set_static) already
  * installed a BIND_STATIC / BIND_INIT_STATIC_OR_JMP handler, we invoke it rather
  * than clobber it. */
+/* perf/semantics: function statics of functions and methods whose (class or
+ * function) name matches a zealphp_shared_static_classes() prefix are
+ * process-shared, like the static properties of those classes: never carried
+ * per coroutine, never re-parked, never reset. The framework registers its
+ * own namespace. The answer is cached per op_array (keyed by the static
+ * template pointer, worker lifetime); the cache is dropped when the prefix
+ * list changes. */
+static HashTable zealphp_fn_shared_cache;
+static bool      zealphp_fn_shared_cache_live = false;
+static bool zealphp_fn_static_shared(zend_op_array *opa)
+{
+    if (zealphp_shared_static_prefixes_n == 0) return false;
+    zend_ulong key = zealphp_fn_static_key(opa);   /* B7: per method slot, so a trait method's clones decide separately */
+    if (!zealphp_fn_shared_cache_live) {
+        zend_hash_init(&zealphp_fn_shared_cache, 64, NULL, NULL, 1);
+        zealphp_fn_shared_cache_live = true;
+    }
+    zval *hit = zend_hash_index_find(&zealphp_fn_shared_cache, key);
+    if (hit) return Z_LVAL_P(hit) != 0;
+    zend_string *name = opa->scope ? opa->scope->name : opa->function_name;
+    bool shared = false;
+    if (name) {
+        zend_string *lc = zend_string_tolower(name);
+        for (uint32_t pi = 0; pi < zealphp_shared_static_prefixes_n; pi++) {
+            zend_string *pf = zealphp_shared_static_prefixes[pi];
+            if (ZSTR_LEN(lc) >= ZSTR_LEN(pf) && memcmp(ZSTR_VAL(lc), ZSTR_VAL(pf), ZSTR_LEN(pf)) == 0) {
+                shared = true;
+                break;
+            }
+        }
+        zend_string_release(lc);
+    }
+    zval v;
+    ZVAL_LONG(&v, shared ? 1 : 0);
+    zend_hash_index_update(&zealphp_fn_shared_cache, key, &v);
+    return shared;
+}
+
 static int zealphp_bind_static_handler(zend_execute_data *execute_data)
 {
     if (zealphp_fn_statics_active) {
@@ -5880,11 +7227,12 @@ static int zealphp_bind_static_handler(zend_execute_data *execute_data)
         if (fn && fn->common.function_name != NULL
             && !(fn->common.fn_flags & ZEND_ACC_CLOSURE)) {
             zend_op_array *opa = &fn->op_array;
-            if (opa->static_variables) {
+            if (opa->static_variables && !zealphp_fn_static_shared(opa)) {
                 zend_ulong key = zealphp_fn_static_key(opa);
                 if (!zend_hash_index_exists(&zealphp_fn_static_registry, key)) {
                     zend_hash_index_add_ptr(&zealphp_fn_static_registry, key, opa);
                 }
+                zealphp_fn_touch(key, opa);   /* perf: this coroutine uses this static */
             }
         }
     }
@@ -5926,6 +7274,13 @@ static int zealphp_bind_static_handler(zend_execute_data *execute_data)
 
 static int zealphp_include_eval_handler(zend_execute_data *execute_data)
 {
+    /* isolation: eval() on the request's global frame can create any global
+     * through CVs no hook sees — record the "every key" marker for the lane. */
+    if (zealphp_glob_hooks_wanted && EX(opline)->extended_value == ZEND_EVAL
+        && (ZEND_CALL_INFO(execute_data) & ZEND_CALL_HAS_SYMBOL_TABLE)
+        && EX(symbol_table) == &EG(symbol_table)) {
+        zealphp_glob_touch(NULL);
+    }
     if (!zealphp_include_isolation_enabled || !zealphp_state_snapshotted) {
         return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
     }
@@ -6318,7 +7673,30 @@ static void zealphp_oparray_cache_store(zend_string *key, zend_op_array *master,
     zend_hash_str_add_ptr(&zealphp_oparray_master_cache, ZSTR_VAL(key), ZSTR_LEN(key), e);
 }
 
+static zend_op_array *zealphp_compile_file_hook_inner(zend_file_handle *file_handle, int type);
+/* perf/isolation: a file included from a global-scope frame runs with its CVs
+ * attached to EG(symbol_table); its `$x = ...` are plain CV writes that no
+ * write hook sees. zealphp_require_global() registers its own file's CVs;
+ * this covers the files THAT file includes (wp-settings.php and friends), and
+ * any other include/require executed on the request's global frame. */
+static void zealphp_register_global_scope_vars(zend_op_array *opa)
+{
+    if (!opa || !opa->last_var || !zealphp_glob_hooks_wanted || !os_get_cid || os_get_cid() <= 0) return;
+    zend_execute_data *ex = EG(current_execute_data);
+    while (ex && !(ex->func && ZEND_USER_CODE(ex->func->type))) ex = ex->prev_execute_data;
+    if (!ex) return;
+    if (!(ZEND_CALL_INFO(ex) & ZEND_CALL_HAS_SYMBOL_TABLE) || ex->symbol_table != &EG(symbol_table)) return;
+    for (uint32_t i = 0; i < opa->last_var; i++) {
+        zealphp_glob_touch(opa->vars[i]);
+    }
+}
 static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, int type)
+{
+    zend_op_array *zp_r = zealphp_compile_file_hook_inner(file_handle, type);
+    zealphp_register_global_scope_vars(zp_r);
+    return zp_r;
+}
+static zend_op_array *zealphp_compile_file_hook_inner(zend_file_handle *file_handle, int type)
 {
     if (!zealphp_silent_redeclare_enabled || !zealphp_original_compile_file) {
         return zealphp_original_compile_file
@@ -7080,6 +8458,7 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_umask_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_lasterr_snapshots, 64, NULL, ZVAL_PTR_DTOR, 0);
     zend_hash_init(&zealphp_coro_static_snapshots, 256, NULL, zealphp_deferred_zval_dtor, 0);
+    zend_hash_init(&zealphp_boot_static_baseline, 64, NULL, zealphp_boot_baseline_dtor, 0);
     /* ext#48: deferred-free list for object-bearing static snapshots whose
      * coroutine closed before the request-end drain (see snapshot_delete). */
     zend_hash_init(&zealphp_statics_orphans, 16, NULL, ZVAL_PTR_DTOR, 0);
@@ -7111,6 +8490,9 @@ PHP_MINIT_FUNCTION(zealphp)
     zend_hash_init(&zealphp_coro_indirect_objs,      256, NULL, zealphp_deferred_zval_dtor, 0);
     /* cid→Coroutine* bridge (raw pointers, NULL dtor — the deltas own the zvals). */
     zend_hash_init(&zealphp_coro_cid_to_ptr, 64, NULL, NULL, 0);
+    zend_hash_init(&zealphp_coro_ptr_to_cid, 64, NULL, NULL, 0);
+    zend_hash_init(&zealphp_lane_force_full, 64, NULL, NULL, 0);
+    zealphp_lane_force_full_live = true;
     /* Inline-resume bookkeeping (borrowed task pointers, NULL dtor). */
     zend_hash_init(&zealphp_coro_cid_task, 64, NULL, NULL, 0);
     zend_hash_init(&zealphp_inline_resumers, 16, NULL, NULL, 0);
@@ -7219,6 +8601,30 @@ PHP_MINIT_FUNCTION(zealphp)
      * are hooked; the handler chains opcode-aware. */
     zealphp_prev_bind_static = zend_get_user_opcode_handler(ZEND_BIND_STATIC);
     zend_set_user_opcode_handler(ZEND_BIND_STATIC,           zealphp_bind_static_handler);
+    /* perf: static-property write hooks (gated at runtime by
+     * zealphp_cstat_hooks_wanted — one branch per write when off). */
+    for (const zend_uchar *zp_op = zealphp_static_prop_write_opcodes; *zp_op; zp_op++) {
+        zealphp_prev_static_prop_handlers[*zp_op] = zend_get_user_opcode_handler(*zp_op);
+        zend_set_user_opcode_handler(*zp_op, zealphp_static_prop_write_handler);
+    }
+    zend_hash_init(&zealphp_cstat_touched, 64, NULL, zealphp_cstat_touched_dtor, 1);
+    zealphp_cstat_touched_live = true;
+    zend_hash_init(&zealphp_cstat_dirty_set, 64, NULL, NULL, 1);
+    zealphp_cstat_dirty_live = true;
+    /* perf: global-variable write hooks (gated by zealphp_glob_hooks_wanted). */
+    for (const zend_uchar *zp_op = zealphp_glob_write_opcodes; *zp_op; zp_op++) {
+        zealphp_prev_glob_handlers[*zp_op] = zend_get_user_opcode_handler(*zp_op);
+        zend_set_user_opcode_handler(*zp_op, zealphp_glob_write_handler);
+    }
+    zealphp_glob_all_key = zend_string_init("\0zealphp_all_globals", sizeof("\0zealphp_all_globals") - 1, 1);
+    zend_hash_init(&zealphp_glob_touched, 64, NULL, zealphp_glob_touched_dtor, 0);
+    zealphp_glob_touched_live = true;
+    zend_hash_init(&zealphp_glob_dirty, 256, NULL, NULL, 0);
+    zealphp_glob_dirty_live = true;
+    zend_hash_init(&zealphp_fn_touched, 64, NULL, zealphp_fn_touched_dtor, 1);
+    zealphp_fn_touched_live = true;
+    zend_hash_init(&zealphp_fn_dirty, 256, NULL, NULL, 1);
+    zealphp_fn_dirty_live = true;
 #ifdef ZEND_BIND_INIT_STATIC_OR_JMP
     zealphp_prev_bind_init_static = zend_get_user_opcode_handler(ZEND_BIND_INIT_STATIC_OR_JMP);
     zend_set_user_opcode_handler(ZEND_BIND_INIT_STATIC_OR_JMP, zealphp_bind_static_handler);
@@ -7257,6 +8663,8 @@ PHP_MSHUTDOWN_FUNCTION(zealphp)
     }
 #define ZEALPHP_UNHOOK_OPCODE(op, ours, prev) \
     if (zend_get_user_opcode_handler(op) == (ours)) zend_set_user_opcode_handler((op), (prev))
+#define ZEALPHP_UNHOOK_OPCODE_LATE(op, ours, prev) \
+    if (zend_get_user_opcode_handler(op) == (ours)) zend_set_user_opcode_handler((op), (prev))
     ZEALPHP_UNHOOK_OPCODE(ZEND_DECLARE_FUNCTION, zealphp_declare_function_handler, zealphp_prev_declare_function);
     ZEALPHP_UNHOOK_OPCODE(ZEND_DECLARE_CLASS, zealphp_declare_class_handler, zealphp_prev_declare_class);
     ZEALPHP_UNHOOK_OPCODE(ZEND_DECLARE_CLASS_DELAYED, zealphp_declare_class_delayed_handler, zealphp_prev_declare_class_delayed);
@@ -7271,6 +8679,21 @@ PHP_MSHUTDOWN_FUNCTION(zealphp)
     }
 #endif
 #undef ZEALPHP_UNHOOK_OPCODE
+    zealphp_settings_hooks_remove();
+    zealphp_refl_hooks_remove();   /* compare-and-restore the six setter handlers */
+    for (const zend_uchar *zp_op = zealphp_static_prop_write_opcodes; *zp_op; zp_op++) {
+        ZEALPHP_UNHOOK_OPCODE_LATE(*zp_op, zealphp_static_prop_write_handler, zealphp_prev_static_prop_handlers[*zp_op]);
+    }
+    for (const zend_uchar *zp_op = zealphp_glob_write_opcodes; *zp_op; zp_op++) {
+        ZEALPHP_UNHOOK_OPCODE_LATE(*zp_op, zealphp_glob_write_handler, zealphp_prev_glob_handlers[*zp_op]);
+    }
+    if (zealphp_orig_extract) {
+        zend_function *f = zend_hash_str_find_ptr(CG(function_table), "extract", sizeof("extract") - 1);
+        if (f && f->type == ZEND_INTERNAL_FUNCTION && f->internal_function.handler == zealphp_hook_extract) {
+            f->internal_function.handler = zealphp_orig_extract;
+        }
+        zealphp_orig_extract = NULL;
+    }
     /* Process is exiting — skip ALL cleanup. On PHP 8.5+ the shutdown order
      * changed: CG(function_table) and refcounted objects (Closures stored in
      * zealphp_callbacks) may already be freed by the time MSHUTDOWN runs.
@@ -7533,25 +8956,51 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_rtcaches, 0, 0, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+static void zealphp_reset_request_rtcaches_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_reset_request_rtcaches)
 {
-    ZEND_PARSE_PARAMETERS_NONE();
-    zend_long count = 0;
-    bool snap = zealphp_state_snapshotted;
+    ZP_PROF_BEGIN(ZP_PROF_REQ_RTCACHES);
+    zealphp_reset_request_rtcaches_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_RTCACHES);
+}
+/* perf: the set of per-request (non-snapshot) user op_arrays whose run_time_cache
+ * the reset clears. Rebuilt only when the function/class tables change size, a
+ * deletion bumps zealphp_symtab_gen, or the snapshot is (re)taken — otherwise the
+ * reset is O(request op_arrays) instead of a full double-table sweep with a hash
+ * probe per user symbol on every request. */
+static zend_op_array **zealphp_rtc_opas = NULL;
+static uint32_t zealphp_rtc_n = 0, zealphp_rtc_cap = 0;
+static uint32_t zealphp_rtc_fn_n = (uint32_t)-1, zealphp_rtc_cl_n = (uint32_t)-1;
+static uint32_t zealphp_rtc_gen = (uint32_t)-1;
+static bool     zealphp_rtc_snap = false;
 
+static zend_always_inline void zealphp_rtc_push(zend_op_array *opa)
+{
+    if (zealphp_rtc_n == zealphp_rtc_cap) {
+        zealphp_rtc_cap = zealphp_rtc_cap ? zealphp_rtc_cap * 2 : 256;
+        zealphp_rtc_opas = perealloc(zealphp_rtc_opas, sizeof(zend_op_array *) * zealphp_rtc_cap, 1);
+    }
+    zealphp_rtc_opas[zealphp_rtc_n++] = opa;
+}
+
+static void zealphp_rtc_refresh(void)
+{
+    uint32_t fn_n = zend_hash_num_elements(EG(function_table));
+    uint32_t cl_n = zend_hash_num_elements(EG(class_table));
+    if (zealphp_rtc_opas && fn_n == zealphp_rtc_fn_n && cl_n == zealphp_rtc_cl_n
+        && zealphp_rtc_gen == zealphp_symtab_gen && zealphp_rtc_snap == zealphp_state_snapshotted) {
+        return;
+    }
+    zealphp_rtc_n = 0;
+    bool snap = zealphp_state_snapshotted;
     zend_string *fname;
     zend_function *fn;
     ZEND_HASH_FOREACH_STR_KEY_PTR(EG(function_table), fname, fn) {
         if (fname && fn && fn->type == ZEND_USER_FUNCTION
             && (!snap || !zend_hash_exists(&zealphp_snapshot_functions, fname))) {
-            void *rtc = ZEND_MAP_PTR_GET(fn->op_array.run_time_cache);
-            if (rtc) {
-                memset(rtc, 0, fn->op_array.cache_size);
-                count++;
-            }
+            zealphp_rtc_push(&fn->op_array);
         }
     } ZEND_HASH_FOREACH_END();
-
     zend_string *cname;
     zend_class_entry *ce;
     ZEND_HASH_FOREACH_STR_KEY_PTR(EG(class_table), cname, ce) {
@@ -7560,15 +9009,31 @@ PHP_FUNCTION(zealphp_reset_request_rtcaches)
             zend_function *m;
             ZEND_HASH_FOREACH_PTR(&ce->function_table, m) {
                 if (m && m->type == ZEND_USER_FUNCTION) {
-                    void *rtc = ZEND_MAP_PTR_GET(m->op_array.run_time_cache);
-                    if (rtc) {
-                        memset(rtc, 0, m->op_array.cache_size);
-                        count++;
-                    }
+                    zealphp_rtc_push(&m->op_array);
                 }
             } ZEND_HASH_FOREACH_END();
         }
     } ZEND_HASH_FOREACH_END();
+    zealphp_rtc_fn_n = fn_n;
+    zealphp_rtc_cl_n = cl_n;
+    zealphp_rtc_gen  = zealphp_symtab_gen;
+    zealphp_rtc_snap = snap;
+}
+
+static void zealphp_reset_request_rtcaches_impl(INTERNAL_FUNCTION_PARAMETERS)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    zend_long count = 0;
+
+    zealphp_rtc_refresh();
+    for (uint32_t i = 0; i < zealphp_rtc_n; i++) {
+        zend_op_array *opa = zealphp_rtc_opas[i];
+        void *rtc = ZEND_MAP_PTR_GET(opa->run_time_cache);
+        if (rtc) {
+            memset(rtc, 0, opa->cache_size);
+            count++;
+        }
+    }
     RETURN_LONG(count);
 }
 
@@ -7639,7 +9104,14 @@ static void zealphp_fn_statics_reset_cb(zend_op_array *opa, HashTable *live, voi
     (*(zend_long *)ctx)++;
 }
 
+static void zealphp_reset_request_statics_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_reset_request_statics)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_FSTAT_RESET);
+    zealphp_reset_request_statics_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_FSTAT_RESET);
+}
+static void zealphp_reset_request_statics_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
@@ -7667,6 +9139,20 @@ PHP_FUNCTION(zealphp_reset_request_statics)
      * static — exactly the registry's membership. Falls back to the full walk
      * when the registry isn't being maintained. */
     if (zealphp_fn_statics_active) {
+        if (zealphp_fn_dirty_live) {
+            /* perf: only functions bound/restored since the last reset can
+             * hold a non-template value. Reset them and forget them. */
+            zend_op_array *opa;
+            ZEND_HASH_FOREACH_PTR(&zealphp_fn_dirty, opa) {
+                if (!opa || !opa->static_variables) continue;
+                if (!ZEND_MAP_PTR(opa->static_variables_ptr)) continue;
+                HashTable *live = ZEND_MAP_PTR_GET(opa->static_variables_ptr);
+                if (!live || live == opa->static_variables) continue;
+                zealphp_fn_statics_reset_cb(opa, live, &count);
+            } ZEND_HASH_FOREACH_END();
+            zend_hash_clean(&zealphp_fn_dirty);
+            RETURN_LONG(count);
+        }
         zealphp_walk_fn_statics_registry(zealphp_fn_statics_reset_cb, &count);
         RETURN_LONG(count);
     }
@@ -7781,7 +9267,14 @@ static void zealphp_fn_statics_refresh_one(zend_op_array *opa, HashTable *live)
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_statics_begin, 0, 0, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+static void zealphp_reset_request_statics_begin_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_reset_request_statics_begin)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_FSTAT_BEGIN);
+    zealphp_reset_request_statics_begin_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_FSTAT_BEGIN);
+}
+static void zealphp_reset_request_statics_begin_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
@@ -7817,7 +9310,11 @@ PHP_FUNCTION(zealphp_reset_request_statics_begin)
      * need the begin-refresh. */
     zend_long count = 0;
     zend_op_array *opa;
-    ZEND_HASH_FOREACH_PTR(&zealphp_fn_static_registry, opa) {
+    /* perf: a function nobody bound/restored since the last request-end reset
+     * is already at its template — only the dirty set can need refreshing
+     * (the in-flight peers' statics, the #28 case). */
+    HashTable *zp_begin_set = zealphp_fn_dirty_live ? &zealphp_fn_dirty : &zealphp_fn_static_registry;
+    ZEND_HASH_FOREACH_PTR(zp_begin_set, opa) {
         if (!opa || !opa->static_variables) continue;
         if (zealphp_opa_snapshot_exempt(opa)) continue;
         if (!ZEND_MAP_PTR(opa->static_variables_ptr)) continue;  /* slot unallocated — first BIND will dup the template */
@@ -7963,7 +9460,14 @@ static void zealphp_reset_class_statics_inplace(zend_class_entry *ce, HashTable 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_reset_request_class_statics, 0, 0, IS_LONG, 0)
 ZEND_END_ARG_INFO()
 
+static void zealphp_reset_request_class_statics_impl(INTERNAL_FUNCTION_PARAMETERS);
 PHP_FUNCTION(zealphp_reset_request_class_statics)
+{
+    ZP_PROF_BEGIN(ZP_PROF_REQ_CSTAT_RESET);
+    zealphp_reset_request_class_statics_impl(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+    ZP_PROF_END(ZP_PROF_REQ_CSTAT_RESET);
+}
+static void zealphp_reset_request_class_statics_impl(INTERNAL_FUNCTION_PARAMETERS)
 {
     ZEND_PARSE_PARAMETERS_NONE();
 
@@ -7978,27 +9482,73 @@ PHP_FUNCTION(zealphp_reset_request_class_statics)
     }
 
     zend_long count = 0;
-    bool snap = zealphp_state_snapshotted;
 
-    zend_string *cname;
-    zend_class_entry *ce;
+    /* perf: no static-property write since the last reset means every live
+     * table is still at its baseline/template. */
+    if (zealphp_cstat_hooks_wanted && !zealphp_cstat_dirty) {
+        RETURN_LONG(0);
+    }
     HashTable zp_dead;
     zend_hash_init(&zp_dead, 8, NULL, ZVAL_PTR_DTOR, 0);
-    ZEND_HASH_FOREACH_STR_KEY_PTR(EG(class_table), cname, ce) {
-        if (cname && ce && ce->type == ZEND_USER_CLASS
-            && ce->default_static_members_count > 0
-            && (!snap || !zend_hash_exists(&zealphp_snapshot_classes, cname))) {
-            /* Only touch classes whose live static table is actually instantiated.
-             * Reset the values IN PLACE (keeping the table allocation + address)
-             * rather than zend_cleanup_internal_class_data's free + lazy re-init,
-             * so a cached ZEND_FETCH_STATIC_PROP slot (incl. a snapshot function's,
-             * which the rtcache reset skips) can't dangle into freed memory. */
-            if (ZEND_MAP_PTR(ce->static_members_table) && CE_STATIC_MEMBERS(ce)) {
-                zealphp_reset_class_statics_inplace(ce, &zp_dead);
-                count++;
-            }
+    /* perf: walk the class-with-statics index, not the whole class table — and
+     * only the classes written since the last reset when every write resolved. */
+    zealphp_static_classes_refresh();
+    bool zp_all = !zealphp_cstat_hooks_wanted || !zealphp_cstat_dirty_live
+        || zend_hash_index_exists(&zealphp_cstat_dirty_set, 0);
+    uint32_t zp_total = zp_all ? zealphp_static_classes_n : zend_hash_num_elements(&zealphp_cstat_dirty_set);
+    zend_ulong *zp_dirty_keys = NULL;
+    if (!zp_all) {
+        zp_dirty_keys = emalloc(sizeof(zend_ulong) * (zp_total ? zp_total : 1));
+        uint32_t k = 0; zend_ulong dk;
+        ZEND_HASH_FOREACH_NUM_KEY(&zealphp_cstat_dirty_set, dk) { zp_dirty_keys[k++] = dk; } ZEND_HASH_FOREACH_END();
+        zp_total = k;
+    }
+    for (uint32_t ci = 0; ci < zp_total; ci++) {
+        zealphp_static_class_ref *ref;
+        if (zp_all) {
+            ref = &zealphp_static_classes[ci];
+        } else {
+            zval *pos = zend_hash_index_find(&zealphp_static_classes_by_ce, zp_dirty_keys[ci]);
+            if (!pos) continue;
+            ref = &zealphp_static_classes[Z_LVAL_P(pos) - 1];
         }
-    } ZEND_HASH_FOREACH_END();
+        zend_class_entry *ce = ref->ce;
+        if (ref->shared) continue;
+        if (!ZEND_MAP_PTR(ce->static_members_table) || !CE_STATIC_MEMBERS(ce)) continue;
+        if (ref->boot) {
+            /* Boot class: back to the warm boot BASELINE (the per-coroutine save
+             * re-parks there on every yield; this covers the slice after the
+             * request's last yield). Runs in the request coroutine's PHP context,
+             * so a displaced object's __destruct is safe here. */
+            zealphp_boot_baseline *b = zend_hash_index_find_ptr(&zealphp_boot_static_baseline, (zend_ulong)(uintptr_t)ce);
+            if (!b) continue;   /* first touched inside a request: template regime below never applies to boot classes */
+            zval *live = CE_STATIC_MEMBERS(ce);
+            bool touched = false;
+            for (uint32_t i = 0; i < b->n && (int)i < ce->default_static_members_count; i++) {
+                zval *bv = &b->v[i];
+                zval *dst = &live[i];
+                if (Z_TYPE_P(bv) == IS_UNDEF || Z_TYPE_P(dst) == IS_INDIRECT
+                    || Z_TYPE_P(dst) == IS_RESOURCE || Z_ISREF_P(dst)) continue;
+                if (zealphp_static_slot_same(dst, bv)) continue;
+                zval old = *dst;
+                ZVAL_COPY(dst, bv);
+                if (Z_REFCOUNTED(old)) zend_hash_next_index_insert(&zp_dead, &old);
+                touched = true;
+            }
+            if (touched) count++;
+            continue;
+        }
+        /* Request-loaded class: reset IN PLACE to the compile-time template
+         * (keeping the table allocation + address) rather than
+         * zend_cleanup_internal_class_data's free + lazy re-init, so a cached
+         * ZEND_FETCH_STATIC_PROP slot (incl. a snapshot function's, which the
+         * rtcache reset skips) can't dangle into freed memory. */
+        zealphp_reset_class_statics_inplace(ce, &zp_dead);
+        count++;
+    }
+    if (zp_dirty_keys) efree(zp_dirty_keys);
+    if (zealphp_cstat_dirty_live) zend_hash_clean(&zealphp_cstat_dirty_set);
+    zealphp_cstat_dirty = false;   /* everything is back at baseline/template */
     zend_hash_destroy(&zp_dead);   /* destructors run here, after the walk */
 
     RETURN_LONG(count);
@@ -8019,6 +9569,16 @@ ZEND_END_ARG_INFO()
 
 PHP_FUNCTION(zealphp_require_global)
 {
+    /* perf: every CV of the global-scope frame about to open is a global this
+     * coroutine may write (zend_detach_symbol_table copies CVs back into
+     * EG(symbol_table) on return). Record them so the save/reset visit them. */
+    #define ZEALPHP_REQUIRE_GLOBAL_TOUCH_VARS(op_array_ptr) do { \
+        if (zealphp_glob_hooks_wanted) { \
+            for (uint32_t zp_vi = 0; zp_vi < (op_array_ptr)->last_var; zp_vi++) { \
+                zealphp_glob_touch((op_array_ptr)->vars[zp_vi]); \
+            } \
+        } \
+    } while (0)
     zend_string *path;
     ZEND_PARSE_PARAMETERS_START(1, 1)
         /* B11: a path, not any string — "a.php\0x" used to be truncated at
@@ -8048,6 +9608,7 @@ PHP_FUNCTION(zealphp_require_global)
         RETURN_THROWS();
     }
 
+    ZEALPHP_REQUIRE_GLOBAL_TOUCH_VARS(op_array);
     zend_execute_data *call = zend_vm_stack_push_call_frame(
         ZEND_CALL_TOP_CODE | ZEND_CALL_HAS_SYMBOL_TABLE,
         (zend_function *) op_array, 0, NULL);
@@ -8114,7 +9675,128 @@ PHP_FUNCTION(zealphp_require_global)
     RETURN_NULL();
 }
 
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_shared_static_classes, 0, 1, IS_LONG, 0)
+    ZEND_ARG_TYPE_INFO(0, prefixes, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
+/* zealphp_shared_static_classes(array $prefixes): int
+ * Class-name prefixes (case-insensitive, e.g. 'ZealPHP\\') whose static
+ * properties are PROCESS-WIDE: never carried per coroutine, never re-parked,
+ * never reset at request end. For a framework's own per-worker state (route
+ * tables, pipelining turnstile, fatal guard, memo caches) that concurrent
+ * requests legitimately share. Replaces the previous list. Returns the count. */
+PHP_FUNCTION(zealphp_shared_static_classes)
+{
+    zval *prefixes;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY(prefixes)
+    ZEND_PARSE_PARAMETERS_END();
+    for (uint32_t i = 0; i < zealphp_shared_static_prefixes_n; i++) {
+        zend_string_release(zealphp_shared_static_prefixes[i]);
+    }
+    zealphp_shared_static_prefixes_n = 0;
+    uint32_t n = zend_hash_num_elements(Z_ARRVAL_P(prefixes));
+    zealphp_shared_static_prefixes = perealloc(zealphp_shared_static_prefixes, sizeof(zend_string *) * (n ? n : 1), 1);
+    zval *v;
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(prefixes), v) {
+        if (Z_TYPE_P(v) != IS_STRING || Z_STRLEN_P(v) == 0) continue;
+        zend_string *lc = zend_string_tolower(Z_STR_P(v));
+        /* Class-table keys have no leading backslash. */
+        if (ZSTR_VAL(lc)[0] == '\\') {
+            zend_string *t = zend_string_init(ZSTR_VAL(lc) + 1, ZSTR_LEN(lc) - 1, 1);
+            zend_string_release(lc);
+            lc = t;
+        } else {
+            zend_string *t = zend_string_init(ZSTR_VAL(lc), ZSTR_LEN(lc), 1);
+            zend_string_release(lc);
+            lc = t;
+        }
+        zealphp_shared_static_prefixes[zealphp_shared_static_prefixes_n++] = lc;
+    } ZEND_HASH_FOREACH_END();
+    zealphp_symtab_gen++;   /* re-derive the index's shared flags */
+    if (zealphp_fn_shared_cache_live) zend_hash_clean(&zealphp_fn_shared_cache);   /* prefixes changed */
+    RETURN_LONG((zend_long)zealphp_shared_static_prefixes_n);
+}
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_zealphp_switch_profile, 0, 0, IS_ARRAY, 0)
+    ZEND_ARG_TYPE_INFO(0, reset, _IS_BOOL, 0)
+ZEND_END_ARG_INFO()
+
+/* zealphp_switch_profile(bool $reset = false): array
+ * Per-stage accumulated wall time of the coroutine switch path (requires
+ * ZEALPHP_SWITCH_PROF=1 in the environment at worker start; otherwise all
+ * zero). Returns [stage => ['calls' => n, 'ns' => total, 'avg_ns' => f]]. */
+PHP_FUNCTION(zealphp_switch_profile)
+{
+    bool reset = 0;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL(reset)
+    ZEND_PARSE_PARAMETERS_END();
+    array_init(return_value);
+    for (int i = 0; i < ZP_PROF_N; i++) {
+        zval row;
+        array_init(&row);
+        add_assoc_long(&row, "calls", (zend_long)zealphp_prof_calls[i]);
+        add_assoc_long(&row, "ns", (zend_long)zealphp_prof_ns[i]);
+        add_assoc_double(&row, "avg_ns", zealphp_prof_calls[i]
+            ? (double)zealphp_prof_ns[i] / (double)zealphp_prof_calls[i] : 0.0);
+        add_assoc_zval(return_value, zealphp_prof_names[i], &row);
+    }
+    add_assoc_bool(return_value, "enabled", zealphp_prof_enabled());
+    /* What the calling coroutine's lane has recorded so far: the keys, classes
+     * and functions its yields carry. Lets an app see which of its writes make
+     * the switch pay (and which framework writes it should register as shared). */
+    {
+        long zp_tc = zealphp_touch_cid();
+        zval zp_g, zp_c, zp_f;
+        array_init(&zp_g); array_init(&zp_c); array_init(&zp_f);
+        if (zp_tc > 0) {
+            HashTable *gs = zealphp_glob_touched_live ? zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)zp_tc) : NULL;
+            if (gs) {
+                zend_string *k;
+                ZEND_HASH_FOREACH_STR_KEY(gs, k) {
+                    if (!k) continue;
+                    add_next_index_str(&zp_g, (k == zealphp_glob_all_key) ? zend_string_init("*", 1, 0) : zend_string_copy(k));
+                } ZEND_HASH_FOREACH_END();
+            }
+            HashTable *cs = zealphp_cstat_touched_live ? zend_hash_index_find_ptr(&zealphp_cstat_touched, (zend_ulong)zp_tc) : NULL;
+            if (cs) {
+                zend_ulong ck;
+                ZEND_HASH_FOREACH_NUM_KEY(cs, ck) {
+                    if (ck == 0) { add_next_index_string(&zp_c, "*"); continue; }
+                    zend_class_entry *ce = (zend_class_entry *)(uintptr_t)ck;
+                    add_next_index_str(&zp_c, zend_string_copy(ce->name));
+                } ZEND_HASH_FOREACH_END();
+            }
+            HashTable *fs = zealphp_fn_touched_live ? zend_hash_index_find_ptr(&zealphp_fn_touched, (zend_ulong)zp_tc) : NULL;
+            if (fs) {
+                zend_ulong fk;
+                ZEND_HASH_FOREACH_NUM_KEY(fs, fk) {
+                    zend_op_array *opa = zend_hash_index_find_ptr(&zealphp_fn_static_registry, fk);
+                    if (!opa) continue;
+                    if (opa->scope) {
+                        zend_string *q = zend_strpprintf(0, "%s::%s", ZSTR_VAL(opa->scope->name), ZSTR_VAL(opa->function_name));
+                        add_next_index_str(&zp_f, q);
+                    } else {
+                        add_next_index_str(&zp_f, zend_string_copy(opa->function_name));
+                    }
+                } ZEND_HASH_FOREACH_END();
+            }
+        }
+        add_assoc_zval(return_value, "touched_globals", &zp_g);
+        add_assoc_zval(return_value, "touched_classes", &zp_c);
+        add_assoc_zval(return_value, "touched_functions", &zp_f);
+    }
+    if (reset) {
+        memset(zealphp_prof_ns, 0, sizeof(zealphp_prof_ns));
+        memset(zealphp_prof_calls, 0, sizeof(zealphp_prof_calls));
+    }
+}
+
 static const zend_function_entry zealphp_functions[] = {
+    PHP_FE(zealphp_switch_profile,         arginfo_zealphp_switch_profile)
+    PHP_FE(zealphp_shared_static_classes,  arginfo_zealphp_shared_static_classes)
     PHP_FE(zealphp_override,               arginfo_zealphp_override)
     PHP_FE(zealphp_restore,                arginfo_zealphp_restore)
     PHP_FE(zealphp_restore_all,            arginfo_zealphp_restore_all)
