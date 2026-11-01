@@ -9744,6 +9744,50 @@ PHP_FUNCTION(zealphp_switch_profile)
         add_assoc_zval(return_value, zealphp_prof_names[i], &row);
     }
     add_assoc_bool(return_value, "enabled", zealphp_prof_enabled());
+    /* What the calling coroutine's lane has recorded so far: the keys, classes
+     * and functions its yields carry. Lets an app see which of its writes make
+     * the switch pay (and which framework writes it should register as shared). */
+    {
+        long zp_tc = zealphp_touch_cid();
+        zval zp_g, zp_c, zp_f;
+        array_init(&zp_g); array_init(&zp_c); array_init(&zp_f);
+        if (zp_tc > 0) {
+            HashTable *gs = zealphp_glob_touched_live ? zend_hash_index_find_ptr(&zealphp_glob_touched, (zend_ulong)zp_tc) : NULL;
+            if (gs) {
+                zend_string *k;
+                ZEND_HASH_FOREACH_STR_KEY(gs, k) {
+                    if (!k) continue;
+                    add_next_index_str(&zp_g, (k == zealphp_glob_all_key) ? zend_string_init("*", 1, 0) : zend_string_copy(k));
+                } ZEND_HASH_FOREACH_END();
+            }
+            HashTable *cs = zealphp_cstat_touched_live ? zend_hash_index_find_ptr(&zealphp_cstat_touched, (zend_ulong)zp_tc) : NULL;
+            if (cs) {
+                zend_ulong ck;
+                ZEND_HASH_FOREACH_NUM_KEY(cs, ck) {
+                    if (ck == 0) { add_next_index_string(&zp_c, "*"); continue; }
+                    zend_class_entry *ce = (zend_class_entry *)(uintptr_t)ck;
+                    add_next_index_str(&zp_c, zend_string_copy(ce->name));
+                } ZEND_HASH_FOREACH_END();
+            }
+            HashTable *fs = zealphp_fn_touched_live ? zend_hash_index_find_ptr(&zealphp_fn_touched, (zend_ulong)zp_tc) : NULL;
+            if (fs) {
+                zend_ulong fk;
+                ZEND_HASH_FOREACH_NUM_KEY(fs, fk) {
+                    zend_op_array *opa = zend_hash_index_find_ptr(&zealphp_fn_static_registry, fk);
+                    if (!opa) continue;
+                    if (opa->scope) {
+                        zend_string *q = zend_strpprintf(0, "%s::%s", ZSTR_VAL(opa->scope->name), ZSTR_VAL(opa->function_name));
+                        add_next_index_str(&zp_f, q);
+                    } else {
+                        add_next_index_str(&zp_f, zend_string_copy(opa->function_name));
+                    }
+                } ZEND_HASH_FOREACH_END();
+            }
+        }
+        add_assoc_zval(return_value, "touched_globals", &zp_g);
+        add_assoc_zval(return_value, "touched_classes", &zp_c);
+        add_assoc_zval(return_value, "touched_functions", &zp_f);
+    }
     if (reset) {
         memset(zealphp_prof_ns, 0, sizeof(zealphp_prof_ns));
         memset(zealphp_prof_calls, 0, sizeof(zealphp_prof_calls));

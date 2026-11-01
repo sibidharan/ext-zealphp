@@ -264,6 +264,40 @@ valgrind clean on 055/057/063/095/096 (093 reports an uninitialised read
 inside OpenSwoole's own `coro_interrupt_function`, identical on pristine
 0.4.1).
 
+## Round 4: two blind spots closed, struct lane
+
+Two write paths the touched sets could not see (both leaked across requests
+in coroutine-legacy on rounds 1–3; both are covered by the full walks of
+0.4.0/0.4.1 and by tests 110 and 111 now):
+
+- **Global-scope includes outside `zealphp_require_global()`.** A file the
+  entry file `include`s runs its top-level `$x = ...` as plain CV writes on
+  the request's global frame — no write opcode fires. The compile-file hook
+  now registers the compiled file's CVs for the lane when the including frame
+  is the request's global frame (wp-settings.php and everything it pulls in);
+  `eval()` on that frame records the every-key marker.
+- **Reflection static writes.** `ReflectionProperty::setValue()`,
+  `setRawValue()` and `ReflectionClass::setStaticPropertyValue()` write
+  static slots from C. Their handlers are wrapped: a static write records the
+  class (and its ancestors) for the lane; an instance write records nothing,
+  so ORM-style hydrators do not pay.
+
+Still invisible by construction: `zend_update_static_property()` called from
+another C extension, and `$GLOBALS` writes performed by C code other than
+`extract()`.
+
+Perf: the superglobal lane is a per-coroutine struct of seven zvals instead
+of a PHP array allocated and filled on every yield: superglobals save 160 →
+86 ns; park 600 → 526 ns, unpark 437 → 428 ns (profiler on). The /yield/20
+route runs at 16.2k req/s against 21.3k in plain coroutine mode, /ping at
+17.2k against 19.0k.
+
+`zealphp_switch_profile()` now also returns `touched_globals`,
+`touched_classes` and `touched_functions` for the calling coroutine's lane,
+so an app can see which of its writes the switch carries. For a framework
+request they are all empty: the remaining per-stage cost is probes and the
+profiler's own timers, not work.
+
 ## Not done / ideas
 
 - Per-coroutine *symbol table swap* (true O(1) for $GLOBALS without hooks) —
