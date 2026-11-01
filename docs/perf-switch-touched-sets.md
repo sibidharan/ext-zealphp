@@ -161,6 +161,68 @@ new test 055). The hook now records the whole consecutive run. The same
 applies to `ZEND_BIND_STATIC`, which is harmless there because the
 function-static hook records the op_array, not the variable.
 
+## Round 2 and 3: skip what an untouched coroutine cannot need
+
+Measured in a local Docker container (php:8.3-cli-bookworm, OpenSwoole
+26.2, Apple-silicon VM, one worker, `ab -c 50`; absolute numbers are not
+comparable with the lab tables above, ratios are).
+
+Per switch with the profiler on (about 0.3 µs of each figure is the fourteen
+timers themselves):
+
+| stage | round 1 | round 3 |
+|---|---|---|
+| superglobals save + restore | 303 + 137 ns | 178 + 104 ns |
+| process settings save + restore | 95 + 28 ns | 23 + 19 ns |
+| class statics save + restore | 89 + 48 ns | 68 + 46 ns |
+| fn statics save + restore | 147 + 121 ns | 19 + 18 ns |
+| $GLOBALS save + restore | 241 + 184 ns | 97 + 66 ns |
+| **park + unpark** | **1038 + 682 ns** | **578 + 419 ns** |
+
+Throughput, profiler off, best of three:
+
+| route | coroutine | coroutine-legacy round 1 | round 3 |
+|---|---|---|---|
+| /ping | ~20–26k | 14.8k | 16.5–17.5k |
+| /yield/20 | ~20–21k | 10.3k | 15.2–15.9k |
+
+What changed:
+
+- **Owner gate once per park.** `zealphp_process_state_owner_ok()` is pure per
+  coroutine; the park computes it once and the setting stages read the cached
+  answer (was two hash probes in each of ~10 callers).
+- **One gate for the six setter-driven setting stages.** A per-coroutine
+  "holds any lane" flag plus the existing setter-touched flag decide in one
+  probe whether cwd/locale/umask/tz/mbenc/libxml run at all, on save and on
+  restore. last-error keeps its own `PG(last_error_message)` check.
+- **Function statics under a shared prefix are process-shared**, like the
+  static properties of those classes: `zealphp_shared_static_classes()`
+  prefixes now also match function and method names (cached per op_array),
+  so the framework's own helpers never enter the touched set. Semantics match
+  plain coroutine mode, where they were never isolated.
+- **$GLOBALS: nothing recorded, nothing done.** Superglobal keys are never
+  recorded (S1 owns them). A coroutine with no recorded write returns before
+  the frame walk and the lane allocation; a restore that finds no lane still
+  re-parks a table a non-gated peer left dirty. Phase R skips when the
+  coroutine bound nothing and finds the touched set through an O(1)
+  ptr→cid bridge instead of scanning the cid→ptr table.
+- **Superglobal lane:** interned keys (no rehash per move), precomputed
+  `PG(http_globals)` indexes, pre-sized lane, and an immutable-empty
+  superglobal is left in place: it already is the parked value.
+- **Class statics:** classes under a shared prefix never enter the touched or
+  dirty sets; an empty touched set skips the index refresh.
+
+Attribution of the remaining gap (profiler off, feature subsets on top of
+plain coroutine mode): superglobals + $GLOBALS + statics account for most of
+the non-yield per-request cost (~3 µs on /ping); the per-switch remainder is
+~0.7 µs, spread over the superglobal moves (7 hash finds + lane) and the
+fixed probes of the park/unpark prologue.
+
+Side finding: coroutine mode with `App::superglobals(true)` but without the
+rest of the legacy flags (not an official mode) dies under concurrency with
+`assert($app !== null)` at the request closure; `coroutine-legacy` itself,
+which sets every flag, is unaffected.
+
 ## Not done / ideas
 
 - Per-coroutine *symbol table swap* (true O(1) for $GLOBALS without hooks) —
@@ -169,5 +231,7 @@ function-static hook records the op_array, not the variable.
   risk class.
 - The ini stage still walks `EG(modified_ini_directives)` (O(modified ini),
   already small).
+- A struct lane for the superglobals (seven zvals in one record instead of a
+  PHP array per yield) would take another ~100 ns off the switch.
 - `zealphp_fn_statics_refresh_one` still deep-copies template values per
   reset (O(vars of dirty functions)).
