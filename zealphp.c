@@ -1550,6 +1550,86 @@ static void zealphp_setter_unhook_one(const char *name, size_t len, zif_handler 
 }
 #define ZP_SETTER_EACH(X) \
     X(chdir) X(setlocale) X(umask) X(date_default_timezone_set) X(mb_internal_encoding) X(libxml_use_internal_errors)
+/* isolation: ReflectionProperty::setValue() / setRawValue() and
+ * ReflectionClass::setStaticPropertyValue() write static slots from C
+ * (zend_update_static_property), bypassing the static-prop write opcodes the
+ * touched set is built from. Wrap them: a static write records the class (and
+ * its ancestors) for the lane; an instance write records nothing. */
+static zif_handler zealphp_orig_refl_prop_setvalue    = NULL;
+static zif_handler zealphp_orig_refl_prop_setrawvalue = NULL;
+static zif_handler zealphp_orig_refl_class_setstatic  = NULL;
+static bool        zealphp_refl_hooks_installed       = false;
+static void zealphp_refl_touch(zval *this_zv, bool class_object)
+{
+    if (!zealphp_cstat_hooks_wanted || !this_zv || Z_TYPE_P(this_zv) != IS_OBJECT) return;
+    zval rv;
+    zval *cls = zend_read_property(Z_OBJCE_P(this_zv), Z_OBJ_P(this_zv),
+                                   class_object ? "name" : "class", class_object ? 4 : 5, 1, &rv);
+    if (!cls || Z_TYPE_P(cls) != IS_STRING) { zealphp_cstat_touch(NULL); return; }
+    zend_string *lc = zend_string_tolower(Z_STR_P(cls));
+    zend_class_entry *ce = zend_hash_find_ptr(EG(class_table), lc);
+    zend_string_release(lc);
+    if (!ce) { zealphp_cstat_touch(NULL); return; }
+    if (!class_object) {
+        zval rv2;
+        zval *pn = zend_read_property(Z_OBJCE_P(this_zv), Z_OBJ_P(this_zv), "name", 4, 1, &rv2);
+        if (!pn || Z_TYPE_P(pn) != IS_STRING) { zealphp_cstat_touch(ce); return; }
+        zend_property_info *pi = zend_hash_find_ptr(&ce->properties_info, Z_STR_P(pn));
+        if (!pi) { zealphp_cstat_touch(ce); return; }          /* unknown: be conservative */
+        if (!(pi->flags & ZEND_ACC_STATIC)) return;             /* instance property: nothing to isolate */
+    }
+    zealphp_cstat_touch(ce);
+}
+static ZEND_NAMED_FUNCTION(zealphp_hook_refl_prop_setvalue)
+{
+    zealphp_refl_touch(ZEND_THIS, false);
+    zealphp_orig_refl_prop_setvalue(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+static ZEND_NAMED_FUNCTION(zealphp_hook_refl_prop_setrawvalue)
+{
+    zealphp_refl_touch(ZEND_THIS, false);
+    zealphp_orig_refl_prop_setrawvalue(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+static ZEND_NAMED_FUNCTION(zealphp_hook_refl_class_setstatic)
+{
+    zealphp_refl_touch(ZEND_THIS, true);
+    zealphp_orig_refl_class_setstatic(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+static void zealphp_method_hook_one(const char *cls, const char *meth, zif_handler *orig, zif_handler ours)
+{
+    zend_class_entry *ce = zend_hash_str_find_ptr(CG(class_table), cls, strlen(cls));
+    if (!ce) return;
+    zend_function *f = zend_hash_str_find_ptr(&ce->function_table, meth, strlen(meth));
+    if (!f || f->type != ZEND_INTERNAL_FUNCTION || f->internal_function.handler == ours) return;
+    *orig = f->internal_function.handler;
+    f->internal_function.handler = ours;
+}
+static void zealphp_method_unhook_one(const char *cls, const char *meth, zif_handler *orig, zif_handler ours)
+{
+    if (!*orig) return;
+    zend_class_entry *ce = zend_hash_str_find_ptr(CG(class_table), cls, strlen(cls));
+    if (!ce) return;
+    zend_function *f = zend_hash_str_find_ptr(&ce->function_table, meth, strlen(meth));
+    if (f && f->type == ZEND_INTERNAL_FUNCTION && f->internal_function.handler == ours) {
+        f->internal_function.handler = *orig;
+    }
+}
+static void zealphp_refl_hooks_install(void)
+{
+    if (zealphp_refl_hooks_installed) return;
+    zealphp_method_hook_one("reflectionproperty", "setvalue",    &zealphp_orig_refl_prop_setvalue,    zealphp_hook_refl_prop_setvalue);
+    zealphp_method_hook_one("reflectionproperty", "setrawvalue", &zealphp_orig_refl_prop_setrawvalue, zealphp_hook_refl_prop_setrawvalue);
+    zealphp_method_hook_one("reflectionclass", "setstaticpropertyvalue", &zealphp_orig_refl_class_setstatic, zealphp_hook_refl_class_setstatic);
+    zealphp_refl_hooks_installed = true;
+}
+static void zealphp_refl_hooks_remove(void)
+{
+    if (!zealphp_refl_hooks_installed) return;
+    zealphp_method_unhook_one("reflectionproperty", "setvalue",    &zealphp_orig_refl_prop_setvalue,    zealphp_hook_refl_prop_setvalue);
+    zealphp_method_unhook_one("reflectionproperty", "setrawvalue", &zealphp_orig_refl_prop_setrawvalue, zealphp_hook_refl_prop_setrawvalue);
+    zealphp_method_unhook_one("reflectionclass", "setstaticpropertyvalue", &zealphp_orig_refl_class_setstatic, zealphp_hook_refl_class_setstatic);
+    zealphp_refl_hooks_installed = false;
+}
 static void zealphp_settings_hooks_install(void)
 {
     if (zealphp_settings_hooks_installed) return;
@@ -5164,6 +5244,7 @@ static bool zealphp_install_coro_hooks(void)
     }
     zealphp_settings_hooks_install();   /* perf: setter hooks feed the settings fast path */
     zealphp_cstat_hooks_wanted = true;  /* perf: static-property write flags feed the S5b fast path */
+    zealphp_refl_hooks_install();       /* isolation: Reflection static writes feed the touched set too */
     /* Inline-resume support: learn each coroutine's task at its start (see
      * zealphp_inline_park). Optional — on_yield records it too, so an API
      * without the hook only loses the never-yielded-resumer case. Both forks
@@ -7159,6 +7240,13 @@ static int zealphp_bind_static_handler(zend_execute_data *execute_data)
 
 static int zealphp_include_eval_handler(zend_execute_data *execute_data)
 {
+    /* isolation: eval() on the request's global frame can create any global
+     * through CVs no hook sees — record the "every key" marker for the lane. */
+    if (zealphp_glob_hooks_wanted && EX(opline)->extended_value == ZEND_EVAL
+        && (ZEND_CALL_INFO(execute_data) & ZEND_CALL_HAS_SYMBOL_TABLE)
+        && EX(symbol_table) == &EG(symbol_table)) {
+        zealphp_glob_touch(NULL);
+    }
     if (!zealphp_include_isolation_enabled || !zealphp_state_snapshotted) {
         return zealphp_chain_or_dispatch(zealphp_prev_include_eval, execute_data);
     }
@@ -7551,7 +7639,30 @@ static void zealphp_oparray_cache_store(zend_string *key, zend_op_array *master,
     zend_hash_str_add_ptr(&zealphp_oparray_master_cache, ZSTR_VAL(key), ZSTR_LEN(key), e);
 }
 
+static zend_op_array *zealphp_compile_file_hook_inner(zend_file_handle *file_handle, int type);
+/* perf/isolation: a file included from a global-scope frame runs with its CVs
+ * attached to EG(symbol_table); its `$x = ...` are plain CV writes that no
+ * write hook sees. zealphp_require_global() registers its own file's CVs;
+ * this covers the files THAT file includes (wp-settings.php and friends), and
+ * any other include/require executed on the request's global frame. */
+static void zealphp_register_global_scope_vars(zend_op_array *opa)
+{
+    if (!opa || !opa->last_var || !zealphp_glob_hooks_wanted || !os_get_cid || os_get_cid() <= 0) return;
+    zend_execute_data *ex = EG(current_execute_data);
+    while (ex && !(ex->func && ZEND_USER_CODE(ex->func->type))) ex = ex->prev_execute_data;
+    if (!ex) return;
+    if (!(ZEND_CALL_INFO(ex) & ZEND_CALL_HAS_SYMBOL_TABLE) || ex->symbol_table != &EG(symbol_table)) return;
+    for (uint32_t i = 0; i < opa->last_var; i++) {
+        zealphp_glob_touch(opa->vars[i]);
+    }
+}
 static zend_op_array *zealphp_compile_file_hook(zend_file_handle *file_handle, int type)
+{
+    zend_op_array *zp_r = zealphp_compile_file_hook_inner(file_handle, type);
+    zealphp_register_global_scope_vars(zp_r);
+    return zp_r;
+}
+static zend_op_array *zealphp_compile_file_hook_inner(zend_file_handle *file_handle, int type)
 {
     if (!zealphp_silent_redeclare_enabled || !zealphp_original_compile_file) {
         return zealphp_original_compile_file
@@ -8534,7 +8645,8 @@ PHP_MSHUTDOWN_FUNCTION(zealphp)
     }
 #endif
 #undef ZEALPHP_UNHOOK_OPCODE
-    zealphp_settings_hooks_remove();   /* compare-and-restore the six setter handlers */
+    zealphp_settings_hooks_remove();
+    zealphp_refl_hooks_remove();   /* compare-and-restore the six setter handlers */
     for (const zend_uchar *zp_op = zealphp_static_prop_write_opcodes; *zp_op; zp_op++) {
         ZEALPHP_UNHOOK_OPCODE_LATE(*zp_op, zealphp_static_prop_write_handler, zealphp_prev_static_prop_handlers[*zp_op]);
     }
