@@ -178,6 +178,7 @@ static const zend_uchar zealphp_static_prop_write_opcodes[] = {
 /* Record "class `ce` (NULL = unknown) had a static written by the running
  * coroutine". An inherited static lives in the DECLARING class's table (the
  * child slot is IS_INDIRECT), so the ancestors are recorded too. */
+static bool zealphp_cstat_ce_is_shared(zend_class_entry *ce);   /* defined with the class index */
 static void zealphp_cstat_touch(zend_class_entry *ce)
 {
     zealphp_cstat_dirty = true;
@@ -198,6 +199,7 @@ static void zealphp_cstat_touch(zend_class_entry *ce)
     }
     for (zend_class_entry *c = ce; c; c = c->parent) {
         if (c->type != ZEND_USER_CLASS || c->default_static_members_count == 0) continue;
+        if (zealphp_cstat_ce_is_shared(c)) continue;   /* process-shared by prefix: never isolated, never reset */
         if (set) zend_hash_index_add_empty_element(set, (zend_ulong)(uintptr_t)c);
         if (zealphp_cstat_dirty_live) zend_hash_index_add_empty_element(&zealphp_cstat_dirty_set, (zend_ulong)(uintptr_t)c);
     }
@@ -2089,6 +2091,17 @@ static bool zealphp_statics_orphans_live = false;
 static bool zealphp_globals_isolatable(zval *v);
 
 /* Rebuild the class-with-statics index when the class table changed. */
+/* perf: answers "is this class process-shared by prefix?" from the index so
+ * the write hook can leave such classes out of the per-coroutine touched set
+ * and the request-end dirty set. Not indexed yet → false (conservative: the
+ * save then sees the entry and skips it by its shared flag). */
+static bool zealphp_cstat_ce_is_shared(zend_class_entry *ce)
+{
+    if (!zealphp_static_classes_by_ce_live || zealphp_shared_static_prefixes_n == 0) return false;
+    zval *pos = zend_hash_index_find(&zealphp_static_classes_by_ce, (zend_ulong)(uintptr_t)ce);
+    if (!pos) return false;
+    return zealphp_static_classes[Z_LVAL_P(pos) - 1].shared;
+}
 static void zealphp_static_classes_refresh(void)
 {
     uint32_t n = zend_hash_num_elements(EG(class_table));
@@ -2343,7 +2356,7 @@ static void zealphp_statics_snapshot_save_ex(long cid, bool repark)
     /* perf: only classes whose statics THIS coroutine wrote (the write-opcode
      * hooks record them) can hold a value to carry or re-park. */
     HashTable *touched = zealphp_cstat_touched_set();
-    if (zealphp_cstat_hooks_wanted && !touched) return;
+    if (zealphp_cstat_hooks_wanted && (!touched || zend_hash_num_elements(touched) == 0)) return;
 
     /* HAZARD-2: the index is built from EG(class_table), never CG — CG may be
      * a coroutine-stack scratch during a compile (see the Stage 3c notes). */
@@ -3861,6 +3874,10 @@ static void zealphp_snapshot_save(long cid)
          * "$_GET cleared after yield once code touches $g->get" leak). */
         zval *arr = Z_ISREF_P(sg) ? Z_REFVAL_P(sg) : sg;
         if (Z_TYPE_P(arr) != IS_ARRAY) continue;
+        /* perf: the immutable empty array IS the parked value — moving it into
+         * the lane and back buys nothing; the restore treats "absent from the
+         * lane + live is the immutable empty array" as "mine, already there". */
+        if (Z_ARRVAL_P(arr) == (HashTable *)&zend_empty_array) continue;
         if (zp_capture_only) {
             /* Adopted child: inherit a (COW-shared) view, leave the live table. */
             zval copy;
@@ -3909,6 +3926,15 @@ static void zealphp_snapshot_save(long cid)
     }
 }
 
+static zend_always_inline bool zealphp_sg_live_needs_clear(zend_string *key)
+{
+    zval *live = zend_hash_find(&EG(symbol_table), key);
+    if (!live) return false;
+    zval *a = Z_ISREF_P(live) ? Z_REFVAL_P(live) : live;
+    /* the immutable empty array is the parked value itself (and what a
+     * skipped-empty save left behind): nothing to clear */
+    return !(Z_TYPE_P(a) == IS_ARRAY && Z_ARRVAL_P(a) == (HashTable *)&zend_empty_array);
+}
 static void zealphp_snapshot_restore(long cid)
 {
     zval *snapshot = zend_hash_index_find(&zealphp_coro_snapshots, (zend_ulong)cid);
@@ -3984,7 +4010,7 @@ static void zealphp_snapshot_restore(long cid)
                 ZVAL_NULL(val);
                 zend_hash_add_new(&EG(symbol_table), zealphp_sg_keys[zp_si], &copy);
             }
-        } else if (zend_hash_find(&EG(symbol_table), zealphp_sg_keys[zp_si])) {
+        } else if (zealphp_sg_live_needs_clear(zealphp_sg_keys[zp_si])) {
             /* #15 safety net: this superglobal is NOT in our snapshot but a value
              * is live in EG — a peer set it and finished without yielding (so the
              * post-save reset never ran for it). Clear it so we don't inherit the
